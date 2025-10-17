@@ -1,8 +1,8 @@
-.PHONY: help build run clean test docker-build docker-run docker-push dev tidy
+.PHONY: help build run clean test docker-build docker-run docker-push docker-buildx-setup dev tidy
 
 # Variables
 APP_NAME=vaultwarden-api
-DOCKER_IMAGE=yourusername/$(APP_NAME)
+DOCKER_IMAGE=turboot/$(APP_NAME)
 VERSION?=latest
 
 help: ## Show this help message
@@ -47,11 +47,26 @@ clean: ## Clean build artifacts
 	rm -f coverage.out coverage.html
 	go clean
 
-docker-build: ## Build Docker image
-	@echo "Building Docker image $(DOCKER_IMAGE):$(VERSION)..."
-	docker build -t $(DOCKER_IMAGE):$(VERSION) .
-	docker tag $(DOCKER_IMAGE):$(VERSION) $(DOCKER_IMAGE):latest
-	@echo "Docker image built successfully"
+docker-buildx-setup: ## Setup Docker buildx for cross-platform builds (one-time setup)
+	@echo "Setting up Docker buildx..."
+	@if ! docker buildx ls | grep -q multiarch; then \
+		docker buildx create --name multiarch --use; \
+		docker buildx inspect --bootstrap; \
+		echo "Buildx setup complete!"; \
+	else \
+		echo "Buildx builder 'multiarch' already exists"; \
+		docker buildx use multiarch; \
+	fi
+
+docker-build: docker-buildx-setup ## Build Docker image for AMD64 (production servers)
+	@echo "Building Docker image for AMD64 platform: $(DOCKER_IMAGE):$(VERSION)..."
+	docker buildx build \
+		--platform linux/amd64 \
+		--load \
+		-t $(DOCKER_IMAGE):$(VERSION) \
+		-t $(DOCKER_IMAGE):latest \
+		.
+	@echo "Docker image built successfully for AMD64"
 
 docker-run: ## Run Docker container locally
 	@if [ ! -f .env ]; then \
@@ -64,11 +79,15 @@ docker-run: ## Run Docker container locally
 		--name $(APP_NAME) \
 		$(DOCKER_IMAGE):latest
 
-docker-push: docker-build ## Push Docker image to registry
-	@echo "Pushing Docker image $(DOCKER_IMAGE):$(VERSION)..."
-	docker push $(DOCKER_IMAGE):$(VERSION)
-	docker push $(DOCKER_IMAGE):latest
-	@echo "Docker image pushed successfully"
+docker-push: docker-buildx-setup ## Build for AMD64 and push Docker image to registry
+	@echo "Building and pushing Docker image for AMD64: $(DOCKER_IMAGE):$(VERSION)..."
+	docker buildx build \
+		--platform linux/amd64 \
+		--push \
+		-t $(DOCKER_IMAGE):$(VERSION) \
+		-t $(DOCKER_IMAGE):latest \
+		.
+	@echo "Docker image pushed successfully to $(DOCKER_IMAGE):$(VERSION) and $(DOCKER_IMAGE):latest"
 
 docker-compose-up: ## Start services with docker-compose
 	@if [ ! -f .env ]; then \

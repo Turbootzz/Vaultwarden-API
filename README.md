@@ -67,7 +67,7 @@ A secure, lightweight Go API that acts as a proxy between your local apps and Va
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/thijsherman/vaultwarden-api.git
+   git clone https://github.com/turbootzz/vaultwarden-api.git
    cd vaultwarden-api
    ```
 
