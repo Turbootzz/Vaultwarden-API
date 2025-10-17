@@ -1,0 +1,49 @@
+# Git
+.git
+.gitignore
+
+# Documentation
+README.md
+CLAUDE.md
+*.md
+
+# Environment files
+.env
+.env.*
+*.env
+
+# Build artifacts
+bin/
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing
+coverage.out
+*.coverprofile
+*.test
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Docker
+docker-compose.yml
+docker-compose.override.yml
+Dockerfile
+
+# Make
+Makefile

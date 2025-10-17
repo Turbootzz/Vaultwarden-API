@@ -1,0 +1,61 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# Go build artifacts
+*.o
+*.a
+*.test
+*.out
+go.work
+
+# Application binary
+/vaultwarden-api
+/cmd/api/api
+
+# Environment files - CRITICAL FOR SECURITY
+.env
+.env.local
+.env.*.local
+*.env
+
+# Secrets and credentials
+secrets/
+credentials/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+coverage.out
+*.coverprofile
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Docker
+docker-compose.override.yml
+
+# Documentation artifacts
+CLAUDE.md
