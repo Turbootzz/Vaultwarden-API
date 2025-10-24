@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -56,6 +57,9 @@ func Load() (*Config, error) {
 		for _, ip := range ips {
 			trimmed := strings.TrimSpace(ip)
 			if trimmed != "" {
+				if err := validateIPOrCIDR(trimmed); err != nil {
+					return nil, fmt.Errorf("invalid IP in ALLOWED_IPS (%s): %w", trimmed, err)
+				}
 				cfg.AllowedIPs = append(cfg.AllowedIPs, trimmed)
 			}
 		}
@@ -106,4 +110,17 @@ func parseDuration(s string) time.Duration {
 		return 10 * time.Second
 	}
 	return d
+}
+
+// validateIPOrCIDR validates if a string is a valid IP address or CIDR range
+func validateIPOrCIDR(s string) error {
+	// Try parsing as CIDR first
+	if _, _, err := net.ParseCIDR(s); err == nil {
+		return nil
+	}
+	// Try parsing as IP address
+	if net.ParseIP(s) != nil {
+		return nil
+	}
+	return fmt.Errorf("not a valid IP address or CIDR range")
 }

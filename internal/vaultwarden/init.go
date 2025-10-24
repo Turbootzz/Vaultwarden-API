@@ -2,6 +2,7 @@ package vaultwarden
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,6 +14,10 @@ import (
 )
 
 var bitwardenInitMutex sync.Mutex
+
+type BitwardenStatus struct {
+	Status string `json:"status"`
+}
 
 func InitializeBitwardenCLI(serverURL, clientID, clientSecret, password string) (string, error) {
 	bitwardenInitMutex.Lock()
@@ -29,12 +34,18 @@ func InitializeBitwardenCLI(serverURL, clientID, clientSecret, password string) 
 	cancel()
 
 	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	cmd = exec.CommandContext(ctx, "bw", "status")
-	statusOutput, _ := cmd.CombinedOutput()
-	cancel()
+	statusOutput, err := cmd.CombinedOutput()
+	if err != nil {
+		logger.Warn.Printf("Failed to check status: %v", err)
+	}
 
-	statusStr := strings.TrimSpace(string(statusOutput))
-	isLoggedIn := strings.Contains(statusStr, `"status":"unlocked"`) || strings.Contains(statusStr, `"status":"locked"`)
+	var status BitwardenStatus
+	isLoggedIn := false
+	if err := json.Unmarshal(statusOutput, &status); err == nil {
+		isLoggedIn = status.Status == "unlocked" || status.Status == "locked"
+	}
 
 	if !isLoggedIn {
 		logger.Info.Println("Logging in to Bitwarden...")
@@ -67,11 +78,14 @@ func InitializeBitwardenCLI(serverURL, clientID, clientSecret, password string) 
 			if strings.Contains(outputStr, "Rate limit") {
 				logger.Warn.Printf("Rate limited (attempt %d/%d)", attempt, maxRetries)
 				loginErr = fmt.Errorf("rate limited: %s", outputStr)
-				continue
+			} else {
+				logger.Warn.Printf("Login failed (attempt %d/%d): %v - %s", attempt, maxRetries, err, outputStr)
+				loginErr = fmt.Errorf("login failed: %w - %s", err, outputStr)
 			}
 
-			loginErr = fmt.Errorf("login failed: %w - %s", err, outputStr)
-			break
+			if attempt < maxRetries {
+				continue
+			}
 		}
 
 		if loginErr != nil {

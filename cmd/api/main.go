@@ -61,8 +61,10 @@ func main() {
 	}
 
 	// Start periodic GitHub IP range updates (every 24 hours)
+	var stopIPUpdate func()
 	if cfg.EnableGitHubIPRanges {
-		ipWhitelist.StartPeriodicUpdate(24 * time.Hour)
+		stopIPUpdate = ipWhitelist.StartPeriodicUpdate(24 * time.Hour)
+		defer stopIPUpdate()
 	}
 
 	// Create Fiber app with security configurations
@@ -75,11 +77,16 @@ func main() {
 		ServerHeader: "",
 		// Don't expose stack traces in production
 		ErrorHandler: customErrorHandler(cfg.IsProd()),
+		// Enable trusted proxy check to prevent IP spoofing
+		EnableTrustedProxyCheck: true,
+		// Trust proxy headers from these IPs (Nginx Proxy Manager, Docker network)
+		TrustedProxies: []string{"127.0.0.1", "::1", "172.16.0.0/12", "10.0.0.0/8", "192.168.0.0/16"},
+		// Use X-Forwarded-For header to get real client IP
+		ProxyHeader: fiber.HeaderXForwardedFor,
 	})
 
 	app.Use(helmet.New())
 	app.Use(recover.New())
-	app.Use(ipWhitelist.Middleware())
 	app.Use(compress.New(compress.Config{
 		Level: compress.LevelBestSpeed,
 	}))
@@ -91,7 +98,13 @@ func main() {
 		AllowCredentials: false,
 	}))
 
-	app.Use(limiter.New(limiter.Config{
+	// Public routes (no authentication or IP whitelist required)
+	app.Get("/health", h.HealthCheck)
+
+	// Protected routes (IP whitelist + API key required)
+	api := app.Group("/")
+	api.Use(ipWhitelist.Middleware())
+	api.Use(limiter.New(limiter.Config{
 		Max: 30,
 		LimitReached: func(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
@@ -99,12 +112,8 @@ func main() {
 			})
 		},
 	}))
+	api.Use(auth.Middleware(cfg.APIKey))
 
-	// Public routes (no authentication required)
-	app.Get("/health", h.HealthCheck)
-
-	// Protected routes (authentication required)
-	api := app.Group("/", auth.Middleware(cfg.APIKey))
 	api.Get("/secret/:name", h.GetSecret)
 	api.Post("/refresh", h.RefreshCache)
 

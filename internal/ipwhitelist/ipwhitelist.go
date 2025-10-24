@@ -58,7 +58,7 @@ func New(allowedIPs []string, enableGitHub bool) (*IPWhitelist, error) {
 				logger.Warn.Printf("Invalid IP '%s'", ipStr)
 				continue
 			}
-			wl.allowedIPs[ipStr] = true
+			wl.allowedIPs[ip.String()] = true
 			logger.Info.Printf("Added IP to whitelist: %s", ipStr)
 		}
 	}
@@ -87,12 +87,17 @@ func (wl *IPWhitelist) Middleware() fiber.Handler {
 
 		clientIP := c.IP()
 
-		if wl.IsAllowed(clientIP) {
-			logger.Info.Printf("IP allowed: %s", clientIP)
+		// Handle comma-separated IPs from X-Forwarded-For header
+		// Take the first IP (original client IP before proxies)
+		ips := strings.Split(clientIP, ",")
+		realClientIP := strings.TrimSpace(ips[0])
+
+		if wl.IsAllowed(realClientIP) {
+			logger.Debug.Printf("IP allowed: %s", realClientIP)
 			return c.Next()
 		}
 
-		logger.Warn.Printf("IP blocked (not whitelisted): %s on %s %s", clientIP, c.Method(), c.Path())
+		logger.Warn.Printf("IP blocked (not whitelisted): %s on %s %s", realClientIP, c.Method(), c.Path())
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"error": "access denied: IP not whitelisted",
 		})
@@ -109,8 +114,8 @@ func (wl *IPWhitelist) IsAllowed(ipStr string) bool {
 		return false
 	}
 
-	// Check single IPs
-	if wl.allowedIPs[ipStr] {
+	// Check single IPs (normalize IP for consistent matching)
+	if wl.allowedIPs[ip.String()] {
 		return true
 	}
 
@@ -174,21 +179,30 @@ func (wl *IPWhitelist) updateGitHubIPRanges() error {
 }
 
 // StartPeriodicUpdate starts a goroutine that updates GitHub IP ranges periodically
-func (wl *IPWhitelist) StartPeriodicUpdate(interval time.Duration) {
+// Returns a stop function that should be called to clean up the goroutine
+func (wl *IPWhitelist) StartPeriodicUpdate(interval time.Duration) func() {
 	if !wl.enableGitHub {
-		return
+		return func() {}
 	}
 
+	ticker := time.NewTicker(interval)
+	done := make(chan struct{})
+
 	go func() {
-		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			if err := wl.updateGitHubIPRanges(); err != nil {
-				logger.Error.Printf("Failed to update GitHub IP ranges: %v", err)
+		for {
+			select {
+			case <-ticker.C:
+				if err := wl.updateGitHubIPRanges(); err != nil {
+					logger.Error.Printf("Failed to update GitHub IP ranges: %v", err)
+				}
+			case <-done:
+				return
 			}
 		}
 	}()
 
 	logger.Info.Printf("Started GitHub IP range auto-update (every %v)", interval)
+	return func() { close(done) }
 }
