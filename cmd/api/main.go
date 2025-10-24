@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/compress"
@@ -15,6 +16,7 @@ import (
 	"github.com/thijsherman/vaultwarden-api/internal/auth"
 	"github.com/thijsherman/vaultwarden-api/internal/config"
 	"github.com/thijsherman/vaultwarden-api/internal/handlers"
+	"github.com/thijsherman/vaultwarden-api/internal/ipwhitelist"
 	"github.com/thijsherman/vaultwarden-api/internal/vaultwarden"
 	"github.com/thijsherman/vaultwarden-api/pkg/logger"
 )
@@ -46,11 +48,22 @@ func main() {
 		logger.Warn.Println("Using provided session token (will expire)")
 		vaultClient = vaultwarden.NewClient(cfg.VaultwardenURL, cfg.VaultwardenToken, cfg.CacheTTL)
 	} else {
-		logger.Error.Fatal("No authentication configured. Set VAULTWARDEN_CLIENT_ID+VAULTWARDEN_CLIENT_SECRET+VAULTWARDEN_PASSWORD")
+		logger.Error.Fatal("No authentication configured. Set either (VAULTWARDEN_CLIENT_ID + VAULTWARDEN_CLIENT_SECRET + VAULTWARDEN_PASSWORD) or VAULTWARDEN_ACCESS_TOKEN")
 	}
 
 	// Initialize handlers
 	h := handlers.NewHandler(vaultClient)
+
+	// Initialize IP whitelist
+	ipWhitelist, err := ipwhitelist.New(cfg.AllowedIPs, cfg.EnableGitHubIPRanges)
+	if err != nil {
+		logger.Error.Fatalf("Failed to initialize IP whitelist: %v", err)
+	}
+
+	// Start periodic GitHub IP range updates (every 24 hours)
+	if cfg.EnableGitHubIPRanges {
+		ipWhitelist.StartPeriodicUpdate(24 * time.Hour)
+	}
 
 	// Create Fiber app with security configurations
 	app := fiber.New(fiber.Config{
@@ -66,6 +79,7 @@ func main() {
 
 	app.Use(helmet.New())
 	app.Use(recover.New())
+	app.Use(ipWhitelist.Middleware())
 	app.Use(compress.New(compress.Config{
 		Level: compress.LevelBestSpeed,
 	}))

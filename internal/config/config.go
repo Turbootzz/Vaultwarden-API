@@ -17,7 +17,9 @@ type Config struct {
 	WriteTimeout time.Duration
 
 	// Security
-	APIKey string
+	APIKey                string
+	AllowedIPs            []string
+	EnableGitHubIPRanges  bool
 
 	VaultwardenURL      string
 	VaultwardenToken    string
@@ -44,6 +46,19 @@ func Load() (*Config, error) {
 		WriteTimeout:       parseDuration(getEnv("WRITE_TIMEOUT", "10s")),
 		CacheTTL:           parseDuration(getEnv("CACHE_TTL", "5m")),
 		CORSAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS", "http://localhost:3000"),
+
+		EnableGitHubIPRanges: getEnv("ENABLE_GITHUB_IP_RANGES", "false") == "true",
+	}
+
+	// Parse allowed IPs
+	if allowedIPsStr := os.Getenv("ALLOWED_IPS"); allowedIPsStr != "" {
+		ips := strings.Split(allowedIPsStr, ",")
+		for _, ip := range ips {
+			trimmed := strings.TrimSpace(ip)
+			if trimmed != "" {
+				cfg.AllowedIPs = append(cfg.AllowedIPs, trimmed)
+			}
+		}
 	}
 
 	// Validate required fields
