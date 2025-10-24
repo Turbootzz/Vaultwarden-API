@@ -3,6 +3,7 @@ package vaultwarden
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -38,13 +39,15 @@ func (c *Client) FetchSecretViaCLI(name string) (string, error) {
 		}
 	}
 
-	cmd := exec.Command("bw", "get", "item", name, "--session", c.token)
+	cmd := exec.Command("bw", "get", "item", name)
+	cmd.Env = append(os.Environ(), fmt.Sprintf("BW_SESSION=%s", c.token))
 	output, err := cmd.Output()
 
 	if err != nil {
 		logger.Info.Printf("Exact match failed, searching for: %s", name)
 
-		searchCmd := exec.Command("bw", "list", "items", "--search", name, "--session", c.token)
+		searchCmd := exec.Command("bw", "list", "items", "--search", name)
+		searchCmd.Env = append(os.Environ(), fmt.Sprintf("BW_SESSION=%s", c.token))
 		searchOutput, searchErr := searchCmd.Output()
 		if searchErr != nil {
 			return "", fmt.Errorf("failed to search for item: %w", searchErr)
@@ -59,7 +62,10 @@ func (c *Client) FetchSecretViaCLI(name string) (string, error) {
 			return "", fmt.Errorf("secret not found: %s", name)
 		}
 
-		// Use the first matching item
+		if len(items) > 1 {
+			logger.Warn.Printf("Multiple items found for '%s', using first match: '%s' (ID: %s)", name, items[0].Name, items[0].ID)
+		}
+
 		output, err = json.Marshal(items[0])
 		if err != nil {
 			return "", fmt.Errorf("failed to marshal item: %w", err)
@@ -98,7 +104,8 @@ func (c *Client) extractValueFromItem(item BitwardenItem) (string, error) {
 }
 
 func (c *Client) SyncVault() error {
-	cmd := exec.Command("bw", "sync", "--session", c.token)
+	cmd := exec.Command("bw", "sync")
+	cmd.Env = append(os.Environ(), fmt.Sprintf("BW_SESSION=%s", c.token))
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("failed to sync vault: %w, output: %s", err, output)

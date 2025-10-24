@@ -30,10 +30,16 @@ func main() {
 
 	// Initialize Vaultwarden client
 	var vaultClient *vaultwarden.Client
-	if cfg.VaultwardenClientID != "" && cfg.VaultwardenSecret != "" {
+	if cfg.VaultwardenClientID != "" || cfg.VaultwardenSecret != "" {
+		if cfg.VaultwardenClientID == "" || cfg.VaultwardenSecret == "" {
+			logger.Error.Fatal("Both VaultwardenClientID and VaultwardenSecret must be provided for API key authentication")
+		}
 		logger.Info.Println("Using API key authentication (recommended)")
 		vaultClient = vaultwarden.NewClientWithAuth(cfg.VaultwardenURL, cfg.VaultwardenClientID, cfg.VaultwardenSecret, cfg.CacheTTL)
 	} else {
+		if cfg.VaultwardenToken == "" {
+			logger.Error.Fatal("VaultwardenToken must be provided for legacy session token authentication")
+		}
 		logger.Warn.Println("Using session token authentication (legacy - token will expire!)")
 		vaultClient = vaultwarden.NewClient(cfg.VaultwardenURL, cfg.VaultwardenToken, cfg.CacheTTL)
 	}

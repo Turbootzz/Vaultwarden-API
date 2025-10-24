@@ -120,10 +120,13 @@ func (am *AuthManager) refreshAccessToken() (string, error) {
 		return "", fmt.Errorf("failed to decode token response: %w", err)
 	}
 
-	// Store the token
 	am.accessToken = tokenResp.AccessToken
-	// Refresh 5 minutes before expiry to avoid edge cases
-	am.tokenExpiry = time.Now().Add(time.Duration(tokenResp.ExpiresIn-300) * time.Second)
+
+	expiryBuffer := 300
+	if tokenResp.ExpiresIn < expiryBuffer {
+		expiryBuffer = tokenResp.ExpiresIn / 2
+	}
+	am.tokenExpiry = time.Now().Add(time.Duration(tokenResp.ExpiresIn-expiryBuffer) * time.Second)
 
 	logger.Info.Printf("Successfully obtained access token (expires in %d seconds)", tokenResp.ExpiresIn)
 
