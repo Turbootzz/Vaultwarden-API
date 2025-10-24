@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -70,13 +68,6 @@ func NewClient(baseURL, token string, cacheTTL time.Duration) *Client {
 
 	if cacheTTL > 0 {
 		go cache.startCleanup(cacheTTL)
-	}
-
-	if token == "" {
-		if sessionData, err := os.ReadFile("/tmp/bw_session"); err == nil {
-			token = strings.TrimSpace(string(sessionData))
-			logger.Info.Println("Loaded session token from /tmp/bw_session")
-		}
 	}
 
 	return &Client{
@@ -203,10 +194,7 @@ func (c *Client) fetchSecret(name string) (string, error) {
 		return "", fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	logger.Info.Printf("Found %d ciphers from Vaultwarden API", len(cipherResp.Data))
-
 	for _, cipher := range cipherResp.Data {
-		logger.Info.Printf("Cipher name: '%s' (looking for: '%s')", cipher.Name, name)
 		if cipher.Name == name {
 			return c.extractSecretValue(cipher)
 		}

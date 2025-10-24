@@ -57,12 +57,6 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("VAULTWARDEN_URL is required")
 	}
 
-	hasAPIKeys := cfg.VaultwardenClientID != "" && cfg.VaultwardenSecret != ""
-	hasSessionToken := cfg.VaultwardenToken != ""
-	if !hasAPIKeys && !hasSessionToken {
-		return nil, fmt.Errorf("either VAULTWARDEN_CLIENT_ID+VAULTWARDEN_CLIENT_SECRET or VAULTWARDEN_ACCESS_TOKEN is required")
-	}
-
 	// Validate and normalize URL
 	parsedURL, err := url.Parse(cfg.VaultwardenURL)
 	if err != nil {

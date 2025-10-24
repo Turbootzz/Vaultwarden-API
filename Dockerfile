@@ -25,17 +25,12 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     ./cmd/api
 
 # Final stage - minimal runtime image
-FROM alpine:3.19
+FROM node:24-alpine
 
-# Install CA certificates for HTTPS, wget for healthcheck, and Bitwarden CLI
-RUN apk --no-cache add ca-certificates wget nodejs npm && \
+# Install CA certificates and wget
+RUN apk --no-cache add ca-certificates wget && \
     npm install -g @bitwarden/cli && \
-    apk del npm && \
-    rm -rf /root/.npm
-
-# Create non-root user for security
-RUN addgroup -g 1000 appuser && \
-    adduser -D -u 1000 -G appuser appuser
+    npm cache clean --force
 
 # Set working directory
 WORKDIR /app
@@ -43,11 +38,14 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /build/vaultwarden-api .
 
-# Change ownership to non-root user
-RUN chown -R appuser:appuser /app
+# Change ownership to existing node user
+RUN chown -R node:node /app
+
+# Set Bitwarden CLI data directory to /tmp (writable)
+ENV BITWARDENCLI_APPDATA_DIR=/tmp/.bitwarden
 
 # Switch to non-root user
-USER appuser
+USER node
 
 # Expose port
 EXPOSE 8080
