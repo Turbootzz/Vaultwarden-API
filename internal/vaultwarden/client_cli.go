@@ -1,3 +1,4 @@
+// Package vaultwarden provides CLI-based secret retrieval
 package vaultwarden
 
 import (

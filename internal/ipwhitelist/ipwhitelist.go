@@ -1,3 +1,4 @@
+// Package ipwhitelist provides IP-based access control with GitHub Actions support
 package ipwhitelist
 
 import (
@@ -85,12 +86,20 @@ func (wl *IPWhitelist) Middleware() fiber.Handler {
 			return c.Next()
 		}
 
+		// Get client IP from Fiber
 		clientIP := c.IP()
 
-		// Handle comma-separated IPs from X-Forwarded-For header
-		// Take the first IP (original client IP before proxies)
-		ips := strings.Split(clientIP, ",")
-		realClientIP := strings.TrimSpace(ips[0])
+		// If c.IP() returns comma-separated IPs, parse them manually
+		// This happens when Fiber doesn't parse X-Forwarded-For despite TrustedProxies config
+		// We take the FIRST IP (leftmost = original client, rightmost = trusted proxy)
+		var realClientIP string
+		if strings.Contains(clientIP, ",") {
+			ips := strings.Split(clientIP, ",")
+			// Take first IP (original client before any proxies)
+			realClientIP = strings.TrimSpace(ips[0])
+		} else {
+			realClientIP = clientIP
+		}
 
 		if wl.IsAllowed(realClientIP) {
 			logger.Debug.Printf("IP allowed: %s", realClientIP)

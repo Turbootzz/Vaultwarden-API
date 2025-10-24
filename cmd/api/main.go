@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -79,8 +80,9 @@ func main() {
 		ErrorHandler: customErrorHandler(cfg.IsProd()),
 		// Enable trusted proxy check to prevent IP spoofing
 		EnableTrustedProxyCheck: true,
-		// Trust proxy headers from these IPs (Nginx Proxy Manager, Docker network)
-		TrustedProxies: []string{"127.0.0.1", "::1", "172.16.0.0/12", "10.0.0.0/8", "192.168.0.0/16"},
+		// IMPORTANT: Only trust your actual reverse proxy IP
+		// Default to localhost - update TRUSTED_PROXY_IP env var with your Nginx Proxy Manager IP
+		TrustedProxies: getTrustedProxies(),
 		// Use X-Forwarded-For header to get real client IP
 		ProxyHeader: fiber.HeaderXForwardedFor,
 	})
@@ -124,6 +126,12 @@ func main() {
 		<-sigChan
 
 		logger.Info.Println("Shutting down gracefully...")
+
+		// Stop IP update goroutine if running
+		if stopIPUpdate != nil {
+			stopIPUpdate()
+		}
+
 		if err := app.Shutdown(); err != nil {
 			logger.Error.Printf("Error during shutdown: %v", err)
 		}
@@ -132,8 +140,36 @@ func main() {
 	// Start server
 	addr := fmt.Sprintf(":%s", cfg.Port)
 	if err := app.Listen(addr); err != nil {
-		logger.Error.Fatalf("Failed to start server: %v", err)
+		// Clean up before exit
+		if stopIPUpdate != nil {
+			stopIPUpdate()
+		}
+		logger.Error.Printf("Failed to start server: %v", err)
+		os.Exit(1)
 	}
+}
+
+// getTrustedProxies returns the list of trusted proxy IPs
+func getTrustedProxies() []string {
+	// Default to localhost only (most secure)
+	defaultProxies := []string{"127.0.0.1", "::1"}
+
+	// Allow configuration via environment variable
+	if proxyIP := os.Getenv("TRUSTED_PROXY_IP"); proxyIP != "" {
+		proxies := strings.Split(proxyIP, ",")
+		result := make([]string, 0, len(defaultProxies)+len(proxies))
+		result = append(result, defaultProxies...)
+
+		for _, ip := range proxies {
+			trimmed := strings.TrimSpace(ip)
+			if trimmed != "" {
+				result = append(result, trimmed)
+			}
+		}
+		return result
+	}
+
+	return defaultProxies
 }
 
 // customErrorHandler creates a custom error handler

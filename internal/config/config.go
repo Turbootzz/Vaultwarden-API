@@ -1,3 +1,4 @@
+// Package config handles application configuration and validation
 package config
 
 import (
@@ -18,15 +19,15 @@ type Config struct {
 	WriteTimeout time.Duration
 
 	// Security
-	APIKey                string
-	AllowedIPs            []string
-	EnableGitHubIPRanges  bool
+	APIKey               string
+	AllowedIPs           []string
+	EnableGitHubIPRanges bool
 
-	VaultwardenURL      string
-	VaultwardenToken    string
-	VaultwardenClientID string
-	VaultwardenSecret   string
+	// Vaultwarden
+	VaultwardenURL   string
+	VaultwardenToken string
 
+	// Performance
 	CacheTTL           time.Duration
 	CORSAllowedOrigins string
 }
@@ -38,10 +39,8 @@ func Load() (*Config, error) {
 		Environment: getEnv("ENVIRONMENT", "development"),
 		APIKey:      os.Getenv("API_KEY"),
 
-		VaultwardenURL:      os.Getenv("VAULTWARDEN_URL"),
-		VaultwardenToken:    os.Getenv("VAULTWARDEN_ACCESS_TOKEN"),
-		VaultwardenClientID: os.Getenv("VAULTWARDEN_CLIENT_ID"),
-		VaultwardenSecret:   os.Getenv("VAULTWARDEN_CLIENT_SECRET"),
+		VaultwardenURL:   os.Getenv("VAULTWARDEN_URL"),
+		VaultwardenToken: os.Getenv("VAULTWARDEN_ACCESS_TOKEN"),
 
 		ReadTimeout:        parseDuration(getEnv("READ_TIMEOUT", "10s")),
 		WriteTimeout:       parseDuration(getEnv("WRITE_TIMEOUT", "10s")),
@@ -79,7 +78,7 @@ func Load() (*Config, error) {
 	// Validate and normalize URL
 	parsedURL, err := url.Parse(cfg.VaultwardenURL)
 	if err != nil {
-		return nil, fmt.Errorf("VAULTWARDEN_URL is invalid: %w", err)
+		return nil, fmt.Errorf("invalid VAULTWARDEN_URL: %w", err)
 	}
 	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
 		return nil, fmt.Errorf("VAULTWARDEN_URL must use http or https scheme")

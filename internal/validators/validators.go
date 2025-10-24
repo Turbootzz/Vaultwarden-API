@@ -1,3 +1,4 @@
+// Package validators provides input validation for secret names
 package validators
 
 import (

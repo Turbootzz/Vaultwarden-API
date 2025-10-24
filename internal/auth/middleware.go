@@ -1,3 +1,4 @@
+// Package auth provides API key authentication middleware
 package auth
 
 import (

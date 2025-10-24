@@ -1,23 +1,19 @@
+// Package vaultwarden provides a client for interacting with Vaultwarden via CLI
 package vaultwarden
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"sync"
 	"time"
 
 	"github.com/thijsherman/vaultwarden-api/pkg/logger"
 )
 
-// Client handles communication with Vaultwarden API
+// Client handles communication with Vaultwarden via CLI
 type Client struct {
-	baseURL     string
-	token       string // Legacy: session token for CLI fallback
-	authManager *AuthManager
-	httpClient  *http.Client
-	cache       *secretCache
+	baseURL string
+	token   string // Session token from CLI authentication
+	cache   *secretCache
 }
 
 // secretCache provides a simple in-memory cache with TTL
@@ -33,32 +29,7 @@ type cacheItem struct {
 	expiresAt time.Time
 }
 
-// CipherResponse represents a Bitwarden/Vaultwarden cipher (item)
-type CipherResponse struct {
-	Data []struct {
-		ID     string `json:"id"`
-		Type   int    `json:"type"` // 1 = Login, 2 = Note, 3 = Card, 4 = Identity
-		Name   string `json:"name"`
-		Login  *struct {
-			Username string `json:"username"`
-			Password string `json:"password"`
-			URIs     []struct {
-				URI string `json:"uri"`
-			} `json:"uris"`
-		} `json:"login,omitempty"`
-		Notes  string `json:"notes,omitempty"`
-		Fields []struct {
-			Name  string `json:"name"`
-			Value string `json:"value"`
-			Type  int    `json:"type"` // 0 = Text, 1 = Hidden, 2 = Boolean
-		} `json:"fields,omitempty"`
-	} `json:"data"`
-}
-
-// NewClient creates a new Vaultwarden client
-// token can be either:
-// - A session token (from bw unlock) for CLI-based access
-// - A client_id for API-based access (requires clientSecret via NewClientWithAuth)
+// NewClient creates a new Vaultwarden client with CLI session token
 func NewClient(baseURL, token string, cacheTTL time.Duration) *Client {
 	cache := &secretCache{
 		items:   make(map[string]*cacheItem),
@@ -73,34 +44,7 @@ func NewClient(baseURL, token string, cacheTTL time.Duration) *Client {
 	return &Client{
 		baseURL: baseURL,
 		token:   token,
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
-		cache: cache,
-	}
-}
-
-// NewClientWithAuth creates a client with API key authentication (recommended)
-// Use this method when you have client_id and client_secret from Vaultwarden
-func NewClientWithAuth(baseURL, clientID, clientSecret string, cacheTTL time.Duration) *Client {
-	cache := &secretCache{
-		items:   make(map[string]*cacheItem),
-		ttl:     cacheTTL,
-		enabled: cacheTTL > 0,
-	}
-
-	// Start cache cleanup goroutine if caching is enabled
-	if cacheTTL > 0 {
-		go cache.startCleanup(cacheTTL)
-	}
-
-	return &Client{
-		baseURL:     baseURL,
-		authManager: NewAuthManager(baseURL, clientID, clientSecret),
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
-		cache: cache,
+		cache:   cache,
 	}
 }
 
@@ -135,119 +79,9 @@ func (c *Client) GetSecret(name string) (string, error) {
 	return value, nil
 }
 
-// fetchSecret queries the Vaultwarden API for a secret
+// fetchSecret queries the Vaultwarden for a secret via CLI
 func (c *Client) fetchSecret(name string) (string, error) {
-	// Only try CLI if using session token (not client credentials)
-	if c.authManager == nil {
-		if value, err := c.FetchSecretViaCLI(name); err == nil {
-			return value, nil
-		} else {
-			logger.Warn.Printf("CLI method failed, trying API: %v", err)
-		}
-	}
-
-	// Use API method
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	url := fmt.Sprintf("%s/api/ciphers", c.baseURL)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set authentication header
-	var token string
-	var tokenErr error
-
-	if c.authManager != nil {
-		// Use API key authentication (preferred)
-		token, tokenErr = c.authManager.GetAccessToken()
-		if tokenErr != nil {
-			return "", fmt.Errorf("failed to get access token: %w", tokenErr)
-		}
-	} else {
-		// Fallback to session token
-		token = c.token
-	}
-
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Device-Type", "14") // SDK type
-
-	// Execute request
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Check response status
-	if resp.StatusCode != http.StatusOK {
-		// SECURITY: Do NOT log response body - may contain sensitive data
-		logger.Error.Printf("Vaultwarden API error (status %d)", resp.StatusCode)
-		return "", fmt.Errorf("vaultwarden api returned status %d", resp.StatusCode)
-	}
-
-	// Parse response
-	var cipherResp CipherResponse
-	if err := json.NewDecoder(resp.Body).Decode(&cipherResp); err != nil {
-		return "", fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	for _, cipher := range cipherResp.Data {
-		if cipher.Name == name {
-			return c.extractSecretValue(cipher)
-		}
-	}
-
-	return "", fmt.Errorf("secret not found: %s", name)
-}
-
-// extractSecretValue extracts the secret value from a cipher based on its type
-func (c *Client) extractSecretValue(cipher struct {
-	ID     string `json:"id"`
-	Type   int    `json:"type"`
-	Name   string `json:"name"`
-	Login  *struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-		URIs     []struct {
-			URI string `json:"uri"`
-		} `json:"uris"`
-	} `json:"login,omitempty"`
-	Notes  string `json:"notes,omitempty"`
-	Fields []struct {
-		Name  string `json:"name"`
-		Value string `json:"value"`
-		Type  int    `json:"type"`
-	} `json:"fields,omitempty"`
-}) (string, error) {
-	// Type 1 = Login item
-	if cipher.Type == 1 && cipher.Login != nil {
-		// Return password by default for login items
-		if cipher.Login.Password != "" {
-			return cipher.Login.Password, nil
-		}
-	}
-
-	// Type 2 = Secure note
-	if cipher.Type == 2 && cipher.Notes != "" {
-		return cipher.Notes, nil
-	}
-
-	// Check custom fields
-	for _, field := range cipher.Fields {
-		if field.Name == "value" || field.Name == "secret" {
-			return field.Value, nil
-		}
-	}
-
-	// If no specific field, return notes if available
-	if cipher.Notes != "" {
-		return cipher.Notes, nil
-	}
-
-	return "", fmt.Errorf("could not extract secret value from cipher")
+	return c.FetchSecretViaCLI(name)
 }
 
 // ClearCache clears all cached secrets
