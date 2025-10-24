@@ -27,8 +27,11 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
 # Final stage - minimal runtime image
 FROM alpine:3.19
 
-# Install CA certificates for HTTPS and wget for healthcheck
-RUN apk --no-cache add ca-certificates wget
+# Install CA certificates for HTTPS, wget for healthcheck, and Bitwarden CLI
+RUN apk --no-cache add ca-certificates wget nodejs npm && \
+    npm install -g @bitwarden/cli && \
+    apk del npm && \
+    rm -rf /root/.npm
 
 # Create non-root user for security
 RUN addgroup -g 1000 appuser && \

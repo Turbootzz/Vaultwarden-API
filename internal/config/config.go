@@ -19,12 +19,13 @@ type Config struct {
 	// Security
 	APIKey string
 
-	// Vaultwarden settings
-	VaultwardenURL   string
-	VaultwardenToken string
+	VaultwardenURL      string
+	VaultwardenToken    string
+	VaultwardenClientID string
+	VaultwardenSecret   string
 
-	// Cache settings
-	CacheTTL time.Duration
+	CacheTTL           time.Duration
+	CORSAllowedOrigins string
 }
 
 // Load reads configuration from environment variables
@@ -34,26 +35,32 @@ func Load() (*Config, error) {
 		Environment: getEnv("ENVIRONMENT", "development"),
 		APIKey:      os.Getenv("API_KEY"),
 
-		VaultwardenURL:   os.Getenv("VAULTWARDEN_URL"),
-		VaultwardenToken: os.Getenv("VAULTWARDEN_ACCESS_TOKEN"),
+		VaultwardenURL:      os.Getenv("VAULTWARDEN_URL"),
+		VaultwardenToken:    os.Getenv("VAULTWARDEN_ACCESS_TOKEN"),
+		VaultwardenClientID: os.Getenv("VAULTWARDEN_CLIENT_ID"),
+		VaultwardenSecret:   os.Getenv("VAULTWARDEN_CLIENT_SECRET"),
 
-		ReadTimeout:  parseDuration(getEnv("READ_TIMEOUT", "10s")),
-		WriteTimeout: parseDuration(getEnv("WRITE_TIMEOUT", "10s")),
-		CacheTTL:     parseDuration(getEnv("CACHE_TTL", "5m")),
+		ReadTimeout:        parseDuration(getEnv("READ_TIMEOUT", "10s")),
+		WriteTimeout:       parseDuration(getEnv("WRITE_TIMEOUT", "10s")),
+		CacheTTL:           parseDuration(getEnv("CACHE_TTL", "5m")),
+		CORSAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS", "http://localhost:3000"),
 	}
 
 	// Validate required fields
 	if cfg.APIKey == "" {
 		return nil, fmt.Errorf("API_KEY is required")
 	}
-	if len(cfg.APIKey) < 16 {
-		return nil, fmt.Errorf("API_KEY must be at least 16 characters for security")
+	if len(cfg.APIKey) < 32 {
+		return nil, fmt.Errorf("API_KEY must be at least 32 characters for security (run: openssl rand -base64 32)")
 	}
 	if cfg.VaultwardenURL == "" {
 		return nil, fmt.Errorf("VAULTWARDEN_URL is required")
 	}
-	if cfg.VaultwardenToken == "" {
-		return nil, fmt.Errorf("VAULTWARDEN_ACCESS_TOKEN is required")
+
+	hasAPIKeys := cfg.VaultwardenClientID != "" && cfg.VaultwardenSecret != ""
+	hasSessionToken := cfg.VaultwardenToken != ""
+	if !hasAPIKeys && !hasSessionToken {
+		return nil, fmt.Errorf("either VAULTWARDEN_CLIENT_ID+VAULTWARDEN_CLIENT_SECRET or VAULTWARDEN_ACCESS_TOKEN is required")
 	}
 
 	// Validate and normalize URL

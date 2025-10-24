@@ -29,7 +29,14 @@ func main() {
 	logger.Info.Printf("Starting Vaultwarden API on port %s (environment: %s)", cfg.Port, cfg.Environment)
 
 	// Initialize Vaultwarden client
-	vaultClient := vaultwarden.NewClient(cfg.VaultwardenURL, cfg.VaultwardenToken, cfg.CacheTTL)
+	var vaultClient *vaultwarden.Client
+	if cfg.VaultwardenClientID != "" && cfg.VaultwardenSecret != "" {
+		logger.Info.Println("Using API key authentication (recommended)")
+		vaultClient = vaultwarden.NewClientWithAuth(cfg.VaultwardenURL, cfg.VaultwardenClientID, cfg.VaultwardenSecret, cfg.CacheTTL)
+	} else {
+		logger.Warn.Println("Using session token authentication (legacy - token will expire!)")
+		vaultClient = vaultwarden.NewClient(cfg.VaultwardenURL, cfg.VaultwardenToken, cfg.CacheTTL)
+	}
 
 	// Initialize handlers
 	h := handlers.NewHandler(vaultClient)
@@ -46,23 +53,26 @@ func main() {
 		ErrorHandler: customErrorHandler(cfg.IsProd()),
 	})
 
-	// Security middleware
-	app.Use(helmet.New()) // Security headers
-	app.Use(recover.New()) // Recover from panics
+	app.Use(helmet.New())
+	app.Use(recover.New())
 	app.Use(compress.New(compress.Config{
 		Level: compress.LevelBestSpeed,
 	}))
 
-	// CORS configuration - adjust as needed
 	app.Use(cors.New(cors.Config{
-		AllowOrigins: "*", // Restrict this in production to specific domains
-		AllowMethods: "GET,POST",
-		AllowHeaders: "Authorization,Content-Type",
+		AllowOrigins:     cfg.CORSAllowedOrigins,
+		AllowMethods:     "GET,POST",
+		AllowHeaders:     "Authorization,Content-Type",
+		AllowCredentials: false,
 	}))
 
-	// Rate limiting to prevent abuse
 	app.Use(limiter.New(limiter.Config{
-		Max: 100, // 100 requests per minute per IP
+		Max: 30,
+		LimitReached: func(c *fiber.Ctx) error {
+			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+				"error": "too many requests, please slow down",
+			})
+		},
 	}))
 
 	// Public routes (no authentication required)

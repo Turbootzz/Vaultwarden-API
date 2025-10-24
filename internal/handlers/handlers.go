@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"github.com/gofiber/fiber/v2"
+	"github.com/thijsherman/vaultwarden-api/internal/validators"
 	"github.com/thijsherman/vaultwarden-api/internal/vaultwarden"
 	"github.com/thijsherman/vaultwarden-api/pkg/logger"
 )
@@ -37,10 +38,15 @@ func (h *Handler) GetSecret(c *fiber.Ctx) error {
 		})
 	}
 
-	// Fetch secret from Vaultwarden
+	if !validators.IsValidSecretName(secretName) {
+		logger.Warn.Printf("Invalid secret name attempted: %s", secretName)
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "invalid secret name format",
+		})
+	}
+
 	value, err := h.vaultClient.GetSecret(secretName)
 	if err != nil {
-		// Don't expose internal error details to client
 		logger.Error.Printf("Failed to fetch secret '%s': %v", secretName, err)
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "secret not found",

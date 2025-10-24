@@ -59,3 +59,5 @@ docker-compose.override.yml
 
 # Documentation artifacts
 CLAUDE.md
+docs/
+settings.local.json

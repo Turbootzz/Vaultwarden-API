@@ -13,10 +13,11 @@ import (
 
 // Client handles communication with Vaultwarden API
 type Client struct {
-	baseURL    string
-	token      string
-	httpClient *http.Client
-	cache      *secretCache
+	baseURL     string
+	token       string // Legacy: session token for CLI fallback
+	authManager *AuthManager
+	httpClient  *http.Client
+	cache       *secretCache
 }
 
 // secretCache provides a simple in-memory cache with TTL
@@ -55,6 +56,9 @@ type CipherResponse struct {
 }
 
 // NewClient creates a new Vaultwarden client
+// token can be either:
+// - A session token (from bw unlock) for CLI-based access
+// - A client_id for API-based access (requires clientSecret via NewClientWithAuth)
 func NewClient(baseURL, token string, cacheTTL time.Duration) *Client {
 	cache := &secretCache{
 		items:   make(map[string]*cacheItem),
@@ -70,6 +74,30 @@ func NewClient(baseURL, token string, cacheTTL time.Duration) *Client {
 	return &Client{
 		baseURL: baseURL,
 		token:   token,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+		cache: cache,
+	}
+}
+
+// NewClientWithAuth creates a client with API key authentication (recommended)
+// Use this method when you have client_id and client_secret from Vaultwarden
+func NewClientWithAuth(baseURL, clientID, clientSecret string, cacheTTL time.Duration) *Client {
+	cache := &secretCache{
+		items:   make(map[string]*cacheItem),
+		ttl:     cacheTTL,
+		enabled: cacheTTL > 0,
+	}
+
+	// Start cache cleanup goroutine if caching is enabled
+	if cacheTTL > 0 {
+		go cache.startCleanup(cacheTTL)
+	}
+
+	return &Client{
+		baseURL:     baseURL,
+		authManager: NewAuthManager(baseURL, clientID, clientSecret),
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -110,10 +138,20 @@ func (c *Client) GetSecret(name string) (string, error) {
 
 // fetchSecret queries the Vaultwarden API for a secret
 func (c *Client) fetchSecret(name string) (string, error) {
+	// First, try using the Bitwarden CLI if available
+	// This is more reliable for Vaultwarden instances
+	if value, err := c.FetchSecretViaCLI(name); err == nil {
+		return value, nil
+	} else {
+		logger.Warn.Printf("CLI method failed, trying API: %v", err)
+	}
+
+	// Fallback to API method
 	// Build the API request with context for timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Using the Bitwarden public API endpoint for list items
 	url := fmt.Sprintf("%s/api/ciphers", c.baseURL)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -121,8 +159,23 @@ func (c *Client) fetchSecret(name string) (string, error) {
 	}
 
 	// Set authentication header
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
+	var token string
+	var tokenErr error
+
+	if c.authManager != nil {
+		// Use API key authentication (preferred)
+		token, tokenErr = c.authManager.GetAccessToken()
+		if tokenErr != nil {
+			return "", fmt.Errorf("failed to get access token: %w", tokenErr)
+		}
+	} else {
+		// Fallback to session token
+		token = c.token
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Device-Type", "14") // SDK type
 
 	// Execute request
 	resp, err := c.httpClient.Do(req)

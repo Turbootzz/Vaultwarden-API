@@ -47,3 +47,8 @@ Dockerfile
 
 # Make
 Makefile
+
+# Documentation
+docs/
+CLAUDE.md
+settings.local.json
