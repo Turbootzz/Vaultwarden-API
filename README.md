@@ -4,11 +4,12 @@ A secure, lightweight Go API that acts as a proxy between your local apps and Va
 
 ## Features
 
-- **Secure**: API key authentication, HTTPS-ready, constant-time comparison, no sensitive logging
+- **Secure**: API key authentication, IP whitelisting, constant-time comparison, no sensitive logging
 - **Lightweight**: ~15MB Docker image, minimal resource usage
 - **Fast**: Built-in caching with configurable TTL
 - **Simple**: Clean architecture, easy to deploy and maintain
 - **Production-ready**: Rate limiting, health checks, graceful shutdown, security headers
+- **IP Whitelisting**: Restrict access by IP/CIDR with optional GitHub Actions support
 
 ## Architecture
 
@@ -40,8 +41,14 @@ A secure, lightweight Go API that acts as a proxy between your local apps and Va
 │   │   └── config.go           # Configuration management
 │   ├── handlers/
 │   │   └── handlers.go         # HTTP handlers
+│   ├── ipwhitelist/
+│   │   └── ipwhitelist.go      # IP-based access control
+│   ├── validators/
+│   │   └── validators.go       # Input validation
 │   └── vaultwarden/
-│       └── client.go           # Vaultwarden API client
+│       ├── client.go           # Vaultwarden client
+│       ├── client_cli.go       # CLI-based secret retrieval
+│       └── init.go             # Bitwarden CLI initialization
 ├── pkg/
 │   └── logger/
 │       └── logger.go           # Secure logging
@@ -84,7 +91,9 @@ A secure, lightweight Go API that acts as a proxy between your local apps and Va
    # Edit .env and add:
    # - API_KEY (generated above)
    # - VAULTWARDEN_URL (your Vaultwarden instance URL)
-   # - VAULTWARDEN_ACCESS_TOKEN (from Vaultwarden settings)
+   # - VAULTWARDEN_CLIENT_ID, VAULTWARDEN_CLIENT_SECRET, VAULTWARDEN_PASSWORD
+   #   (from Vaultwarden Account Settings → Security → Keys → View API Key)
+   # - ALLOWED_IPS (your IP address or CIDR range for security)
    ```
 
 4. **Run the application**
@@ -153,29 +162,120 @@ All configuration is done via environment variables:
 |----------|----------|---------|-------------|
 | `API_PORT` | No | `8080` | Port the API listens on |
 | `ENVIRONMENT` | No | `development` | Environment (development/production) |
-| `API_KEY` | **Yes** | - | API key for authentication |
+| `API_KEY` | **Yes** | - | API key for authentication (min 32 chars) |
 | `VAULTWARDEN_URL` | **Yes** | - | Vaultwarden instance URL |
-| `VAULTWARDEN_ACCESS_TOKEN` | **Yes** | - | Vaultwarden API access token |
+| `VAULTWARDEN_CLIENT_ID` | **Yes*** | - | Vaultwarden API client ID |
+| `VAULTWARDEN_CLIENT_SECRET` | **Yes*** | - | Vaultwarden API client secret |
+| `VAULTWARDEN_PASSWORD` | **Yes*** | - | Your Vaultwarden master password |
+| `VAULTWARDEN_ACCESS_TOKEN` | **Yes*** | - | Alternative: pre-generated session token |
+| `ALLOWED_IPS` | No | - | Comma-separated IPs/CIDRs to whitelist |
+| `ENABLE_GITHUB_IP_RANGES` | No | `false` | Allow GitHub Actions IPs (updates every 24h) |
+| `TRUSTED_PROXY_IP` | No | `localhost` | Trusted reverse proxy IPs/CIDRs |
+| `CORS_ALLOWED_ORIGINS` | No | `localhost:3000` | CORS allowed origins |
 | `CACHE_TTL` | No | `5m` | Cache duration (0 to disable) |
 | `READ_TIMEOUT` | No | `10s` | HTTP read timeout |
 | `WRITE_TIMEOUT` | No | `10s` | HTTP write timeout |
+| `DEBUG` | No | `false` | Enable debug logging |
 
-## Getting Vaultwarden Access Token
+**\*Note:** Either use `VAULTWARDEN_CLIENT_ID` + `VAULTWARDEN_CLIENT_SECRET` + `VAULTWARDEN_PASSWORD` (recommended) OR `VAULTWARDEN_ACCESS_TOKEN` (will expire).
 
-There are several ways to get an access token for Vaultwarden:
+## Getting Vaultwarden API Credentials
 
-1. **Via Web UI** (if available):
-   - Log into Vaultwarden
-   - Go to Settings → Security
-   - Generate a new API Key
+### Recommended Method: API Key Authentication
 
-2. **Via CLI** (for self-hosted):
-   - Use the Vaultwarden CLI or API to generate a token
-   - Refer to Vaultwarden documentation for your specific version
+1. **Get API Credentials from Vaultwarden Web UI**:
+   - Log into your Vaultwarden instance
+   - Go to **Account Settings** → **Security** → **Keys**
+   - Click **View API Key**
+   - You'll see:
+     - `client_id` (starts with `user.`)
+     - `client_secret` (long random string)
+   - Add these to your `.env` as `VAULTWARDEN_CLIENT_ID` and `VAULTWARDEN_CLIENT_SECRET`
+   - Add your master password as `VAULTWARDEN_PASSWORD`
 
-3. **Via Personal Access Token**:
-   - Some Vaultwarden versions support personal access tokens
-   - Check your instance's API documentation
+2. **Benefits**:
+   - ✅ Bypasses 2FA
+   - ✅ Automatically logs in on startup
+   - ✅ Never expires
+   - ✅ More secure than session tokens
+
+### Alternative Method: Session Token
+
+1. **Generate a session token manually**:
+   ```bash
+   # Login and unlock your vault
+   bw config server https://vault.yourdomain.com
+   bw login
+   SESSION_TOKEN=$(bw unlock --raw)
+   echo $SESSION_TOKEN
+   ```
+
+2. **Add to `.env`**:
+   ```bash
+   VAULTWARDEN_ACCESS_TOKEN=your-session-token-here
+   ```
+
+3. **Limitations**:
+   - ⚠️ Tokens expire after inactivity
+   - ⚠️ Requires manual regeneration
+   - ⚠️ Not recommended for production
+
+## IP Whitelisting
+
+The API supports IP-based access control for enhanced security.
+
+### Configuration
+
+**Allow specific IPs:**
+```bash
+ALLOWED_IPS=203.0.113.50
+```
+
+**Allow multiple IPs:**
+```bash
+ALLOWED_IPS=203.0.113.50,198.51.100.25
+```
+
+**Allow CIDR ranges:**
+```bash
+ALLOWED_IPS=192.168.1.0/24
+```
+
+**Mix IPs and CIDRs:**
+```bash
+ALLOWED_IPS=203.0.113.50,192.168.1.0/24,10.0.0.0/8
+```
+
+**Enable GitHub Actions (optional):**
+```bash
+ENABLE_GITHUB_IP_RANGES=true
+```
+This automatically whitelists all GitHub Actions IP ranges and updates them every 24 hours.
+
+### Trusted Proxies
+
+If you're running behind a reverse proxy (Nginx Proxy Manager, Traefik, Cloudflare), configure trusted proxies:
+
+**Single proxy IP:**
+```bash
+TRUSTED_PROXY_IP=172.18.0.5
+```
+
+**Docker network range:**
+```bash
+TRUSTED_PROXY_IP=172.16.0.0/12
+```
+
+**Multiple proxies:**
+```bash
+TRUSTED_PROXY_IP=172.18.0.5,192.168.1.10
+```
+
+**Important Notes:**
+- Invalid IPs/CIDRs are logged and ignored
+- Duplicates are automatically removed
+- The API extracts real client IPs from `X-Forwarded-For` header
+- If no whitelist is configured, all IPs are allowed (not recommended for production)
 
 ## Deployment Guide
 
@@ -193,6 +293,7 @@ There are several ways to get an access token for Vaultwarden:
 3. **Set environment variables in Portainer**
    - Click "Add environment variable"
    - Add all required variables (see Configuration table)
+   - **RECOMMENDED**: Add `ALLOWED_IPS` with your IP address
    - **IMPORTANT**: Never hardcode secrets in the stack file
 
 4. **Deploy the stack**
@@ -246,15 +347,18 @@ There are several ways to get an access token for Vaultwarden:
 ### Production Deployment
 
 1. **Always use HTTPS** via reverse proxy
-2. **Restrict CORS** to specific domains (edit `main.go`)
-3. **Set ENVIRONMENT=production** in `.env`
-4. **Enable rate limiting** (already configured)
-5. **Use read-only filesystem** (already in docker-compose)
-6. **Run as non-root user** (already in Dockerfile)
-7. **Monitor logs** for suspicious activity
-8. **Implement IP whitelisting** if possible
-9. **Use Docker secrets** instead of environment variables
-10. **Regular security updates** (rebuild images monthly)
+2. **Enable IP whitelisting** - Set `ALLOWED_IPS` to your trusted IPs/networks
+3. **Configure trusted proxies** - Set `TRUSTED_PROXY_IP` to your reverse proxy range
+4. **Restrict CORS** to specific domains via `CORS_ALLOWED_ORIGINS`
+5. **Set ENVIRONMENT=production** to hide detailed error messages
+6. **Use API key authentication** (not session tokens) for reliability
+7. **Enable rate limiting** (already configured: 30 req/min)
+8. **Use read-only filesystem** (already in docker-compose)
+9. **Run as non-root user** (already in Dockerfile)
+10. **Monitor logs** for suspicious activity and blocked IPs
+11. **Use Docker secrets** instead of environment variables when possible
+12. **Regular security updates** (rebuild images monthly)
+13. **Enable DEBUG=false** in production (default)
 
 ## Usage Examples
 
@@ -337,13 +441,35 @@ make generate-api-key # Generate a random API key
 - Use the Vaultwarden web UI to confirm the secret exists
 
 ### "Vaultwarden api returned status 401"
-- Your `VAULTWARDEN_ACCESS_TOKEN` is invalid or expired
-- Generate a new token from Vaultwarden settings
+- Your credentials are invalid or expired
+- For API key method: Check `VAULTWARDEN_CLIENT_ID`, `VAULTWARDEN_CLIENT_SECRET`, `VAULTWARDEN_PASSWORD`
+- For session token: Generate a new `VAULTWARDEN_ACCESS_TOKEN`
+
+### "IP blocked (not whitelisted)"
+- Your IP is not in the `ALLOWED_IPS` list
+- Check your current public IP: `curl ifconfig.me`
+- Add your IP to `ALLOWED_IPS` in `.env` or Portainer
+- If behind a proxy, ensure `TRUSTED_PROXY_IP` is set correctly
+- Enable `DEBUG=true` to see which IP is being detected
+
+### "Failed to initialize Bitwarden CLI"
+- Ensure Bitwarden CLI is installed in the Docker container (already done)
+- Check that `VAULTWARDEN_URL` is accessible from the container
+- Verify your master password is correct
+- Check logs for specific error messages
 
 ### Docker build fails
 - Ensure you have the latest Go version in Dockerfile
 - Run `go mod tidy` before building
 - Check for network issues when downloading dependencies
+
+## Recent Enhancements
+
+- ✅ **IP Whitelisting** - CIDR support, GitHub Actions IPs, automatic validation
+- ✅ **CLI Authentication** - Bitwarden CLI integration with API key support
+- ✅ **Trusted Proxies** - Proper client IP detection behind reverse proxies
+- ✅ **Input Validation** - Secure secret name validation
+- ✅ **Debug Logging** - Optional debug mode for troubleshooting
 
 ## Future Enhancements
 
@@ -380,13 +506,8 @@ This is a security-sensitive tool. Please:
 - Monitor access logs regularly
 - Report security issues privately
 
-## Support
 
-For issues and questions:
-- Open an issue on GitHub
-- Check existing issues for solutions
-- Provide detailed error messages and logs
 
 ---
 
-**Built with ❤️ using Go and Fiber**
+**Made by Thijs Herman**
