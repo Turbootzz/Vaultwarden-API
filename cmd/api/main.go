@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -65,7 +66,6 @@ func main() {
 	var stopIPUpdate func()
 	if cfg.EnableGitHubIPRanges {
 		stopIPUpdate = ipWhitelist.StartPeriodicUpdate(24 * time.Hour)
-		defer stopIPUpdate()
 	}
 
 	// Create Fiber app with security configurations
@@ -149,27 +149,58 @@ func main() {
 	}
 }
 
-// getTrustedProxies returns the list of trusted proxy IPs
+// getTrustedProxies returns the list of trusted proxy IPs with validation
 func getTrustedProxies() []string {
-	// Default to localhost only (most secure)
-	defaultProxies := []string{"127.0.0.1", "::1"}
+	seen := make(map[string]bool)
+	result := []string{}
 
-	// Allow configuration via environment variable
-	if proxyIP := os.Getenv("TRUSTED_PROXY_IP"); proxyIP != "" {
-		proxies := strings.Split(proxyIP, ",")
-		result := make([]string, 0, len(defaultProxies)+len(proxies))
-		result = append(result, defaultProxies...)
-
-		for _, ip := range proxies {
-			trimmed := strings.TrimSpace(ip)
-			if trimmed != "" {
-				result = append(result, trimmed)
-			}
-		}
-		return result
+	// Add defaults
+	for _, ip := range []string{"127.0.0.1", "::1"} {
+		result = append(result, ip)
+		seen[ip] = true
 	}
 
-	return defaultProxies
+	// Add from environment variable
+	if proxyIP := os.Getenv("TRUSTED_PROXY_IP"); proxyIP != "" {
+		proxies := strings.Split(proxyIP, ",")
+
+		for _, proxy := range proxies {
+			trimmed := strings.TrimSpace(proxy)
+			if trimmed == "" || seen[trimmed] {
+				continue
+			}
+
+			// Validate: check if it's a valid IP or CIDR
+			if err := validateIPOrCIDR(trimmed); err != nil {
+				logger.Warn.Printf("Ignoring invalid IP/CIDR in TRUSTED_PROXY_IP: %s (%v)", trimmed, err)
+				continue
+			}
+
+			result = append(result, trimmed)
+			seen[trimmed] = true
+		}
+	}
+
+	return result
+}
+
+// validateIPOrCIDR validates if a string is a valid IP address or CIDR range
+func validateIPOrCIDR(s string) error {
+	// Check if it's a CIDR range
+	if strings.Contains(s, "/") {
+		_, _, err := net.ParseCIDR(s)
+		if err != nil {
+			return fmt.Errorf("invalid CIDR: %w", err)
+		}
+		return nil
+	}
+
+	// Check if it's a valid IP
+	if net.ParseIP(s) == nil {
+		return fmt.Errorf("invalid IP address")
+	}
+
+	return nil
 }
 
 // customErrorHandler creates a custom error handler
