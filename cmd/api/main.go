@@ -30,18 +30,22 @@ func main() {
 
 	// Initialize Vaultwarden client
 	var vaultClient *vaultwarden.Client
-	if cfg.VaultwardenClientID != "" || cfg.VaultwardenSecret != "" {
-		if cfg.VaultwardenClientID == "" || cfg.VaultwardenSecret == "" {
-			logger.Error.Fatal("Both VaultwardenClientID and VaultwardenSecret must be provided for API key authentication")
+
+	vaultwardenEmail := os.Getenv("VAULTWARDEN_EMAIL")
+	vaultwardenPassword := os.Getenv("VAULTWARDEN_PASSWORD")
+
+	if vaultwardenEmail != "" && vaultwardenPassword != "" {
+		logger.Info.Println("Initializing Bitwarden CLI with credentials")
+		sessionToken, err := vaultwarden.InitializeBitwardenCLI(cfg.VaultwardenURL, vaultwardenEmail, vaultwardenPassword)
+		if err != nil {
+			logger.Error.Fatalf("Failed to initialize Bitwarden CLI: %v", err)
 		}
-		logger.Info.Println("Using API key authentication (recommended)")
-		vaultClient = vaultwarden.NewClientWithAuth(cfg.VaultwardenURL, cfg.VaultwardenClientID, cfg.VaultwardenSecret, cfg.CacheTTL)
-	} else {
-		if cfg.VaultwardenToken == "" {
-			logger.Error.Fatal("VaultwardenToken must be provided for legacy session token authentication")
-		}
-		logger.Warn.Println("Using session token authentication (legacy - token will expire!)")
+		vaultClient = vaultwarden.NewClient(cfg.VaultwardenURL, sessionToken, cfg.CacheTTL)
+	} else if cfg.VaultwardenToken != "" {
+		logger.Warn.Println("Using provided session token (will expire)")
 		vaultClient = vaultwarden.NewClient(cfg.VaultwardenURL, cfg.VaultwardenToken, cfg.CacheTTL)
+	} else {
+		logger.Error.Fatal("No authentication method configured. Set VAULTWARDEN_EMAIL+VAULTWARDEN_PASSWORD or VAULTWARDEN_ACCESS_TOKEN")
 	}
 
 	// Initialize handlers
