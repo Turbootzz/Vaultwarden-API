@@ -138,20 +138,18 @@ func (c *Client) GetSecret(name string) (string, error) {
 
 // fetchSecret queries the Vaultwarden API for a secret
 func (c *Client) fetchSecret(name string) (string, error) {
-	// First, try using the Bitwarden CLI if available
-	// This is more reliable for Vaultwarden instances
-	if value, err := c.FetchSecretViaCLI(name); err == nil {
-		return value, nil
-	} else {
-		logger.Warn.Printf("CLI method failed, trying API: %v", err)
+	// Only try CLI if using session token (not client credentials)
+	if c.authManager == nil {
+		if value, err := c.FetchSecretViaCLI(name); err == nil {
+			return value, nil
+		} else {
+			logger.Warn.Printf("CLI method failed, trying API: %v", err)
+		}
 	}
 
-	// Fallback to API method
-	// Build the API request with context for timeout
+	// Use API method
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	// Using the Bitwarden public API endpoint for list items
 	url := fmt.Sprintf("%s/api/ciphers", c.baseURL)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
