@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   vaultwarden-api:
     build:
@@ -10,37 +8,27 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     environment:
-      # Server configuration
       - API_PORT=8080
       - ENVIRONMENT=production
-
-      # Security - REQUIRED
-      # IMPORTANT: Change these values before deploying!
       - API_KEY=${API_KEY}
-
-      # Vaultwarden configuration
       - VAULTWARDEN_URL=${VAULTWARDEN_URL}
-      - VAULTWARDEN_ACCESS_TOKEN=${VAULTWARDEN_ACCESS_TOKEN}
-
-      # Performance
+      - VAULTWARDEN_EMAIL=${VAULTWARDEN_EMAIL}
+      - VAULTWARDEN_PASSWORD=${VAULTWARDEN_PASSWORD}
+      - ALLOWED_IPS=${ALLOWED_IPS}
+      - ENABLE_GITHUB_IP_RANGES=${ENABLE_GITHUB_IP_RANGES:-false}
+      - TRUSTED_PROXY_IP=${TRUSTED_PROXY_IP}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      - SYNC_INTERVAL=${SYNC_INTERVAL:-5m}
       - CACHE_TTL=5m
       - READ_TIMEOUT=10s
       - WRITE_TIMEOUT=10s
-
-    # Security: read-only filesystem (except for tmp)
     read_only: true
     tmpfs:
       - /tmp
-
-    # Security: drop all capabilities
     cap_drop:
       - ALL
-
-    # Security: prevent privilege escalation
     security_opt:
       - no-new-privileges:true
-
-    # Resource limits (adjust based on your needs)
     deploy:
       resources:
         limits:
@@ -49,33 +37,14 @@ services:
         reservations:
           cpus: '0.25'
           memory: 64M
-
-    # Health check
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
       interval: 30s
       timeout: 3s
       retries: 3
-      start_period: 5s
-
-    # Logging configuration
+      start_period: 10s
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
-
-    # Network configuration
-    networks:
-      - vaultwarden-network
-
-networks:
-  vaultwarden-network:
-    driver: bridge
-
-# For production deployment with Portainer Stack:
-# 1. Copy this file to your Portainer environment
-# 2. Set environment variables in Portainer's stack configuration
-# 3. Or create a .env file (but NEVER commit it to git!)
-# 4. Deploy behind a reverse proxy (Nginx Proxy Manager, Traefik, etc.)
-# 5. Ensure HTTPS is enabled on the reverse proxy

@@ -1,4 +1,4 @@
-// Package handlers provides HTTP request handlers for the API
+// Package handlers provides HTTP request handlers for the API.
 package handlers
 
 import (
@@ -8,27 +8,27 @@ import (
 	"github.com/thijsherman/vaultwarden-api/pkg/logger"
 )
 
-// Handler contains all HTTP handlers
+// Handler contains all HTTP handlers.
 type Handler struct {
 	vaultClient *vaultwarden.Client
 }
 
-// NewHandler creates a new handler instance
+// NewHandler creates a new handler instance.
 func NewHandler(vaultClient *vaultwarden.Client) *Handler {
 	return &Handler{
 		vaultClient: vaultClient,
 	}
 }
 
-// HealthCheck handles GET /health
+// HealthCheck handles GET /health.
 func (h *Handler) HealthCheck(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
-		"status": "ok",
+		"status":  "ok",
 		"service": "vaultwarden-api",
 	})
 }
 
-// GetSecret handles GET /secret/:name
+// GetSecret handles GET /secret/:name.
 func (h *Handler) GetSecret(c *fiber.Ctx) error {
 	secretName := c.Params("name")
 
@@ -48,20 +48,19 @@ func (h *Handler) GetSecret(c *fiber.Ctx) error {
 
 	value, err := h.vaultClient.GetSecret(secretName)
 	if err != nil {
-		logger.Error.Printf("Failed to fetch secret (requested by IP: %s): %v", c.IP(), err)
+		logger.Error.Printf("Failed to fetch secret (requested by IP: %s)", c.IP())
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "secret not found",
 		})
 	}
 
-	// Return the secret value
 	return c.JSON(fiber.Map{
 		"name":  secretName,
 		"value": value,
 	})
 }
 
-// RefreshCache handles POST /refresh
+// RefreshCache handles POST /refresh.
 func (h *Handler) RefreshCache(c *fiber.Ctx) error {
 	h.vaultClient.ClearCache()
 
