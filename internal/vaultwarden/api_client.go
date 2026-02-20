@@ -414,7 +414,7 @@ func (ac *APIClient) loginWithPassword(hashedPassword string) (*TokenResponse, e
 		"password":         {hashedPassword},
 		"scope":            {"api offline_access"},
 		"client_id":        {"web"},
-		"deviceType":       {"10"},
+		"deviceType":       {"14"},
 		"deviceIdentifier": {ac.deviceID},
 		"deviceName":       {"vaultwarden-api"},
 	}
@@ -429,7 +429,7 @@ func (ac *APIClient) loginWithAPIKey() (*TokenResponse, error) {
 		"client_id":        {ac.clientID},
 		"client_secret":    {ac.clientSecret},
 		"scope":            {"api"},
-		"deviceType":       {"10"},
+		"deviceType":       {"14"},
 		"deviceIdentifier": {ac.deviceID},
 		"deviceName":       {"vaultwarden-api"},
 	}
