@@ -1,152 +1,165 @@
-// Package vaultwarden provides a client for interacting with Vaultwarden via CLI
+// Package vaultwarden provides a production-ready client for retrieving secrets
+// from Vaultwarden using native Go HTTP and crypto (no CLI dependency).
 package vaultwarden
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/thijsherman/vaultwarden-api/pkg/logger"
 )
 
-// Client handles communication with Vaultwarden via CLI
+// Client manages vault access, caching, and background sync.
 type Client struct {
-	baseURL string
-	token   string // Session token from CLI authentication
-	cache   *secretCache
+	api       *APIClient
+	cacheTTL  time.Duration
+	syncEvery time.Duration
+
+	mu    sync.RWMutex
+	items map[string]DecryptedItem // keyed by lowercase name
+	byID  map[string]DecryptedItem // keyed by ID
+
+	stopSync chan struct{}
 }
 
-// secretCache provides a simple in-memory cache with TTL
-type secretCache struct {
-	mu      sync.RWMutex
-	items   map[string]*cacheItem
-	ttl     time.Duration
-	enabled bool
-}
-
-type cacheItem struct {
-	value     string
-	expiresAt time.Time
-}
-
-// NewClient creates a new Vaultwarden client with CLI session token
-func NewClient(baseURL, token string, cacheTTL time.Duration) *Client {
-	cache := &secretCache{
-		items:   make(map[string]*cacheItem),
-		ttl:     cacheTTL,
-		enabled: cacheTTL > 0,
-	}
-
-	if cacheTTL > 0 {
-		go cache.startCleanup(cacheTTL)
-	}
-
+// NewClient creates a new vault client backed by the native API client.
+func NewClient(api *APIClient, cacheTTL, syncInterval time.Duration) *Client {
 	return &Client{
-		baseURL: baseURL,
-		token:   token,
-		cache:   cache,
+		api:       api,
+		cacheTTL:  cacheTTL,
+		syncEvery: syncInterval,
+		items:     make(map[string]DecryptedItem),
+		byID:      make(map[string]DecryptedItem),
+		stopSync:  make(chan struct{}),
 	}
 }
 
-// GetSecret retrieves a secret by name from Vaultwarden
-// It first checks the cache, then queries the API if needed
+// Initialize authenticates and performs the initial vault sync.
+func (c *Client) Initialize() error {
+	if err := c.api.Authenticate(); err != nil {
+		return fmt.Errorf("authenticate: %w", err)
+	}
+
+	if err := c.syncVault(); err != nil {
+		return fmt.Errorf("initial sync: %w", err)
+	}
+
+	// Start background sync.
+	go c.backgroundSync()
+
+	return nil
+}
+
+// GetSecret retrieves a decrypted secret by name.
+// It searches by exact name (case-insensitive), then falls back to partial match.
 func (c *Client) GetSecret(name string) (string, error) {
-	// Validate input
 	if name == "" {
 		return "", fmt.Errorf("secret name cannot be empty")
 	}
 
-	// Check cache first
-	if c.cache.enabled {
-		if value, found := c.cache.get(name); found {
-			logger.Debug.Printf("Cache hit for secret")
-			return value, nil
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	key := strings.ToLower(name)
+
+	// Exact match.
+	if item, ok := c.items[key]; ok {
+		return extractSecret(item), nil
+	}
+
+	// Partial match (search).
+	for _, item := range c.items {
+		if strings.Contains(strings.ToLower(item.Name), key) {
+			logger.Debug.Printf("Partial match found for secret lookup")
+			return extractSecret(item), nil
 		}
 	}
 
-	// Cache miss - fetch from API
-	logger.Debug.Printf("Fetching secret from Vaultwarden (cache miss)")
-	value, err := c.fetchSecret(name)
-	if err != nil {
-		return "", err
-	}
-
-	// Store in cache
-	if c.cache.enabled {
-		c.cache.set(name, value)
-	}
-
-	return value, nil
+	return "", fmt.Errorf("secret not found")
 }
 
-// fetchSecret queries the Vaultwarden for a secret via CLI
-func (c *Client) fetchSecret(name string) (string, error) {
-	return c.FetchSecretViaCLI(name)
-}
-
-// ClearCache clears all cached secrets
+// ClearCache triggers a fresh vault sync.
 func (c *Client) ClearCache() {
-	if c.cache.enabled {
-		c.cache.clear()
-		logger.Info.Println("Cache cleared")
+	if err := c.syncVault(); err != nil {
+		logger.Error.Printf("Cache refresh sync failed: %v", err)
 	}
 }
 
-// Cache methods
-func (sc *secretCache) get(key string) (string, bool) {
-	sc.mu.RLock()
-	defer sc.mu.RUnlock()
-
-	item, found := sc.items[key]
-	if !found {
-		return "", false
-	}
-
-	// Check if expired
-	if time.Now().After(item.expiresAt) {
-		return "", false
-	}
-
-	return item.value, true
+// Stop stops the background sync goroutine.
+func (c *Client) Stop() {
+	close(c.stopSync)
 }
 
-func (sc *secretCache) set(key, value string) {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	sc.items[key] = &cacheItem{
-		value:     value,
-		expiresAt: time.Now().Add(sc.ttl),
+// syncVault fetches and decrypts all items from the vault.
+func (c *Client) syncVault() error {
+	items, err := c.api.Sync()
+	if err != nil {
+		return err
 	}
+
+	newItems := make(map[string]DecryptedItem, len(items))
+	newByID := make(map[string]DecryptedItem, len(items))
+
+	for _, item := range items {
+		key := strings.ToLower(item.Name)
+		newItems[key] = item
+		newByID[item.ID] = item
+	}
+
+	c.mu.Lock()
+	c.items = newItems
+	c.byID = newByID
+	c.mu.Unlock()
+
+	return nil
 }
 
-func (sc *secretCache) clear() {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	sc.items = make(map[string]*cacheItem)
-}
-
-// startCleanup runs a background goroutine to periodically remove expired cache entries
-// This prevents memory leaks from accumulating expired items
-func (sc *secretCache) startCleanup(interval time.Duration) {
-	ticker := time.NewTicker(interval)
+// backgroundSync periodically syncs the vault to pick up changes.
+func (c *Client) backgroundSync() {
+	ticker := time.NewTicker(c.syncEvery)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		sc.removeExpired()
+	for {
+		select {
+		case <-ticker.C:
+			if err := c.syncVault(); err != nil {
+				logger.Warn.Printf("Background sync failed: %v", err)
+			} else {
+				logger.Debug.Println("Background vault sync completed")
+			}
+		case <-c.stopSync:
+			logger.Info.Println("Background sync stopped")
+			return
+		}
 	}
 }
 
-// removeExpired removes all expired items from the cache
-func (sc *secretCache) removeExpired() {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
+// extractSecret extracts the most relevant secret value from a decrypted item.
+// Priority: password > field named "value"/"secret"/"api_key" > notes > first field.
+func extractSecret(item DecryptedItem) string {
+	if item.Password != "" {
+		return item.Password
+	}
 
-	now := time.Now()
-	for key, item := range sc.items {
-		if now.After(item.expiresAt) {
-			delete(sc.items, key)
+	// Check custom fields by priority.
+	for _, name := range []string{"value", "secret", "api_key", "apikey", "token"} {
+		if v, ok := item.Fields[name]; ok && v != "" {
+			return v
 		}
 	}
+
+	if item.Notes != "" {
+		return item.Notes
+	}
+
+	// Return first non-empty field value.
+	for _, v := range item.Fields {
+		if v != "" {
+			return v
+		}
+	}
+
+	return ""
 }

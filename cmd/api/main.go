@@ -24,7 +24,7 @@ import (
 )
 
 func main() {
-	// Load configuration
+	// Load configuration.
 	cfg, err := config.Load()
 	if err != nil {
 		logger.Error.Fatalf("Failed to load configuration: %v", err)
@@ -32,59 +32,57 @@ func main() {
 
 	logger.Info.Printf("Starting Vaultwarden API on port %s (environment: %s)", cfg.Port, cfg.Environment)
 
-	// Initialize Vaultwarden client
-	var vaultClient *vaultwarden.Client
+	// Initialize Vaultwarden client.
+	email := os.Getenv("VAULTWARDEN_EMAIL")
+	password := os.Getenv("VAULTWARDEN_PASSWORD")
+	clientID := os.Getenv("VAULTWARDEN_CLIENT_ID")
+	clientSecret := os.Getenv("VAULTWARDEN_CLIENT_SECRET")
 
-	vaultwardenClientID := os.Getenv("VAULTWARDEN_CLIENT_ID")
-	vaultwardenClientSecret := os.Getenv("VAULTWARDEN_CLIENT_SECRET")
-	vaultwardenPassword := os.Getenv("VAULTWARDEN_PASSWORD")
-
-	if vaultwardenClientID != "" && vaultwardenClientSecret != "" && vaultwardenPassword != "" {
-		logger.Info.Println("Initializing Bitwarden CLI with API key")
-		sessionToken, err := vaultwarden.InitializeBitwardenCLI(cfg.VaultwardenURL, vaultwardenClientID, vaultwardenClientSecret, vaultwardenPassword)
-		if err != nil {
-			logger.Error.Fatalf("Failed to initialize Bitwarden CLI: %v", err)
-		}
-		vaultClient = vaultwarden.NewClient(cfg.VaultwardenURL, sessionToken, cfg.CacheTTL)
-	} else if cfg.VaultwardenToken != "" {
-		logger.Warn.Println("Using provided session token (will expire)")
-		vaultClient = vaultwarden.NewClient(cfg.VaultwardenURL, cfg.VaultwardenToken, cfg.CacheTTL)
-	} else {
-		logger.Error.Fatal("No authentication configured. Set either (VAULTWARDEN_CLIENT_ID + VAULTWARDEN_CLIENT_SECRET + VAULTWARDEN_PASSWORD) or VAULTWARDEN_ACCESS_TOKEN")
+	if email == "" || password == "" {
+		logger.Error.Fatal("VAULTWARDEN_EMAIL and VAULTWARDEN_PASSWORD are required")
 	}
 
-	// Initialize handlers
+	syncInterval := parseDurationEnv("SYNC_INTERVAL", "5m")
+
+	vaultClient, err := vaultwarden.InitializeClient(
+		cfg.VaultwardenURL,
+		email,
+		password,
+		clientID,
+		clientSecret,
+		cfg.CacheTTL,
+		syncInterval,
+	)
+	if err != nil {
+		logger.Error.Fatalf("Failed to initialize Vaultwarden client: %v", err)
+	}
+
+	// Initialize handlers.
 	h := handlers.NewHandler(vaultClient)
 
-	// Initialize IP whitelist
+	// Initialize IP whitelist.
 	ipWhitelist, err := ipwhitelist.New(cfg.AllowedIPs, cfg.EnableGitHubIPRanges)
 	if err != nil {
 		logger.Error.Fatalf("Failed to initialize IP whitelist: %v", err)
 	}
 
-	// Start periodic GitHub IP range updates (every 24 hours)
+	// Start periodic GitHub IP range updates.
 	var stopIPUpdate func()
 	if cfg.EnableGitHubIPRanges {
 		stopIPUpdate = ipWhitelist.StartPeriodicUpdate(24 * time.Hour)
 	}
 
-	// Create Fiber app with security configurations
+	// Create Fiber app with security configurations.
 	app := fiber.New(fiber.Config{
-		AppName:               "Vaultwarden API v1.0",
+		AppName:               "Vaultwarden API v2.0",
 		DisableStartupMessage: false,
 		ReadTimeout:           cfg.ReadTimeout,
 		WriteTimeout:          cfg.WriteTimeout,
-		// Disable server header for security
-		ServerHeader: "",
-		// Don't expose stack traces in production
-		ErrorHandler: customErrorHandler(cfg.IsProd()),
-		// Enable trusted proxy check to prevent IP spoofing
+		ServerHeader:          "",
+		ErrorHandler:          customErrorHandler(cfg.IsProd()),
 		EnableTrustedProxyCheck: true,
-		// IMPORTANT: Only trust your actual reverse proxy IP
-		// Default to localhost - update TRUSTED_PROXY_IP env var with your Nginx Proxy Manager IP
-		TrustedProxies: getTrustedProxies(),
-		// Use X-Forwarded-For header to get real client IP
-		ProxyHeader: fiber.HeaderXForwardedFor,
+		TrustedProxies:        getTrustedProxies(),
+		ProxyHeader:           fiber.HeaderXForwardedFor,
 	})
 
 	app.Use(helmet.New())
@@ -100,10 +98,10 @@ func main() {
 		AllowCredentials: false,
 	}))
 
-	// Public routes (no authentication or IP whitelist required)
+	// Public routes.
 	app.Get("/health", h.HealthCheck)
 
-	// Protected routes (IP whitelist + API key required)
+	// Protected routes.
 	api := app.Group("/")
 	api.Use(ipWhitelist.Middleware())
 	api.Use(limiter.New(limiter.Config{
@@ -119,7 +117,7 @@ func main() {
 	api.Get("/secret/:name", h.GetSecret)
 	api.Post("/refresh", h.RefreshCache)
 
-	// Graceful shutdown
+	// Graceful shutdown.
 	go func() {
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -127,7 +125,8 @@ func main() {
 
 		logger.Info.Println("Shutting down gracefully...")
 
-		// Stop IP update goroutine if running
+		vaultClient.Stop()
+
 		if stopIPUpdate != nil {
 			stopIPUpdate()
 		}
@@ -137,10 +136,9 @@ func main() {
 		}
 	}()
 
-	// Start server
+	// Start server.
 	addr := fmt.Sprintf(":%s", cfg.Port)
 	if err := app.Listen(addr); err != nil {
-		// Clean up before exit
 		if stopIPUpdate != nil {
 			stopIPUpdate()
 		}
@@ -149,33 +147,40 @@ func main() {
 	}
 }
 
-// getTrustedProxies returns the list of trusted proxy IPs with validation
+// parseDurationEnv reads a duration from an env var with a fallback.
+func parseDurationEnv(key, fallback string) time.Duration {
+	s := os.Getenv(key)
+	if s == "" {
+		s = fallback
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 5 * time.Minute
+	}
+	return d
+}
+
+// getTrustedProxies returns the list of trusted proxy IPs.
 func getTrustedProxies() []string {
 	seen := make(map[string]bool)
 	result := []string{}
 
-	// Add defaults
 	for _, ip := range []string{"127.0.0.1", "::1"} {
 		result = append(result, ip)
 		seen[ip] = true
 	}
 
-	// Add from environment variable
 	if proxyIP := os.Getenv("TRUSTED_PROXY_IP"); proxyIP != "" {
 		proxies := strings.Split(proxyIP, ",")
-
 		for _, proxy := range proxies {
 			trimmed := strings.TrimSpace(proxy)
 			if trimmed == "" || seen[trimmed] {
 				continue
 			}
-
-			// Validate: check if it's a valid IP or CIDR
 			if err := validateIPOrCIDR(trimmed); err != nil {
 				logger.Warn.Printf("Ignoring invalid IP/CIDR in TRUSTED_PROXY_IP: %s (%v)", trimmed, err)
 				continue
 			}
-
 			result = append(result, trimmed)
 			seen[trimmed] = true
 		}
@@ -184,38 +189,28 @@ func getTrustedProxies() []string {
 	return result
 }
 
-// validateIPOrCIDR validates if a string is a valid IP address or CIDR range
+// validateIPOrCIDR validates an IP or CIDR string.
 func validateIPOrCIDR(s string) error {
-	// Check if it's a CIDR range
 	if strings.Contains(s, "/") {
 		_, _, err := net.ParseCIDR(s)
-		if err != nil {
-			return fmt.Errorf("invalid CIDR: %w", err)
-		}
-		return nil
+		return err
 	}
-
-	// Check if it's a valid IP
 	if net.ParseIP(s) == nil {
 		return fmt.Errorf("invalid IP address")
 	}
-
 	return nil
 }
 
-// customErrorHandler creates a custom error handler
+// customErrorHandler creates a custom error handler.
 func customErrorHandler(isProd bool) fiber.ErrorHandler {
 	return func(c *fiber.Ctx, err error) error {
 		code := fiber.StatusInternalServerError
-
 		if e, ok := err.(*fiber.Error); ok {
 			code = e.Code
 		}
 
-		// Log the error
 		logger.Error.Printf("Request error (status %d): %v", code, err)
 
-		// Don't expose internal errors in production
 		message := "Internal Server Error"
 		if !isProd {
 			message = err.Error()
