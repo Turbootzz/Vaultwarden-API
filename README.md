@@ -66,6 +66,35 @@ curl -H "Authorization: Bearer YOUR_API_KEY" \
 
 That's it. Your app reads secrets from the API instead of `.env` files.
 
+## Setting Up Your Secrets in Vaultwarden
+
+The API reads regular Vaultwarden/Bitwarden vault items. No special format needed — just create login items like you normally would.
+
+### Recommended: Create a dedicated user
+
+For security, **don't use your personal Vaultwarden account** (which has all your passwords). Instead:
+
+1. Create a new user in Vaultwarden (e.g., `secrets@yourdomain.com`)
+2. Log in as that user and add only the secrets your apps need
+3. Point this API at that dedicated account
+
+This way, the API only has access to the secrets you explicitly add — not your entire password vault.
+
+### How to store secrets
+
+Create a login item in Vaultwarden for each secret:
+
+| Field | What to put |
+|-------|-------------|
+| **Name** | The key you'll use in the API (e.g., `DATABASE_URL`) |
+| **Password** | The secret value |
+
+That's it. When you call `GET /secret/DATABASE_URL`, the API finds the item named "DATABASE_URL" and returns the password field.
+
+You can also use **custom fields** or **notes** — the API returns the most relevant value: password → custom fields → notes.
+
+> **Tip:** Name your items exactly like you'd name environment variables. It makes the mental mapping easy: `DATABASE_URL` in Vaultwarden = `DATABASE_URL` in your app.
+
 ## API Endpoints
 
 | Method | Path | Auth | Description |
@@ -105,6 +134,8 @@ With API key credentials set, the service uses `client_credentials` grant which 
 
 ## Docker Compose
 
+### Standalone
+
 ```yaml
 services:
   vaultwarden-api:
@@ -138,6 +169,41 @@ services:
       timeout: 3s
       retries: 3
 ```
+
+### Alongside your existing Vaultwarden
+
+Already running Vaultwarden in Docker? Add the API to the same stack:
+
+```yaml
+services:
+  vaultwarden:
+    image: vaultwarden/server:latest
+    # ... your existing vaultwarden config ...
+
+  vaultwarden-api:
+    image: ghcr.io/turbootzz/vaultwarden-api:latest
+    container_name: vaultwarden-api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      - VAULTWARDEN_URL=http://vaultwarden:80  # Internal Docker network
+      - VAULTWARDEN_EMAIL=${VAULTWARDEN_EMAIL}
+      - VAULTWARDEN_PASSWORD=${VAULTWARDEN_PASSWORD}
+      - API_KEY=${API_KEY}
+      - ENVIRONMENT=production
+    depends_on:
+      - vaultwarden
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+```
+
+> **Note:** When both containers are in the same Docker network, use `http://vaultwarden:80` as the URL (internal Docker DNS). No need to expose Vaultwarden's port to the host.
 
 ## Usage Examples
 
@@ -238,6 +304,19 @@ When you request `/secret/DATABASE_URL`, the API:
 3. Returns the most relevant value: password → custom field → notes
 
 This means you can name your Vaultwarden items naturally (e.g., "Database URL") and fetch them with any casing.
+
+## Troubleshooting
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `prelogin failed (HTTP 502)` | Can't reach Vaultwarden | Check `VAULTWARDEN_URL` — is it reachable from the container? |
+| `Two factor required` | Account has 2FA enabled | Set `VAULTWARDEN_CLIENT_ID` and `VAULTWARDEN_CLIENT_SECRET` (see [2FA section](#2fa--two-step-login)) |
+| `MAC verification failed` | Wrong password or org-owned items | Normal for items shared via organizations — they use a different key |
+| `missing authorization header` | No Bearer token in request | Add `-H "Authorization: Bearer YOUR_API_KEY"` to your request |
+| `secret not found` | Item name doesn't match | Check the exact name in your Vaultwarden vault (matching is case-insensitive) |
+| Container exits immediately | Missing required env vars | Ensure `VAULTWARDEN_URL`, `VAULTWARDEN_EMAIL`, `VAULTWARDEN_PASSWORD`, and `API_KEY` are all set |
+
+**Debug mode:** Set `DEBUG=true` to see detailed logs including secret names being synced (don't use in production).
 
 ## Contributing
 
