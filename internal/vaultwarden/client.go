@@ -59,13 +59,13 @@ func (c *Client) GetSecret(name string) (string, error) {
 	// Check cache first
 	if c.cache.enabled {
 		if value, found := c.cache.get(name); found {
-			logger.Debug.Printf("Cache hit for secret: %s", name)
+			logger.Debug.Printf("Cache hit for secret")
 			return value, nil
 		}
 	}
 
 	// Cache miss - fetch from API
-	logger.Debug.Printf("Fetching secret from Vaultwarden: %s", name)
+	logger.Debug.Printf("Fetching secret from Vaultwarden (cache miss)")
 	value, err := c.fetchSecret(name)
 	if err != nil {
 		return "", err

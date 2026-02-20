@@ -48,7 +48,7 @@ func (h *Handler) GetSecret(c *fiber.Ctx) error {
 
 	value, err := h.vaultClient.GetSecret(secretName)
 	if err != nil {
-		logger.Error.Printf("Failed to fetch secret (requested by IP: %s)", c.IP())
+		logger.Error.Printf("Failed to fetch secret (requested by IP: %s): %v", c.IP(), err)
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "secret not found",
 		})
