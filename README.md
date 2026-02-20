@@ -9,7 +9,7 @@ A lightweight, production-ready Go API that acts as a secrets bridge between you
 - **🚀 Zero external dependencies** — Pure Go binary, no Node.js, no Bitwarden CLI
 - **🔒 Native Bitwarden crypto** — AES-256-CBC + HMAC-SHA256, PBKDF2/Argon2id key derivation
 - **♻️ Auto token refresh** — Never worry about expired sessions again
-- **📦 ~15MB Docker image** — Alpine-based, runs as non-root
+- **📦 ~20MB Docker image** — Alpine-based, runs as non-root
 - **🛡️ Defense in depth** — API key auth, IP whitelisting, rate limiting, security headers
 - **⚡ Background vault sync** — Secrets always up-to-date (configurable interval)
 - **🏭 Production-ready** — Health checks, graceful shutdown, structured logging
@@ -82,6 +82,8 @@ That's it. Your app reads secrets from the API instead of `.env` files.
 | `VAULTWARDEN_EMAIL` | **Yes** | — | Your Vaultwarden email |
 | `VAULTWARDEN_PASSWORD` | **Yes** | — | Your master password |
 | `API_KEY` | **Yes** | — | API key for this service (min 32 chars) |
+| `VAULTWARDEN_CLIENT_ID` | No | — | API key client ID (bypasses 2FA — see below) |
+| `VAULTWARDEN_CLIENT_SECRET` | No | — | API key client secret (bypasses 2FA — see below) |
 | `ALLOWED_IPS` | No | (all) | Comma-separated IPs/CIDRs to whitelist |
 | `ENABLE_GITHUB_IP_RANGES` | No | `false` | Auto-whitelist GitHub Actions IPs |
 | `SYNC_INTERVAL` | No | `5m` | How often to re-sync the vault |
@@ -89,6 +91,17 @@ That's it. Your app reads secrets from the API instead of `.env` files.
 | `TRUSTED_PROXY_IP` | No | `localhost` | Trusted reverse proxy IPs |
 | `ENVIRONMENT` | No | `development` | Set to `production` to hide errors |
 | `DEBUG` | No | `false` | Enable debug logging |
+
+### 2FA / Two-Step Login
+
+If your Vaultwarden account has 2FA enabled, password login will be blocked. You need to use API key login instead:
+
+1. Log in to your Vaultwarden web vault
+2. Go to **Settings → Security → Keys** → **View API key**
+3. Set `VAULTWARDEN_CLIENT_ID` and `VAULTWARDEN_CLIENT_SECRET` in your environment
+4. The `VAULTWARDEN_PASSWORD` is still required — it's used for decryption, not authentication
+
+With API key credentials set, the service uses `client_credentials` grant which bypasses 2FA entirely.
 
 ## Docker Compose
 
