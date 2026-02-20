@@ -15,12 +15,12 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/helmet"
 	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"github.com/gofiber/fiber/v2/middleware/recover"
-	"github.com/thijsherman/vaultwarden-api/internal/auth"
-	"github.com/thijsherman/vaultwarden-api/internal/config"
-	"github.com/thijsherman/vaultwarden-api/internal/handlers"
-	"github.com/thijsherman/vaultwarden-api/internal/ipwhitelist"
-	"github.com/thijsherman/vaultwarden-api/internal/vaultwarden"
-	"github.com/thijsherman/vaultwarden-api/pkg/logger"
+	"github.com/Turbootzz/vaultwarden-api/internal/auth"
+	"github.com/Turbootzz/vaultwarden-api/internal/config"
+	"github.com/Turbootzz/vaultwarden-api/internal/handlers"
+	"github.com/Turbootzz/vaultwarden-api/internal/ipwhitelist"
+	"github.com/Turbootzz/vaultwarden-api/internal/vaultwarden"
+	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
 )
 
 func main() {

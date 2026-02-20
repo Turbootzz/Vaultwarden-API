@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/thijsherman/vaultwarden-api/pkg/logger"
+	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
 )
 
 // Client manages vault access, caching, and background sync.

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/thijsherman/vaultwarden-api/pkg/logger"
+	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
 )
 
 // InitializeClient creates and initializes a fully authenticated vault client.

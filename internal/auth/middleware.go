@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/thijsherman/vaultwarden-api/pkg/logger"
+	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
 )
 
 // Middleware creates an authentication middleware for API key validation

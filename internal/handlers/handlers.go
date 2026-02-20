@@ -3,9 +3,9 @@ package handlers
 
 import (
 	"github.com/gofiber/fiber/v2"
-	"github.com/thijsherman/vaultwarden-api/internal/validators"
-	"github.com/thijsherman/vaultwarden-api/internal/vaultwarden"
-	"github.com/thijsherman/vaultwarden-api/pkg/logger"
+	"github.com/Turbootzz/vaultwarden-api/internal/validators"
+	"github.com/Turbootzz/vaultwarden-api/internal/vaultwarden"
+	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
 )
 
 // Handler contains all HTTP handlers.

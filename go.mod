@@ -1,4 +1,4 @@
-module github.com/thijsherman/vaultwarden-api
+module github.com/Turbootzz/vaultwarden-api
 
 go 1.25.3
 

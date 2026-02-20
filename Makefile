@@ -2,7 +2,7 @@
 
 # Variables
 APP_NAME=vaultwarden-api
-DOCKER_IMAGE=turboot/$(APP_NAME)
+DOCKER_IMAGE=ghcr.io/turbootzz/$(APP_NAME)
 VERSION?=latest
 
 help: ## Show this help message
@@ -79,7 +79,7 @@ docker-run: ## Run Docker container locally
 		--name $(APP_NAME) \
 		$(DOCKER_IMAGE):latest
 
-docker-push: docker-buildx-setup ## Build for AMD64 and push Docker image to registry
+docker-push: docker-buildx-setup ## Build for AMD64 and push Docker image to GHCR
 	@echo "Building and pushing Docker image for AMD64: $(DOCKER_IMAGE):$(VERSION)..."
 	docker buildx build \
 		--platform linux/amd64 \
@@ -88,6 +88,15 @@ docker-push: docker-buildx-setup ## Build for AMD64 and push Docker image to reg
 		-t $(DOCKER_IMAGE):latest \
 		.
 	@echo "Docker image pushed successfully to $(DOCKER_IMAGE):$(VERSION) and $(DOCKER_IMAGE):latest"
+
+docker-push-tag: docker-buildx-setup ## Build and push with a specific tag (e.g., make docker-push-tag VERSION=v2.0)
+	@echo "Building and pushing: $(DOCKER_IMAGE):$(VERSION)..."
+	docker buildx build \
+		--platform linux/amd64 \
+		--push \
+		-t $(DOCKER_IMAGE):$(VERSION) \
+		.
+	@echo "Pushed $(DOCKER_IMAGE):$(VERSION)"
 
 docker-compose-up: ## Start services with docker-compose
 	@if [ ! -f .env ]; then \
