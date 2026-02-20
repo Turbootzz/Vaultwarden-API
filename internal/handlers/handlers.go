@@ -40,7 +40,7 @@ func (h *Handler) GetSecret(c *fiber.Ctx) error {
 	}
 
 	if !validators.IsValidSecretName(secretName) {
-		logger.Warn.Printf("Invalid secret name attempted: %s", secretName)
+		logger.Warn.Printf("Invalid secret name format attempted from IP: %s", c.IP())
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "invalid secret name format",
 		})
@@ -48,7 +48,7 @@ func (h *Handler) GetSecret(c *fiber.Ctx) error {
 
 	value, err := h.vaultClient.GetSecret(secretName)
 	if err != nil {
-		logger.Error.Printf("Failed to fetch secret '%s': %v", secretName, err)
+		logger.Error.Printf("Failed to fetch secret (requested by IP: %s)", c.IP())
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "secret not found",
 		})
