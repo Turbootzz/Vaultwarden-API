@@ -19,7 +19,7 @@ A lightweight, production-ready Go API that acts as a secrets bridge between you
 ```
 ┌─────────────┐    HTTPS + API Key    ┌──────────────────────┐    Native Go    ┌──────────────┐
 │  Your App   │ ────────────────────> │  Vaultwarden API     │ ──────────────> │  Vaultwarden │
-│  (any lang) │ <──────────────────── │  (Go, ~15MB image)   │ <────────────── │  Server      │
+│  (any lang) │ <──────────────────── │  (Go, ~20MB image)   │ <────────────── │  Server      │
 └─────────────┘    JSON response      │                      │  Encrypted API  └──────────────┘
                                       │  • Auto token refresh│
                                       │  • Background sync   │
@@ -211,7 +211,7 @@ resp, _ := http.DefaultClient.Do(req)
 │       ├── client.go                 # Secret lookup + caching
 │       └── init.go                   # Initialization with retry
 ├── pkg/logger/logger.go              # Structured logging
-├── Dockerfile                        # Multi-stage build (~15MB image)
+├── Dockerfile                        # Multi-stage build (~20MB image)
 ├── docker-compose.yml                # Production-ready compose
 └── go.mod
 ```
