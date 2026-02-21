@@ -61,4 +61,3 @@ docker-compose.override.yml
 CLAUDE.md
 docs/
 settings.local.json
-reddit-post-draft.md
