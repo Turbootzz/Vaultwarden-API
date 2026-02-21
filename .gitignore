@@ -60,4 +60,5 @@ docker-compose.override.yml
 # Documentation artifacts
 CLAUDE.md
 docs/
-settings.local.jsonreddit-post-draft.md
+settings.local.json
+reddit-post-draft.md
