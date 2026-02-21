@@ -40,20 +40,30 @@ type SyncResponse struct {
 
 // SyncProfile contains user profile info.
 type SyncProfile struct {
-	ID    string `json:"id"`
-	Email string `json:"email"`
-	Key   string `json:"key"`
+	ID            string           `json:"id"`
+	Email         string           `json:"email"`
+	Key           string           `json:"key"`
+	PrivateKey    string           `json:"privateKey"`
+	Organizations []SyncOrganization `json:"organizations"`
+}
+
+// SyncOrganization represents an organization the user belongs to.
+type SyncOrganization struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Key  string `json:"key"`
 }
 
 // SyncCipher represents an encrypted vault item from the sync response.
 type SyncCipher struct {
-	ID    string      `json:"id"`
-	Type  int         `json:"type"`
-	Name  string      `json:"name"`
-	Notes *string     `json:"notes"`
-	Login *SyncLogin  `json:"login"`
-	Card  *SyncCard   `json:"card"`
-	Fields []SyncField `json:"fields"`
+	ID             string      `json:"id"`
+	Type           int         `json:"type"`
+	OrganizationID *string     `json:"organizationId"`
+	Name           string      `json:"name"`
+	Notes          *string     `json:"notes"`
+	Login          *SyncLogin  `json:"login"`
+	Card           *SyncCard   `json:"card"`
+	Fields         []SyncField `json:"fields"`
 }
 
 // SyncLogin contains encrypted login data.
@@ -304,10 +314,41 @@ func (ac *APIClient) Sync() ([]DecryptedItem, error) {
 		return nil, fmt.Errorf("decode sync response: %w", err)
 	}
 
+	// Decrypt org keys if organizations are present.
+	orgKeys := make(map[string]SymmetricKey)
+	if len(syncResp.Profile.Organizations) > 0 && syncResp.Profile.PrivateKey != "" {
+		privateKey, err := DecryptPrivateKey(syncResp.Profile.PrivateKey, key)
+		if err != nil {
+			logger.Warn.Printf("Failed to decrypt RSA private key, org items will be skipped: %v", err)
+		} else {
+			for _, org := range syncResp.Profile.Organizations {
+				orgKey, err := DecryptOrgKey(org.Key, privateKey)
+				if err != nil {
+					logger.Warn.Printf("Failed to decrypt org key for %s: %v", org.ID, err)
+					continue
+				}
+				orgKeys[org.ID] = orgKey
+				logger.Debug.Printf("Decrypted org key for organization %s", org.ID)
+			}
+			logger.Info.Printf("Decrypted %d organization key(s)", len(orgKeys))
+		}
+	}
+
 	// Decrypt all ciphers.
 	items := make([]DecryptedItem, 0, len(syncResp.Ciphers))
 	for _, c := range syncResp.Ciphers {
-		item, err := decryptCipher(c, key)
+		// Select the correct decryption key.
+		decryptKey := key
+		if c.OrganizationID != nil && *c.OrganizationID != "" {
+			if orgKey, ok := orgKeys[*c.OrganizationID]; ok {
+				decryptKey = orgKey
+			} else {
+				logger.Debug.Printf("No org key for cipher %s (org %s), skipping", c.ID, *c.OrganizationID)
+				continue
+			}
+		}
+
+		item, err := decryptCipher(c, decryptKey)
 		if err != nil {
 			logger.Debug.Printf("Failed to decrypt cipher %s: %v", c.ID, err)
 			continue

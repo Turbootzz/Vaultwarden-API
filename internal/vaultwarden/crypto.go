@@ -6,7 +6,10 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
+	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -41,7 +44,8 @@ type SymmetricKey struct {
 }
 
 // CipherString represents an encrypted Bitwarden value.
-// Format: "<encType>.<iv>|<ciphertext>|<mac>"
+// Format for AES types: "<encType>.<iv>|<ciphertext>|<mac>"
+// Format for RSA types: "<encType>.<ciphertext>"
 type CipherString struct {
 	Type int
 	IV   []byte
@@ -92,6 +96,13 @@ func ParseCipherString(s string) (*CipherString, error) {
 		}
 		if cs.MAC, err = base64.StdEncoding.DecodeString(pieces[2]); err != nil {
 			return nil, fmt.Errorf("invalid MAC: %w", err)
+		}
+
+	case EncTypeRsa2048_OaepSha256_B64, EncTypeRsa2048_OaepSha1_B64:
+		// RSA types: single base64-encoded ciphertext, no IV or MAC.
+		raw := strings.Join(pieces, "|") // rejoin in case base64 contained no pipes
+		if cs.CT, err = base64.StdEncoding.DecodeString(raw); err != nil {
+			return nil, fmt.Errorf("invalid RSA ciphertext: %w", err)
 		}
 
 	default:
@@ -243,6 +254,77 @@ func DecryptSymmetricKey(encryptedKey string, masterKey []byte) (SymmetricKey, e
 	// The decrypted key is 64 bytes: first 32 = encKey, last 32 = macKey.
 	if len(decrypted) != 64 {
 		return SymmetricKey{}, fmt.Errorf("unexpected symmetric key length: %d (expected 64)", len(decrypted))
+	}
+
+	return SymmetricKey{
+		EncKey: decrypted[:32],
+		MacKey: decrypted[32:],
+	}, nil
+}
+
+// DecryptRSA decrypts a CipherString using an RSA private key (OAEP).
+// Supports type 3 (SHA-256) and type 4 (SHA-1).
+func (cs *CipherString) DecryptRSA(privateKey *rsa.PrivateKey) ([]byte, error) {
+	switch cs.Type {
+	case EncTypeRsa2048_OaepSha256_B64:
+		return rsa.DecryptOAEP(sha256.New(), nil, privateKey, cs.CT, nil)
+	case EncTypeRsa2048_OaepSha1_B64:
+		return rsa.DecryptOAEP(sha1.New(), nil, privateKey, cs.CT, nil)
+	default:
+		return nil, fmt.Errorf("not an RSA cipher type: %d", cs.Type)
+	}
+}
+
+// DecryptPrivateKey decrypts the user's encrypted RSA private key from the sync response.
+// The private key is AES-CBC encrypted with the user's symmetric key.
+// When decrypted, it's a PKCS8 DER-encoded RSA private key.
+func DecryptPrivateKey(encryptedPrivateKey string, symKey SymmetricKey) (*rsa.PrivateKey, error) {
+	if encryptedPrivateKey == "" {
+		return nil, errors.New("encrypted private key is empty")
+	}
+
+	cs, err := ParseCipherString(encryptedPrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("parse private key cipher string: %w", err)
+	}
+
+	derBytes, err := cs.Decrypt(symKey)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt private key: %w", err)
+	}
+
+	parsed, err := x509.ParsePKCS8PrivateKey(derBytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse PKCS8 private key: %w", err)
+	}
+
+	rsaKey, ok := parsed.(*rsa.PrivateKey)
+	if !ok {
+		return nil, errors.New("private key is not RSA")
+	}
+
+	return rsaKey, nil
+}
+
+// DecryptOrgKey decrypts an organization's symmetric key using the user's RSA private key.
+// The org key is RSA-OAEP encrypted. When decrypted, it's 64 bytes: encKey(32) + macKey(32).
+func DecryptOrgKey(encryptedOrgKey string, privateKey *rsa.PrivateKey) (SymmetricKey, error) {
+	if encryptedOrgKey == "" {
+		return SymmetricKey{}, errors.New("encrypted org key is empty")
+	}
+
+	cs, err := ParseCipherString(encryptedOrgKey)
+	if err != nil {
+		return SymmetricKey{}, fmt.Errorf("parse org key cipher string: %w", err)
+	}
+
+	decrypted, err := cs.DecryptRSA(privateKey)
+	if err != nil {
+		return SymmetricKey{}, fmt.Errorf("RSA decrypt org key: %w", err)
+	}
+
+	if len(decrypted) != 64 {
+		return SymmetricKey{}, fmt.Errorf("unexpected org key length: %d (expected 64)", len(decrypted))
 	}
 
 	return SymmetricKey{
