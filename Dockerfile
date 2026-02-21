@@ -17,7 +17,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     ./cmd/api
 
 # Runtime stage — pure Alpine, no Node.js
-FROM alpine:3.21
+FROM alpine:3.23
 
 RUN apk --no-cache add ca-certificates wget && \
     adduser -D -H appuser
