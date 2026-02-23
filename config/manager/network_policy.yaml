@@ -1,0 +1,43 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vaultwarden-operator
+  namespace: vaultwarden-operator-system
+  labels:
+    app.kubernetes.io/name: vaultwarden-operator
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: vaultwarden-operator
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Kubelet health and readiness probes (/healthz, /readyz on :8081)
+    - ports:
+        - port: 8081
+          protocol: TCP
+    # Uncomment to allow Prometheus metrics scraping from a monitoring namespace:
+    # - from:
+    #     - namespaceSelector:
+    #         matchLabels:
+    #           kubernetes.io/metadata.name: monitoring
+    #   ports:
+    #     - port: 8080
+    #       protocol: TCP
+  egress:
+    # DNS — required for resolving the Vaultwarden hostname and Kubernetes API server
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Kubernetes API server (kubernetes.default.svc:443) and Vaultwarden (HTTPS).
+    # Port 6443 covers clusters that expose kube-apiserver on its default port.
+    # If your Vaultwarden instance runs on a non-standard port, add it here.
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
