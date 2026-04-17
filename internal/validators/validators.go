@@ -47,11 +47,11 @@ func SanitizeSecretName(name string) (string, bool) {
 
 func IsValidFilterQueryValue(s string) bool {
 	s = strings.TrimSpace(s)
-	if s == "" || len(s) > 256 {
+	if s == "" || len(s) > SecretNameMaxLength {
 		return false
 	}
 	for _, r := range s {
-		if r == 0 || r == '\n' || r == '\r' {
+		if r < 32 || r == 127 {
 			return false
 		}
 	}

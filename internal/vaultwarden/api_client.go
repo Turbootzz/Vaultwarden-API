@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -313,6 +314,8 @@ func decryptVaultLabel(raw string, keys ...SymmetricKey) string {
 		}
 	}
 	// If not a ciphertext, return as-is
+	// NOTE: This does not mean that the decryption will silently fail and return the raw value if
+	// the decryption fails during MAC verification (that part still throws an error as it should)
 	if _, err := ParseCipherString(raw); err != nil {
 		return raw
 	}
@@ -375,25 +378,31 @@ func buildSyncNameMaps(syncResp SyncResponse, userKey SymmetricKey, orgKeys map[
 	return out
 }
 
-// LookupIDByName returns the first id whose display name equals target (case-insensitive, trimmed).
+// LookupIDByName returns an id whose display name equals target (case-insensitive, trimmed).
+// If several ids share that name, it returns the lexicographically smallest id.
 func LookupIDByName(idToName map[string]string, target string) (id string, ok bool) {
 	target = strings.TrimSpace(target)
 	if target == "" || len(idToName) == 0 {
 		return "", false
 	}
+	var matches []string
 	for id, n := range idToName {
 		if strings.EqualFold(strings.TrimSpace(n), target) {
-			return id, true
+			matches = append(matches, id)
 		}
 	}
-	return "", false
+	if len(matches) == 0 {
+		return "", false
+	}
+	sort.Strings(matches)
+	return matches[0], true
 }
 
 // Sync fetches and decrypts all vault items and returns them along with maps of decrypted
 // organization, folder, and collection names.
 func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 	if err := ac.EnsureValidToken(); err != nil {
-		return nil, SyncNameMaps{}, fmt.Errorf("ensure valid token: %w", err)
+		return nil, emptySyncNameMaps(), fmt.Errorf("ensure valid token: %w", err)
 	}
 
 	ac.mu.RLock()
@@ -403,20 +412,20 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 
 	req, err := http.NewRequest("GET", ac.baseURL+"/api/sync", nil)
 	if err != nil {
-		return nil, SyncNameMaps{}, fmt.Errorf("create sync request: %w", err)
+		return nil, emptySyncNameMaps(), fmt.Errorf("create sync request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := ac.httpClient.Do(req)
 	if err != nil {
-		return nil, SyncNameMaps{}, fmt.Errorf("sync request: %w", err)
+		return nil, emptySyncNameMaps(), fmt.Errorf("sync request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized {
 		// Token might be invalid, try to refresh and retry once.
 		if err := ac.RefreshAccessToken(); err != nil {
-			return nil, SyncNameMaps{}, fmt.Errorf("sync auth failed, refresh failed: %w", err)
+			return nil, emptySyncNameMaps(), fmt.Errorf("sync auth failed, refresh failed: %w", err)
 		}
 		ac.mu.RLock()
 		token = ac.accessToken
@@ -425,19 +434,19 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp, err = ac.httpClient.Do(req)
 		if err != nil {
-			return nil, SyncNameMaps{}, fmt.Errorf("sync retry: %w", err)
+			return nil, emptySyncNameMaps(), fmt.Errorf("sync retry: %w", err)
 		}
 		defer resp.Body.Close()
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, SyncNameMaps{}, fmt.Errorf("sync failed (HTTP %d): %s", resp.StatusCode, string(body))
+		return nil, emptySyncNameMaps(), fmt.Errorf("sync failed (HTTP %d): %s", resp.StatusCode, string(body))
 	}
 
 	var syncResp SyncResponse
 	if err := json.NewDecoder(resp.Body).Decode(&syncResp); err != nil {
-		return nil, SyncNameMaps{}, fmt.Errorf("decode sync response: %w", err)
+		return nil, emptySyncNameMaps(), fmt.Errorf("decode sync response: %w", err)
 	}
 
 	// Decrypt org keys if organizations are present.

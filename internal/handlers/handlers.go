@@ -117,7 +117,27 @@ func parseUUIDQuery(field, raw string) (string, error) {
 	return parsed.String(), nil
 }
 
+// resolveDim sets *out from either a friendly name (resolved via NameMaps) or a raw id.
+// Name lookups use vaultwarden.LookupIDByName and return an error when the name is unknown.
+// Id branch copies the value through without verifying it exists in the vault—only format
+// validation (parseUUIDQuery) applies earlier. That asymmetry is intentional.
+func resolveDim(dim, name, id string, nameMap map[string]string, out *string) error {
+	switch {
+	case name != "":
+		resolved, ok := vaultwarden.LookupIDByName(nameMap, name)
+		if !ok {
+			return fmt.Errorf("unknown %s_name", dim)
+		}
+		*out = resolved
+	case id != "":
+		*out = id
+	}
+	return nil
+}
+
 // parseSecretFilters reads placement query params: at most one of id or name per dimension.
+// Name-based filters are resolved against h.vaultClient.NameMaps(); unknown names fail.
+// Id-based filters are accepted as-is after UUID parsing (existence is not checked here).
 func (h *Handler) parseSecretFilters(c *fiber.Ctx) (vaultwarden.SecretFilter, error) {
 	var out vaultwarden.SecretFilter
 
@@ -161,37 +181,14 @@ func (h *Handler) parseSecretFilters(c *fiber.Ctx) (vaultwarden.SecretFilter, er
 
 	nm := h.vaultClient.NameMaps()
 
-	switch {
-	case orgName != "":
-		id, ok := vaultwarden.LookupIDByName(nm.Organizations, orgName)
-		if !ok {
-			return out, fmt.Errorf("unknown organization_name")
-		}
-		out.OrganizationID = id
-	case orgID != "":
-		out.OrganizationID = orgID
+	if err := resolveDim("organization", orgName, orgID, nm.Organizations, &out.OrganizationID); err != nil {
+		return out, err
 	}
-
-	switch {
-	case colName != "":
-		id, ok := vaultwarden.LookupIDByName(nm.Collections, colName)
-		if !ok {
-			return out, fmt.Errorf("unknown collection_name")
-		}
-		out.CollectionID = id
-	case colID != "":
-		out.CollectionID = colID
+	if err := resolveDim("collection", colName, colID, nm.Collections, &out.CollectionID); err != nil {
+		return out, err
 	}
-
-	switch {
-	case folderName != "":
-		id, ok := vaultwarden.LookupIDByName(nm.Folders, folderName)
-		if !ok {
-			return out, fmt.Errorf("unknown folder_name")
-		}
-		out.FolderID = id
-	case folderID != "":
-		out.FolderID = folderID
+	if err := resolveDim("folder", folderName, folderID, nm.Folders, &out.FolderID); err != nil {
+		return out, err
 	}
 
 	return out, nil

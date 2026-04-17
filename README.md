@@ -305,7 +305,7 @@ When you request `/secret/DATABASE_URL`, the API:
 
 This means you can name your Vaultwarden items naturally (e.g., "Database URL") and fetch them with any casing.
 
-**Colliding names**: By default, the first match will be selected and returned. To help distinguish between matches with the same name, you can split them up into different organisations, collections, or folders to your liking.
+**Colliding names**: By default, the first match will be selected and returned. To help distinguish between matches with the same name, you can split them up into different organizations, collections, or folders to your liking.
 You can then use either the ID or the name of these groupings as a filter for the request.
 Examples:
 - `GET /secret/DATABASE_URL?organization_name=Organization1`
