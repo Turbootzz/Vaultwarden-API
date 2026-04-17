@@ -8,7 +8,7 @@ import (
 
 const SecretNameMaxLength = 255
 
-var SecretNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_\-\./]*[a-zA-Z0-9]$`)
+var SecretNamePattern = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9 _\-\./]*[a-zA-Z0-9])?$`)
 
 func IsValidSecretName(name string) bool {
 	if len(name) == 0 || len(name) > SecretNameMaxLength {
@@ -43,4 +43,17 @@ func SanitizeSecretName(name string) (string, bool) {
 	}
 
 	return "", false
+}
+
+func IsValidFilterQueryValue(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" || len(s) > 256 {
+		return false
+	}
+	for _, r := range s {
+		if r == 0 || r == '\n' || r == '\r' {
+			return false
+		}
+	}
+	return true
 }

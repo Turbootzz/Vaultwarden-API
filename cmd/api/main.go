@@ -9,18 +9,18 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/compress"
-	"github.com/gofiber/fiber/v2/middleware/cors"
-	"github.com/gofiber/fiber/v2/middleware/helmet"
-	"github.com/gofiber/fiber/v2/middleware/limiter"
-	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/Turbootzz/vaultwarden-api/internal/auth"
 	"github.com/Turbootzz/vaultwarden-api/internal/config"
 	"github.com/Turbootzz/vaultwarden-api/internal/handlers"
 	"github.com/Turbootzz/vaultwarden-api/internal/ipwhitelist"
 	"github.com/Turbootzz/vaultwarden-api/internal/vaultwarden"
 	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/compress"
+	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v2/middleware/helmet"
+	"github.com/gofiber/fiber/v2/middleware/limiter"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 )
 
 func main() {
@@ -74,15 +74,17 @@ func main() {
 
 	// Create Fiber app with security configurations.
 	app := fiber.New(fiber.Config{
-		AppName:               "Vaultwarden API v2.0",
-		DisableStartupMessage: false,
-		ReadTimeout:           cfg.ReadTimeout,
-		WriteTimeout:          cfg.WriteTimeout,
-		ServerHeader:          "",
-		ErrorHandler:          customErrorHandler(cfg.IsProd()),
+		AppName:                 "Vaultwarden API v2.0",
+		DisableStartupMessage:   false,
+		ReadTimeout:             cfg.ReadTimeout,
+		WriteTimeout:            cfg.WriteTimeout,
+		ServerHeader:            "",
+		ErrorHandler:            customErrorHandler(cfg.IsProd()),
 		EnableTrustedProxyCheck: true,
-		TrustedProxies:        getTrustedProxies(),
-		ProxyHeader:           fiber.HeaderXForwardedFor,
+		TrustedProxies:          getTrustedProxies(),
+		ProxyHeader:             fiber.HeaderXForwardedFor,
+		// Avoid empty c.IP() when header is missing (e.g. behind a trusted proxy)
+		EnableIPValidation: true,
 	})
 
 	app.Use(helmet.New())

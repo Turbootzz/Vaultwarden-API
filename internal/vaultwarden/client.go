@@ -4,6 +4,7 @@ package vaultwarden
 
 import (
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -18,8 +19,10 @@ type Client struct {
 	syncEvery time.Duration
 
 	mu    sync.RWMutex
-	items map[string]DecryptedItem // keyed by lowercase name
-	byID  map[string]DecryptedItem // keyed by ID
+	items map[string]DecryptedItem // keyed by cipher id
+
+	// nameMaps from the last successful sync (for resolving filter names to UUIDs).
+	nameMaps SyncNameMaps
 
 	stopSync chan struct{}
 }
@@ -31,7 +34,6 @@ func NewClient(api *APIClient, cacheTTL, syncInterval time.Duration) *Client {
 		cacheTTL:  cacheTTL,
 		syncEvery: syncInterval,
 		items:     make(map[string]DecryptedItem),
-		byID:      make(map[string]DecryptedItem),
 		stopSync:  make(chan struct{}),
 	}
 }
@@ -52,9 +54,39 @@ func (c *Client) Initialize() error {
 	return nil
 }
 
+// SecretFilter limits lookup by vault placement. Empty fields are ignored (no constraint).
+// Use at most one of organization id vs name, etc., enforced at the HTTP layer.
+type SecretFilter struct {
+	OrganizationID string
+	CollectionID   string
+	FolderID       string
+}
+
+func matchesSecretFilter(item DecryptedItem, f SecretFilter) bool {
+	if f.OrganizationID != "" && !strings.EqualFold(item.OrganizationID, f.OrganizationID) {
+		return false
+	}
+	if f.CollectionID != "" {
+		found := false
+		for _, id := range item.CollectionIDs {
+			if strings.EqualFold(id, f.CollectionID) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	if f.FolderID != "" && !strings.EqualFold(item.FolderID, f.FolderID) {
+		return false
+	}
+	return true
+}
+
 // GetSecret retrieves a decrypted secret by name.
 // It searches by exact name (case-insensitive), then falls back to partial match.
-func (c *Client) GetSecret(name string) (string, error) {
+func (c *Client) GetSecret(name string, filter SecretFilter) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("secret name cannot be empty")
 	}
@@ -64,13 +96,21 @@ func (c *Client) GetSecret(name string) (string, error) {
 
 	key := strings.ToLower(name)
 
-	// Exact match.
-	if item, ok := c.items[key]; ok {
-		return extractSecret(item), nil
+	candidates := make([]DecryptedItem, 0, len(c.items))
+	for _, item := range c.items {
+		if matchesSecretFilter(item, filter) {
+			candidates = append(candidates, item)
+		}
 	}
 
-	// Partial match (search).
-	for _, item := range c.items {
+	// Case 1: Exact match.
+	for _, item := range candidates {
+		if strings.EqualFold(item.Name, name) {
+			return extractSecret(item), nil
+		}
+	}
+	// Case 2: Partial match
+	for _, item := range candidates {
 		if strings.Contains(strings.ToLower(item.Name), key) {
 			logger.Debug.Printf("Partial match found for secret lookup")
 			return extractSecret(item), nil
@@ -92,25 +132,36 @@ func (c *Client) Stop() {
 	close(c.stopSync)
 }
 
+// NameMaps returns a copy of decrypted organization, folder, and collection names
+// from the last successful vault sync.
+func (c *Client) NameMaps() SyncNameMaps {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return SyncNameMaps{
+		Organizations: maps.Clone(c.nameMaps.Organizations),
+		Folders:       maps.Clone(c.nameMaps.Folders),
+		Collections:   maps.Clone(c.nameMaps.Collections),
+	}
+}
+
 // syncVault fetches and decrypts all items from the vault.
 func (c *Client) syncVault() error {
-	items, err := c.api.Sync()
+	items, nameMaps, err := c.api.Sync()
 	if err != nil {
 		return err
 	}
 
 	newItems := make(map[string]DecryptedItem, len(items))
-	newByID := make(map[string]DecryptedItem, len(items))
-
 	for _, item := range items {
-		key := strings.ToLower(item.Name)
-		newItems[key] = item
-		newByID[item.ID] = item
+		if item.ID == "" {
+			continue
+		}
+		newItems[item.ID] = item
 	}
 
 	c.mu.Lock()
 	c.items = newItems
-	c.byID = newByID
+	c.nameMaps = nameMaps
 	c.mu.Unlock()
 
 	return nil

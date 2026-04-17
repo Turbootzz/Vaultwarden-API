@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
+	"github.com/google/uuid"
 )
 
 // PreloginResponse contains the KDF parameters from the server.
@@ -34,16 +34,18 @@ type TokenResponse struct {
 
 // SyncResponse contains the full vault sync data.
 type SyncResponse struct {
-	Profile SyncProfile  `json:"profile"`
-	Ciphers []SyncCipher `json:"ciphers"`
+	Profile     SyncProfile      `json:"profile"`
+	Ciphers     []SyncCipher     `json:"ciphers"`
+	Collections []SyncCollection `json:"collections"`
+	Folders     []SyncFolder     `json:"folders"`
 }
 
 // SyncProfile contains user profile info.
 type SyncProfile struct {
-	ID            string           `json:"id"`
-	Email         string           `json:"email"`
-	Key           string           `json:"key"`
-	PrivateKey    string           `json:"privateKey"`
+	ID            string             `json:"id"`
+	Email         string             `json:"email"`
+	Key           string             `json:"key"`
+	PrivateKey    string             `json:"privateKey"`
 	Organizations []SyncOrganization `json:"organizations"`
 }
 
@@ -54,11 +56,26 @@ type SyncOrganization struct {
 	Key  string `json:"key"`
 }
 
+// SyncCollection represents a collection that logins can be assigned to.
+type SyncCollection struct {
+	ID             string `json:"id"`
+	OrganizationID string `json:"organizationId"`
+	Name           string `json:"name"`
+}
+
+// SyncFolder represents a folder that logins can be assigned to.
+type SyncFolder struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
 // SyncCipher represents an encrypted vault item from the sync response.
 type SyncCipher struct {
 	ID             string      `json:"id"`
 	Type           int         `json:"type"`
 	OrganizationID *string     `json:"organizationId"`
+	CollectionIDs  []string    `json:"collectionIds"`
+	FolderID       *string     `json:"folderId"`
 	Name           string      `json:"name"`
 	Notes          *string     `json:"notes"`
 	Login          *SyncLogin  `json:"login"`
@@ -264,10 +281,119 @@ func (ac *APIClient) EnsureValidToken() error {
 	return nil
 }
 
-// Sync fetches and decrypts all vault items.
-func (ac *APIClient) Sync() ([]DecryptedItem, error) {
+// SyncNameMaps holds decrypted display names keyed by Vaultwarden UUID (from sync).
+type SyncNameMaps struct {
+	Organizations map[string]string // organization id -> name (decrypted with user symmetric key)
+	Folders       map[string]string // folder id -> name (decrypted with user symmetric key)
+	Collections   map[string]string // collection id -> name (decrypted with org symmetric key)
+}
+
+func emptySyncNameMaps() SyncNameMaps {
+	return SyncNameMaps{
+		Organizations: make(map[string]string),
+		Folders:       make(map[string]string),
+		Collections:   make(map[string]string),
+	}
+}
+
+// decryptVaultLabel decrypts a cipher string using the given keys in order.
+// If the value is not a valid cipher string (e.g. plaintext from the server), it is returned as-is
+func decryptVaultLabel(raw string, keys ...SymmetricKey) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	for _, k := range keys {
+		if len(k.EncKey) == 0 {
+			continue
+		}
+		out, err := DecryptStr(raw, k)
+		if err == nil && out != "" {
+			return out
+		}
+	}
+	// If not a ciphertext, return as-is
+	if _, err := ParseCipherString(raw); err != nil {
+		return raw
+	}
+	logger.Debug.Printf("decryptVaultLabel: could not decrypt ciphertext-form value")
+	return ""
+}
+
+// buildSyncNameMaps decrypts organization, folder, and collection names from a sync response.
+// Organization names are tried with the user symmetric key first, then that org's symmetric key
+// Folder names use the user key; collection names use the org key.
+func buildSyncNameMaps(syncResp SyncResponse, userKey SymmetricKey, orgKeys map[string]SymmetricKey) SyncNameMaps {
+	out := emptySyncNameMaps()
+
+	for _, org := range syncResp.Profile.Organizations {
+		if org.ID == "" {
+			continue
+		}
+		var keys []SymmetricKey
+		keys = append(keys, userKey)
+		if k, ok := orgKeys[org.ID]; ok {
+			keys = append(keys, k)
+		}
+		name := decryptVaultLabel(org.Name, keys...)
+		if name == "" {
+			logger.Debug.Printf("Empty organization display name for org %s (raw len=%d)", org.ID, len(org.Name))
+			continue
+		}
+		out.Organizations[org.ID] = name
+	}
+
+	for _, f := range syncResp.Folders {
+		if f.ID == "" {
+			continue
+		}
+		name := decryptVaultLabel(f.Name, userKey)
+		if name == "" {
+			logger.Debug.Printf("Empty folder name for folder %s", f.ID)
+			continue
+		}
+		out.Folders[f.ID] = name
+	}
+
+	for _, col := range syncResp.Collections {
+		if col.ID == "" || col.OrganizationID == "" {
+			continue
+		}
+		orgKey, ok := orgKeys[col.OrganizationID]
+		if !ok {
+			logger.Debug.Printf("No org key for collection %s (org %s), skipping name decrypt", col.ID, col.OrganizationID)
+			continue
+		}
+		name := decryptVaultLabel(col.Name, orgKey)
+		if name == "" {
+			logger.Debug.Printf("Empty collection name for collection %s", col.ID)
+			continue
+		}
+		out.Collections[col.ID] = name
+	}
+
+	return out
+}
+
+// LookupIDByName returns the first id whose display name equals target (case-insensitive, trimmed).
+func LookupIDByName(idToName map[string]string, target string) (id string, ok bool) {
+	target = strings.TrimSpace(target)
+	if target == "" || len(idToName) == 0 {
+		return "", false
+	}
+	for id, n := range idToName {
+		if strings.EqualFold(strings.TrimSpace(n), target) {
+			return id, true
+		}
+	}
+	return "", false
+}
+
+// Sync fetches and decrypts all vault items and returns them along with maps of decrypted
+// organization, folder, and collection names.
+func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 	if err := ac.EnsureValidToken(); err != nil {
-		return nil, fmt.Errorf("ensure valid token: %w", err)
+		return nil, SyncNameMaps{}, fmt.Errorf("ensure valid token: %w", err)
 	}
 
 	ac.mu.RLock()
@@ -277,20 +403,20 @@ func (ac *APIClient) Sync() ([]DecryptedItem, error) {
 
 	req, err := http.NewRequest("GET", ac.baseURL+"/api/sync", nil)
 	if err != nil {
-		return nil, fmt.Errorf("create sync request: %w", err)
+		return nil, SyncNameMaps{}, fmt.Errorf("create sync request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := ac.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("sync request: %w", err)
+		return nil, SyncNameMaps{}, fmt.Errorf("sync request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized {
 		// Token might be invalid, try to refresh and retry once.
 		if err := ac.RefreshAccessToken(); err != nil {
-			return nil, fmt.Errorf("sync auth failed, refresh failed: %w", err)
+			return nil, SyncNameMaps{}, fmt.Errorf("sync auth failed, refresh failed: %w", err)
 		}
 		ac.mu.RLock()
 		token = ac.accessToken
@@ -299,19 +425,19 @@ func (ac *APIClient) Sync() ([]DecryptedItem, error) {
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp, err = ac.httpClient.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("sync retry: %w", err)
+			return nil, SyncNameMaps{}, fmt.Errorf("sync retry: %w", err)
 		}
 		defer resp.Body.Close()
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("sync failed (HTTP %d): %s", resp.StatusCode, string(body))
+		return nil, SyncNameMaps{}, fmt.Errorf("sync failed (HTTP %d): %s", resp.StatusCode, string(body))
 	}
 
 	var syncResp SyncResponse
 	if err := json.NewDecoder(resp.Body).Decode(&syncResp); err != nil {
-		return nil, fmt.Errorf("decode sync response: %w", err)
+		return nil, SyncNameMaps{}, fmt.Errorf("decode sync response: %w", err)
 	}
 
 	// Decrypt org keys if organizations are present.
@@ -357,19 +483,32 @@ func (ac *APIClient) Sync() ([]DecryptedItem, error) {
 	}
 
 	logger.Info.Printf("Synced and decrypted %d vault items", len(items))
-	return items, nil
+
+	nameMaps := buildSyncNameMaps(syncResp, key, orgKeys)
+
+	logger.Info.Printf(
+		"Synced %d organizations, %d folders, and %d collections",
+		len(syncResp.Profile.Organizations),
+		len(syncResp.Folders),
+		len(syncResp.Collections),
+	)
+
+	return items, nameMaps, nil
 }
 
 // DecryptedItem is a decrypted vault item ready for cache lookup.
 type DecryptedItem struct {
-	ID       string
-	Type     int
-	Name     string
-	Username string
-	Password string
-	Notes    string
-	URI      string
-	Fields   map[string]string
+	ID             string
+	Type           int
+	Name           string
+	Username       string
+	Password       string
+	Notes          string
+	URI            string
+	Fields         map[string]string
+	OrganizationID string
+	CollectionIDs  []string
+	FolderID       string
 }
 
 // decryptCipher decrypts a single vault cipher into a DecryptedItem.
@@ -416,6 +555,16 @@ func decryptCipher(c SyncCipher, key SymmetricKey) (DecryptedItem, error) {
 		if name != "" {
 			item.Fields[name] = value
 		}
+	}
+
+	if c.OrganizationID != nil {
+		item.OrganizationID = strings.TrimSpace(*c.OrganizationID)
+	}
+	if len(c.CollectionIDs) > 0 {
+		item.CollectionIDs = append([]string(nil), c.CollectionIDs...)
+	}
+	if c.FolderID != nil {
+		item.FolderID = strings.TrimSpace(*c.FolderID)
 	}
 
 	return item, nil
