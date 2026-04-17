@@ -305,6 +305,20 @@ When you request `/secret/DATABASE_URL`, the API:
 
 This means you can name your Vaultwarden items naturally (e.g., "Database URL") and fetch them with any casing.
 
+**Colliding names**: By default, the first match will be selected and returned. To help distinguish between matches with the same name, you can split them up into different organisations, collections, or folders to your liking.
+You can then use either the ID or the name of these groupings as a filter for the request.
+Examples:
+- `GET /secret/DATABASE_URL?organization_name=Organization1`
+- `GET /secret/DATABASE_URL?organization_id=<organization_uuid>`
+- `GET /secret/DATABASE_URL?collection_name=Project1`
+- `GET /secret/DATABASE_URL?collection_id=<collection_uuid>`
+- `GET /secret/DATABASE_URL?folder_name=Deployments`
+- `GET /secret/DATABASE_URL?folder_id=<folder_uuid>`
+
+You can combine the filters for even more fine-grained filtering, as such:
+- `GET /secret/DATABASE_URL?organization_name=Organization1&collection_name=Project1`
+However, for each dimension (organization | collection | folder) you can only filter on one value. Additionally, specifying the name and the ID are mutually exclusive; you cannot specify both at the same time.
+
 ## Troubleshooting
 
 | Error | Cause | Fix |
