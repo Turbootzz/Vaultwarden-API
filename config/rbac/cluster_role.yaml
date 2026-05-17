@@ -1,0 +1,70 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vaultwarden-operator
+  labels:
+    app.kubernetes.io/name: vaultwarden-operator
+    app.kubernetes.io/managed-by: kustomize
+rules:
+  # VaultwardenSecret resources
+  - apiGroups:
+      - secrets.vaultwarden.io
+    resources:
+      - vaultwardensecrets
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - secrets.vaultwarden.io
+    resources:
+      - vaultwardensecrets/status
+    verbs:
+      - get
+      - update
+      - patch
+  - apiGroups:
+      - secrets.vaultwarden.io
+    resources:
+      - vaultwardensecrets/finalizers
+    verbs:
+      - update
+  # Native Kubernetes Secrets (managed output)
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  # Events
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+  # Leader election (coordination.k8s.io/leases)
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete

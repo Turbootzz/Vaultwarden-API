@@ -318,6 +318,12 @@ This means you can name your Vaultwarden items naturally (e.g., "Database URL") 
 
 **Debug mode:** Set `DEBUG=true` to see detailed logs including secret names being synced (don't use in production).
 
+## Kubernetes Operator
+
+Want to sync Vaultwarden secrets directly into Kubernetes `Secret` objects? The companion operator lets you declare a `VaultwardenSecret` custom resource and have it automatically kept in sync.
+
+See **[README-OPERATOR.md](README-OPERATOR.md)** for installation and usage.
+
 ## Contributing
 
 Contributions welcome! Fork → branch → PR.
