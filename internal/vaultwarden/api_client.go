@@ -298,8 +298,9 @@ func emptySyncNameMaps() SyncNameMaps {
 }
 
 // decryptVaultLabel decrypts a cipher string using the given keys in order.
-// If the value is not a valid cipher string (e.g. plaintext from the server), it is returned as-is
-func decryptVaultLabel(raw string, keys ...SymmetricKey) string {
+// decryptVaultLabel decrypts a cipher string using the given keys in order.
+// The entityKind and entityID are used for tracing during logging.
+func decryptVaultLabel(raw, entityKind, entityID string, keys ...SymmetricKey) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return ""
@@ -319,7 +320,7 @@ func decryptVaultLabel(raw string, keys ...SymmetricKey) string {
 	if _, err := ParseCipherString(raw); err != nil {
 		return raw
 	}
-	logger.Debug.Printf("decryptVaultLabel: could not decrypt ciphertext-form value")
+	logger.Warn.Printf("decryptVaultLabel: could not decrypt ciphertext-form %s name (id=%s)", entityKind, entityID)
 	return ""
 }
 
@@ -338,7 +339,7 @@ func buildSyncNameMaps(syncResp SyncResponse, userKey SymmetricKey, orgKeys map[
 		if k, ok := orgKeys[org.ID]; ok {
 			keys = append(keys, k)
 		}
-		name := decryptVaultLabel(org.Name, keys...)
+		name := decryptVaultLabel(org.Name, "organization", org.ID, keys...)
 		if name == "" {
 			logger.Debug.Printf("Empty organization display name for org %s (raw len=%d)", org.ID, len(org.Name))
 			continue
@@ -350,7 +351,7 @@ func buildSyncNameMaps(syncResp SyncResponse, userKey SymmetricKey, orgKeys map[
 		if f.ID == "" {
 			continue
 		}
-		name := decryptVaultLabel(f.Name, userKey)
+		name := decryptVaultLabel(f.Name, "folder", f.ID, userKey)
 		if name == "" {
 			logger.Debug.Printf("Empty folder name for folder %s", f.ID)
 			continue
@@ -367,7 +368,7 @@ func buildSyncNameMaps(syncResp SyncResponse, userKey SymmetricKey, orgKeys map[
 			logger.Debug.Printf("No org key for collection %s (org %s), skipping name decrypt", col.ID, col.OrganizationID)
 			continue
 		}
-		name := decryptVaultLabel(col.Name, orgKey)
+		name := decryptVaultLabel(col.Name, "collection", col.ID, orgKey)
 		if name == "" {
 			logger.Debug.Printf("Empty collection name for collection %s", col.ID)
 			continue
