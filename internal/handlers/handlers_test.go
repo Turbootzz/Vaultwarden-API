@@ -314,7 +314,7 @@ func TestGetSecret(t *testing.T) {
 			if tt.query != "" {
 				url += "?" + tt.query
 			}
-			req := httptest.NewRequest(http.MethodGet, url, nil)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
 			resp, err := app.Test(req, -1)
 			if err != nil {
 				t.Fatalf("app.Test: %v", err)

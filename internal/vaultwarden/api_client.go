@@ -421,9 +421,13 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 	if err != nil {
 		return nil, emptySyncNameMaps(), fmt.Errorf("sync request: %w", err)
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			logger.Warn.Printf("close sync 401 response body: %v", closeErr)
+		}
+
 		// Token might be invalid, try to refresh and retry once.
 		if err := ac.RefreshAccessToken(); err != nil {
 			return nil, emptySyncNameMaps(), fmt.Errorf("sync auth failed, refresh failed: %w", err)
@@ -437,8 +441,12 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 		if err != nil {
 			return nil, emptySyncNameMaps(), fmt.Errorf("sync retry: %w", err)
 		}
-		defer resp.Body.Close()
 	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			logger.Warn.Printf("close sync response body: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
