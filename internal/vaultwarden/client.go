@@ -27,15 +27,33 @@ type Client struct {
 	stopSync chan struct{}
 }
 
-// NewClient creates a new vault client backed by the native API client.
-func NewClient(api *APIClient, cacheTTL, syncInterval time.Duration) *Client {
-	return &Client{
+// ClientOption configures NewClient.
+type ClientOption func(*Client)
+
+// WithState preloads decrypted items and name maps (e.g. unit tests with api set to nil).
+func WithState(items map[string]DecryptedItem, nameMaps SyncNameMaps) ClientOption {
+	return func(c *Client) {
+		if items != nil {
+			c.items = items
+		}
+		c.nameMaps = nameMaps
+	}
+}
+
+// NewClient creates a vault client. Pass WithState to preload cache data without calling Initialize.
+func NewClient(api *APIClient, cacheTTL, syncInterval time.Duration, opts ...ClientOption) *Client {
+	c := &Client{
 		api:       api,
 		cacheTTL:  cacheTTL,
 		syncEvery: syncInterval,
 		items:     make(map[string]DecryptedItem),
+		nameMaps:  emptySyncNameMaps(),
 		stopSync:  make(chan struct{}),
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // Initialize authenticates and performs the initial vault sync.
