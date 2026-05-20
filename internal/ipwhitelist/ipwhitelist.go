@@ -10,18 +10,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
 	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
+	"github.com/gofiber/fiber/v2"
 )
 
 // IPWhitelist manages IP-based access control
 type IPWhitelist struct {
-	mu                sync.RWMutex
-	allowedIPs        map[string]bool
-	allowedCIDRs      []*net.IPNet
-	githubIPRanges    []*net.IPNet
-	enableGitHub      bool
-	lastGitHubUpdate  time.Time
+	mu               sync.RWMutex
+	allowedIPs       map[string]bool
+	allowedCIDRs     []*net.IPNet
+	githubIPRanges   []*net.IPNet
+	enableGitHub     bool
+	lastGitHubUpdate time.Time
 }
 
 // GitHubMeta represents GitHub's API response for IP ranges
@@ -86,27 +86,14 @@ func (wl *IPWhitelist) Middleware() fiber.Handler {
 			return c.Next()
 		}
 
-		// Get client IP from Fiber
 		clientIP := c.IP()
 
-		// If c.IP() returns comma-separated IPs, parse them manually
-		// This happens when Fiber doesn't parse X-Forwarded-For despite TrustedProxies config
-		// We take the FIRST IP (leftmost = original client, rightmost = trusted proxy)
-		var realClientIP string
-		if strings.Contains(clientIP, ",") {
-			ips := strings.Split(clientIP, ",")
-			// Take first IP (original client before any proxies)
-			realClientIP = strings.TrimSpace(ips[0])
-		} else {
-			realClientIP = clientIP
-		}
-
-		if wl.IsAllowed(realClientIP) {
-			logger.Debug.Printf("IP allowed: %s", realClientIP)
+		if wl.IsAllowed(clientIP) {
+			logger.Debug.Printf("IP allowed: %s", clientIP)
 			return c.Next()
 		}
 
-		logger.Warn.Printf("IP blocked (not whitelisted): %s on %s %s", realClientIP, c.Method(), c.Path())
+		logger.Warn.Printf("IP blocked (not whitelisted): %s on %s %s", clientIP, c.Method(), c.Path())
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"error": "access denied: IP not whitelisted",
 		})
