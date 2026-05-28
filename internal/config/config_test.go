@@ -114,6 +114,16 @@ func TestLoadAPIKeys(t *testing.T) {
 			t.Error("expected error for entry without key")
 		}
 	})
+
+	t.Run("duplicate key material rejected", func(t *testing.T) {
+		clearKeyEnv(t)
+		// Same key string used twice would let one entry silently override the
+		// other's scope in the store.
+		t.Setenv("API_KEYS", `[{"name":"a","key":"`+key32a+`"},{"name":"b","key":"`+key32a+`"}]`)
+		if _, err := loadAPIKeys(); err == nil {
+			t.Error("expected error for duplicate key material")
+		}
+	})
 }
 
 func TestParseInt(t *testing.T) {
@@ -142,6 +152,9 @@ func TestLoadRateLimitDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("VAULTWARDEN_URL", "https://vault.example.com")
 
 	t.Run("defaults", func(t *testing.T) {
+		// Clear any inherited overrides so defaults are evaluated deterministically.
+		t.Setenv("RATE_LIMIT_MAX", "")
+		t.Setenv("RATE_LIMIT_WINDOW", "")
 		cfg, err := Load()
 		if err != nil {
 			t.Fatalf("Load: %v", err)

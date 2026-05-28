@@ -1,9 +1,11 @@
 package auth
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/gofiber/fiber/v2"
@@ -112,7 +114,7 @@ func TestMiddleware(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
 			if tt.header != "" {
 				req.Header.Set("Authorization", tt.header)
 			}
@@ -123,6 +125,10 @@ func TestMiddleware(t *testing.T) {
 			defer resp.Body.Close()
 			if resp.StatusCode != tt.wantStatus {
 				t.Errorf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			if !strings.Contains(string(body), tt.wantBody) {
+				t.Errorf("body = %q, want substring %q", body, tt.wantBody)
 			}
 		})
 	}

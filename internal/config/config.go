@@ -50,15 +50,15 @@ func Load() (*Config, error) {
 		VaultwardenURL:   os.Getenv("VAULTWARDEN_URL"),
 		VaultwardenToken: os.Getenv("VAULTWARDEN_ACCESS_TOKEN"),
 
-		ReadTimeout:        parseDuration(getEnv("READ_TIMEOUT", "10s")),
-		WriteTimeout:       parseDuration(getEnv("WRITE_TIMEOUT", "10s")),
-		CacheTTL:           parseDuration(getEnv("CACHE_TTL", "5m")),
+		ReadTimeout:        parseDuration(os.Getenv("READ_TIMEOUT"), "10s"),
+		WriteTimeout:       parseDuration(os.Getenv("WRITE_TIMEOUT"), "10s"),
+		CacheTTL:           parseDuration(os.Getenv("CACHE_TTL"), "5m"),
 		CORSAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS", "http://localhost:3000"),
 
 		EnableGitHubIPRanges: getEnv("ENABLE_GITHUB_IP_RANGES", "false") == "true",
 
 		RateLimitMax:    parseInt(getEnv("RATE_LIMIT_MAX", "30"), 30),
-		RateLimitWindow: parseDuration(getEnv("RATE_LIMIT_WINDOW", "1m")),
+		RateLimitWindow: parseDuration(os.Getenv("RATE_LIMIT_WINDOW"), "1m"),
 	}
 
 	// Load API keys from API_KEYS_FILE / API_KEYS / legacy API_KEY.
@@ -114,12 +114,13 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-// parseDuration parses a duration string with a fallback
-func parseDuration(s string) time.Duration {
-	d, err := time.ParseDuration(s)
-	if err != nil {
-		return 10 * time.Second
+// parseDuration parses a duration string, falling back to the given default
+// string for empty or malformed input (the fallback is a known-good constant).
+func parseDuration(s, fallback string) time.Duration {
+	if d, err := time.ParseDuration(s); err == nil {
+		return d
 	}
+	d, _ := time.ParseDuration(fallback)
 	return d
 }
 
@@ -173,10 +174,15 @@ func loadAPIKeys() ([]auth.APIKey, error) {
 		return nil, fmt.Errorf("no API keys configured: set API_KEY, API_KEYS, or API_KEYS_FILE")
 	}
 
+	seen := make(map[string]struct{}, len(keys))
 	for i, k := range keys {
 		if len(k.Key) < 32 {
 			return nil, fmt.Errorf("API key #%d (%q) must be at least 32 characters for security (run: openssl rand -base64 32)", i+1, k.Name)
 		}
+		if _, dup := seen[k.Key]; dup {
+			return nil, fmt.Errorf("duplicate API key material for key #%d (%q): each key must be unique so it cannot silently override another key's scope", i+1, k.Name)
+		}
+		seen[k.Key] = struct{}{}
 	}
 
 	return keys, nil
