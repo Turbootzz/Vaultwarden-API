@@ -107,14 +107,19 @@ func main() {
 	api := app.Group("/")
 	api.Use(ipWhitelist.Middleware())
 	api.Use(limiter.New(limiter.Config{
-		Max: 30,
+		Max:        cfg.RateLimitMax,
+		Expiration: cfg.RateLimitWindow,
+		// Whitelisted/trusted IPs bypass rate limiting entirely.
+		Next: func(c *fiber.Ctx) bool {
+			return ipWhitelist.IsAllowed(c.IP())
+		},
 		LimitReached: func(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
 				"error": "too many requests, please slow down",
 			})
 		},
 	}))
-	api.Use(auth.Middleware(cfg.APIKey))
+	api.Use(auth.Middleware(auth.NewStore(cfg.APIKeys)))
 
 	api.Get("/secret/:name", h.GetSecret)
 	api.Post("/refresh", h.RefreshCache)
