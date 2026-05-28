@@ -73,30 +73,53 @@ func (c *Client) Initialize() error {
 }
 
 // SecretFilter limits lookup by vault placement. Empty fields are ignored (no constraint).
-// Use at most one of organization id vs name, etc., enforced at the HTTP layer.
+//
+// The singular fields are client-supplied query filters (use at most one of id vs
+// name per dimension, enforced at the HTTP layer). The plural fields are server-set
+// from the authenticated key's scope and act as a hard boundary: a request must match
+// both the client filter and the scope, so a client filter can only narrow within the
+// scope, never widen beyond it. Empty plural slices impose no constraint.
 type SecretFilter struct {
 	OrganizationID string
 	CollectionID   string
 	FolderID       string
+
+	OrganizationIDs []string
+	CollectionIDs   []string
+}
+
+func containsFold(ids []string, target string) bool {
+	for _, id := range ids {
+		if strings.EqualFold(id, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func intersectsFold(a, b []string) bool {
+	for _, id := range a {
+		if containsFold(b, id) {
+			return true
+		}
+	}
+	return false
 }
 
 func matchesSecretFilter(item DecryptedItem, f SecretFilter) bool {
 	if f.OrganizationID != "" && !strings.EqualFold(item.OrganizationID, f.OrganizationID) {
 		return false
 	}
-	if f.CollectionID != "" {
-		found := false
-		for _, id := range item.CollectionIDs {
-			if strings.EqualFold(id, f.CollectionID) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return false
-		}
+	if f.CollectionID != "" && !containsFold(item.CollectionIDs, f.CollectionID) {
+		return false
 	}
 	if f.FolderID != "" && !strings.EqualFold(item.FolderID, f.FolderID) {
+		return false
+	}
+	if len(f.OrganizationIDs) > 0 && !containsFold(f.OrganizationIDs, item.OrganizationID) {
+		return false
+	}
+	if len(f.CollectionIDs) > 0 && !intersectsFold(item.CollectionIDs, f.CollectionIDs) {
 		return false
 	}
 	return true

@@ -5,9 +5,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/Turbootzz/vaultwarden-api/internal/auth"
 	"github.com/Turbootzz/vaultwarden-api/internal/vaultwarden"
 	"github.com/gofiber/fiber/v2"
 	"github.com/valyala/fasthttp"
@@ -221,7 +223,7 @@ func TestParseSecretFilters(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if got != tt.want {
+			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("filter = %+v, want %+v", got, tt.want)
 			}
 		})
@@ -229,8 +231,11 @@ func TestParseSecretFilters(t *testing.T) {
 }
 
 func TestGetSecret(t *testing.T) {
+	const fullKey = "full-access-key-for-getsecret-test-000000"
 	h := NewHandler(vaultwarden.NewClient(nil, 0, 0, vaultwarden.WithState(testVaultItems(), testNameMaps())))
 	app := fiber.New()
+	// Mirror production: auth runs first and attaches a (here unscoped) scope.
+	app.Use(auth.Middleware(auth.NewStore([]auth.APIKey{{Name: "full", Key: fullKey}})))
 	app.Get("/secret/:name", h.GetSecret)
 
 	// Test the GetSecret handler with various input scenarios
@@ -315,6 +320,106 @@ func TestGetSecret(t *testing.T) {
 				url += "?" + tt.query
 			}
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+			req.Header.Set("Authorization", "Bearer "+fullKey)
+			resp, err := app.Test(req, -1)
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+
+			body, _ := io.ReadAll(resp.Body)
+			if tt.wantStatus == http.StatusOK {
+				var payload map[string]string
+				if err := json.Unmarshal(body, &payload); err != nil {
+					t.Fatalf("json: %v", err)
+				}
+				if payload["value"] != tt.wantBody {
+					t.Errorf("value = %q, want %q", payload["value"], tt.wantBody)
+				}
+				return
+			}
+			if !strings.Contains(string(body), tt.wantBody) {
+				t.Errorf("body = %s, want substring %q", body, tt.wantBody)
+			}
+		})
+	}
+}
+
+// TestGetSecretFailsClosedWithoutAuth verifies that if the handler is reached
+// without the auth middleware (no scope in context), it denies rather than
+// granting full access.
+func TestGetSecretFailsClosedWithoutAuth(t *testing.T) {
+	h := NewHandler(vaultwarden.NewClient(nil, 0, 0, vaultwarden.WithState(testVaultItems(), testNameMaps())))
+	app := fiber.New()
+	app.Get("/secret/:name", h.GetSecret) // intentionally no auth.Middleware
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/secret/db-password", nil)
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want %d (fail closed)", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+func TestGetSecretScoped(t *testing.T) {
+	h := NewHandler(vaultwarden.NewClient(nil, 0, 0, vaultwarden.WithState(testVaultItems(), testNameMaps())))
+
+	// Keys wired through the real auth middleware so scope flows via c.Locals.
+	const (
+		fullKey     = "full-access-0000000000000000000000000000"
+		colKey      = "collection-scoped-11111111111111111111111"
+		orgKey      = "org-scoped-2222222222222222222222222222222"
+		badScopeKey = "bad-scope-33333333333333333333333333333333"
+	)
+	store := auth.NewStore([]auth.APIKey{
+		{Name: "full", Key: fullKey},
+		{Name: "dev", Key: colKey, Scope: auth.Scope{Collections: []string{"Shared"}}},
+		{Name: "acme", Key: orgKey, Scope: auth.Scope{Organizations: []string{"Acme"}}},
+		{Name: "broken", Key: badScopeKey, Scope: auth.Scope{Collections: []string{"Nonexistent"}}},
+	})
+
+	app := fiber.New()
+	app.Use(auth.Middleware(store))
+	app.Get("/secret/:name", h.GetSecret)
+
+	tests := []struct {
+		name       string
+		key        string
+		path       string
+		query      string
+		wantStatus int
+		wantBody   string
+	}{
+		// db-password (cipher-1) lives in org "Acme" / collection "Shared".
+		{"collection scope can read in-scope secret", colKey, "/secret/db-password", "", http.StatusOK, "s3cret"},
+		// other-password (cipher-2) has no collection -> out of a collection scope.
+		{"collection scope blocks out-of-scope secret", colKey, "/secret/other-password", "", http.StatusNotFound, "secret not found"},
+		{"org scope can read in-scope secret", orgKey, "/secret/db-password", "", http.StatusOK, "s3cret"},
+		// other-password is in a different org -> blocked server-side regardless of query.
+		{"org scope blocks other org secret", orgKey, "/secret/other-password", "", http.StatusNotFound, "secret not found"},
+		{"client filter cannot widen beyond org scope", orgKey, "/secret/other-password", "organization_id=" + testOtherOrgID, http.StatusNotFound, "secret not found"},
+		// Unscoped (full-access) key sees everything.
+		{"full access reads other org secret", fullKey, "/secret/other-password", "", http.StatusOK, "other-org"},
+		// Scope referencing an unknown collection name fails closed.
+		{"unresolvable scope fails closed", badScopeKey, "/secret/db-password", "", http.StatusNotFound, "secret not found"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			url := tt.path
+			if tt.query != "" {
+				url += "?" + tt.query
+			}
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+			req.Header.Set("Authorization", "Bearer "+tt.key)
 			resp, err := app.Test(req, -1)
 			if err != nil {
 				t.Fatalf("app.Test: %v", err)

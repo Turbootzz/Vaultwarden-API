@@ -110,16 +110,56 @@ You can also use **custom fields** or **notes** — the API returns the most rel
 | `VAULTWARDEN_URL` | **Yes** | — | Your Vaultwarden instance URL |
 | `VAULTWARDEN_EMAIL` | **Yes** | — | Your Vaultwarden email |
 | `VAULTWARDEN_PASSWORD` | **Yes** | — | Your master password |
-| `API_KEY` | **Yes** | — | API key for this service (min 32 chars) |
+| `API_KEY` | Yes\* | — | Single full-access key for this service (min 32 chars) |
+| `API_KEYS` | Yes\* | — | Inline JSON array of scoped keys (see [Scoped API keys](#scoped-api-keys)) |
+| `API_KEYS_FILE` | Yes\* | — | Path to a JSON file of scoped keys; takes precedence over `API_KEYS` |
 | `VAULTWARDEN_CLIENT_ID` | No | — | API key client ID (bypasses 2FA — see below) |
 | `VAULTWARDEN_CLIENT_SECRET` | No | — | API key client secret (bypasses 2FA — see below) |
 | `ALLOWED_IPS` | No | (all) | Comma-separated IPs/CIDRs to whitelist |
 | `ENABLE_GITHUB_IP_RANGES` | No | `false` | Auto-whitelist GitHub Actions IPs |
 | `SYNC_INTERVAL` | No | `5m` | How often to re-sync the vault |
 | `CACHE_TTL` | No | `5m` | Secret cache duration |
+| `RATE_LIMIT_MAX` | No | `30` | Max requests per window, per IP |
+| `RATE_LIMIT_WINDOW` | No | `1m` | Rate-limit window duration |
 | `TRUSTED_PROXY_IP` | No | `localhost` | Trusted reverse proxy IPs |
 | `ENVIRONMENT` | No | `development` | Set to `production` to hide errors |
 | `DEBUG` | No | `false` | Enable debug logging |
+
+\* At least one of `API_KEY`, `API_KEYS`, or `API_KEYS_FILE` is required.
+
+### Scoped API keys
+
+`API_KEY` is a single, full-access key — any holder can read every secret the account
+can decrypt. For least-privilege, per-consumer access, define multiple keys with
+`API_KEYS` (inline JSON) or `API_KEYS_FILE` (a JSON file, ideal as a mounted Docker
+secret). Each key is scoped to allowed organizations and/or collections, and is
+individually revocable (remove it from the config and re-deploy).
+
+```json
+[
+  {
+    "name": "dev-team",
+    "key": "<32+ character secret>",
+    "organizations": ["MyOrg"],
+    "collections": ["Secrets - DEV"]
+  }
+]
+```
+
+- **Scope is enforced server-side**, regardless of the `organization_*` / `collection_*`
+  query filters. A scoped key can only ever read secrets within its scope — the query
+  filters can narrow within scope but never widen beyond it.
+- **A key with no `organizations` and no `collections` is unscoped** (full access),
+  same as the legacy `API_KEY`. `API_KEY` keeps working alongside scoped keys.
+- **Matching:** a secret is in scope when its organization is in the key's allowed
+  organizations (if any) **and** it belongs to at least one allowed collection (if any).
+  Consequently, an org-scoped key **cannot read personal / no-org items**.
+- **Refs may be names or UUIDs.** UUIDs are recommended: name matching is
+  case-insensitive, silently stops matching if the org/collection is renamed, and a
+  duplicate name binds to the lowest matching UUID. Unresolvable refs **fail closed**
+  (the key matches nothing), including the brief window before the first vault sync.
+
+`API_KEYS_FILE` takes precedence over `API_KEYS` when both are set.
 
 ### 2FA / Two-Step Login
 
@@ -251,8 +291,9 @@ resp, _ := http.DefaultClient.Do(req)
 ## Security
 
 - **API key authentication** with constant-time comparison (timing-attack resistant)
+- **Per-key scoping** — multiple revocable keys, each restricted server-side to specific organizations/collections ([Scoped API keys](#scoped-api-keys))
 - **IP whitelisting** with CIDR support + optional GitHub Actions IP auto-import
-- **Rate limiting** (30 requests/minute per IP)
+- **Rate limiting** (configurable via `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW`, default 30/min per IP; whitelisted IPs are exempt)
 - **Read-only filesystem** in Docker (only `/tmp` writable)
 - **Non-root user** in container
 - **No capabilities** (`cap_drop: ALL`)
@@ -327,8 +368,8 @@ However, for each dimension (organization | collection | folder) you can only fi
 | `Two factor required` | Account has 2FA enabled | Set `VAULTWARDEN_CLIENT_ID` and `VAULTWARDEN_CLIENT_SECRET` (see [2FA section](#2fa--two-step-login)) |
 | `MAC verification failed` | Wrong password or org-owned items | Normal for items shared via organizations — they use a different key |
 | `missing authorization header` | No Bearer token in request | Add `-H "Authorization: Bearer YOUR_API_KEY"` to your request |
-| `secret not found` | Item name doesn't match | Check the exact name in your Vaultwarden vault (matching is case-insensitive) |
-| Container exits immediately | Missing required env vars | Ensure `VAULTWARDEN_URL`, `VAULTWARDEN_EMAIL`, `VAULTWARDEN_PASSWORD`, and `API_KEY` are all set |
+| `secret not found` | Item name doesn't match, or out of the key's scope | Check the exact name in your Vaultwarden vault (matching is case-insensitive); for a scoped key, confirm the secret is within its allowed orgs/collections |
+| Container exits immediately | Missing required env vars | Ensure `VAULTWARDEN_URL`, `VAULTWARDEN_EMAIL`, `VAULTWARDEN_PASSWORD`, and one of `API_KEY` / `API_KEYS` / `API_KEYS_FILE` are set |
 
 **Debug mode:** Set `DEBUG=true` to see detailed logs including secret names being synced (don't use in production).
 

@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/Turbootzz/vaultwarden-api/internal/auth"
 	"github.com/Turbootzz/vaultwarden-api/internal/validators"
 	"github.com/Turbootzz/vaultwarden-api/internal/vaultwarden"
 	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
@@ -91,6 +92,14 @@ func (h *Handler) GetSecret(c *fiber.Ctx) error {
 		})
 	}
 
+	// Enforce the authenticated key's scope server-side, regardless of query filters.
+	if !h.applyKeyScope(c, &filter) {
+		logger.Warn.Printf("Request denied by key scope from IP: %s", c.IP())
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "secret not found",
+		})
+	}
+
 	value, err := h.vaultClient.GetSecret(secretName, filter)
 	if err != nil {
 		logger.Error.Printf("Failed to fetch secret (requested by IP: %s)", c.IP())
@@ -133,6 +142,66 @@ func resolveDim(dim, name, id string, nameMap map[string]string, out *string) er
 		*out = id
 	}
 	return nil
+}
+
+// resolveRef resolves a scope reference that may be either a UUID or a friendly name.
+// UUIDs pass through (existence not verified); names are looked up via NameMaps.
+func resolveRef(nameMap map[string]string, ref string) (string, bool) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "", false
+	}
+	if parsed, err := uuid.Parse(ref); err == nil {
+		return parsed.String(), true
+	}
+	return vaultwarden.LookupIDByName(nameMap, ref)
+}
+
+// resolveScopeRefs maps scope refs (UUIDs or names) to UUIDs, dropping any that
+// don't resolve. The caller treats an all-unresolved dimension as deny (fail closed).
+func resolveScopeRefs(refs []string, nameMap map[string]string) []string {
+	out := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if id, ok := resolveRef(nameMap, ref); ok {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// applyKeyScope sets the server-side scope fields on the filter from the
+// authenticated key's scope. It returns false to deny the request (404) when a
+// constrained dimension resolves to nothing — including unknown names and the
+// pre-first-sync window — so a scoped key can never read outside its scope.
+func (h *Handler) applyKeyScope(c *fiber.Ctx, filter *vaultwarden.SecretFilter) bool {
+	scope, ok := auth.ScopeFromCtx(c)
+	if !ok {
+		// No scope in context means the auth middleware did not run for this
+		// request. Fail closed rather than silently granting full access.
+		return false
+	}
+	if scope.IsEmpty() {
+		return true // unscoped key: full access
+	}
+
+	nm := h.vaultClient.NameMaps()
+
+	if len(scope.Organizations) > 0 {
+		ids := resolveScopeRefs(scope.Organizations, nm.Organizations)
+		if len(ids) == 0 {
+			return false
+		}
+		filter.OrganizationIDs = ids
+	}
+	if len(scope.Collections) > 0 {
+		ids := resolveScopeRefs(scope.Collections, nm.Collections)
+		if len(ids) == 0 {
+			return false
+		}
+		filter.CollectionIDs = ids
+	}
+
+	return true
 }
 
 // parseSecretFilters reads placement query params: at most one of id or name per dimension.

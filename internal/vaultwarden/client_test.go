@@ -55,13 +55,42 @@ func TestMatchesSecretFilter(t *testing.T) {
 			SecretFilter{
 				OrganizationID: testOrgID,
 				CollectionID:   testCollectionID,
-				FolderID:         testFolderID,
+				FolderID:       testFolderID,
 			},
 			true,
 		},
 		{
 			"org ok collection fail",
 			SecretFilter{OrganizationID: testOrgID, CollectionID: "77777777-7777-4777-8777-777777777777"},
+			false,
+		},
+		// Server-side scope (plural fields).
+		{"scope org in set", SecretFilter{OrganizationIDs: []string{testOrgID2, testOrgID}}, true},
+		{"scope org not in set", SecretFilter{OrganizationIDs: []string{testOrgID2}}, false},
+		{"scope collection intersects", SecretFilter{CollectionIDs: []string{testCollectionID}}, true},
+		{
+			"scope collection disjoint",
+			SecretFilter{CollectionIDs: []string{"77777777-7777-4777-8777-777777777777"}},
+			false,
+		},
+		{
+			"scope org and collection both match",
+			SecretFilter{OrganizationIDs: []string{testOrgID}, CollectionIDs: []string{testCollectionID}},
+			true,
+		},
+		{
+			"scope org ok but collection disjoint",
+			SecretFilter{OrganizationIDs: []string{testOrgID}, CollectionIDs: []string{"77777777-7777-4777-8777-777777777777"}},
+			false,
+		},
+		{
+			"scope narrowed further by client filter",
+			SecretFilter{OrganizationID: testOrgID, OrganizationIDs: []string{testOrgID}},
+			true,
+		},
+		{
+			"client filter cannot widen beyond scope",
+			SecretFilter{OrganizationID: testOrgID, OrganizationIDs: []string{testOrgID2}},
 			false,
 		},
 	}
@@ -73,5 +102,19 @@ func TestMatchesSecretFilter(t *testing.T) {
 				t.Errorf("matchesSecretFilter() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestMatchesSecretFilter_PersonalItemExcludedByOrgScope(t *testing.T) {
+	t.Parallel()
+
+	// A personal (no-org) item must be excluded once a key scopes to organizations.
+	personal := DecryptedItem{ID: "personal-1", Name: "personal-secret"}
+
+	if matchesSecretFilter(personal, SecretFilter{OrganizationIDs: []string{testOrgID}}) {
+		t.Error("personal item should be excluded by an org scope")
+	}
+	if !matchesSecretFilter(personal, SecretFilter{}) {
+		t.Error("personal item should match an empty (full-access) scope")
 	}
 }
