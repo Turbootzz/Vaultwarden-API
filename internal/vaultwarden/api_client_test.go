@@ -337,6 +337,55 @@ func TestSync_AllCiphersFailToDecryptReturnsError(t *testing.T) {
 	}
 }
 
+func TestSync_OrgCipherWithoutOrgKeyCountsAsFailure(t *testing.T) {
+	// The account belongs to an organization but the profile carries no private key,
+	// so no org key can be derived and every org-owned cipher is skipped. Those skips
+	// are failures, not deliberate omissions like trashed items: a vault whose items
+	// are all org-owned must report an error rather than hand syncVault an empty item
+	// set that would replace a healthy cache.
+	//
+	// The name is encrypted under the *user* key on purpose. It would decrypt fine if
+	// the cipher were ever attempted with it, so this test only stays green while the
+	// org-key-missing path both skips the cipher and counts it as a failure.
+	userKey := testUserKey()
+	orgID := testOrgID
+	orgName := mustEncryptType2Cipher(t, "org-item", userKey)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		resp := SyncResponse{
+			Profile: SyncProfile{
+				Organizations: []SyncOrganization{{ID: orgID, Name: "Org"}},
+			},
+			Ciphers: []SyncCipher{
+				{
+					ID:             "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+					Type:           CipherTypeLogin,
+					OrganizationID: &orgID,
+					Name:           orgName,
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	items, _, err := ac.Sync()
+	if err == nil {
+		t.Fatalf("Sync() returned %d items and no error; want an error when the only cipher is org-owned and no org key is available", len(items))
+	}
+	if !strings.Contains(err.Error(), "refusing to replace cache") {
+		t.Errorf("error %q should refuse to replace the cache", err)
+	}
+	if !strings.Contains(err.Error(), "decrypted 0 of 1") {
+		t.Errorf("error %q should count the skipped org cipher as a failure", err)
+	}
+}
+
 func TestSync_OnlyTrashedCiphersSyncsEmpty(t *testing.T) {
 	// A vault whose every item is in the trash is genuinely empty, not broken:
 	// trashed skips are not decrypt failures, so Sync must still succeed.

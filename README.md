@@ -372,7 +372,8 @@ However, for each dimension (organization | collection | folder) you can only fi
 |-------|-------|-----|
 | `prelogin failed (HTTP 502)` | Can't reach Vaultwarden | Check `VAULTWARDEN_URL` — is it reachable from the container? |
 | `Two factor required` | Account has 2FA enabled | Set `VAULTWARDEN_CLIENT_ID` and `VAULTWARDEN_CLIENT_SECRET` (see [2FA section](#2fa--two-step-login)) |
-| `MAC verification failed` | Wrong password or org-owned items | Normal for items shared via organizations — they use a different key |
+| `MAC verification failed` | Wrong password or org-owned items | Normal for individual items shared via organizations — they use a different key. If *every* item fails, see the row below |
+| `sync decrypted 0 of N ciphers (M failures), refusing to replace cache` | No usable decryption key for any item — wrong master password, or every item is org-owned and the org key can't be decrypted | Check `VAULTWARDEN_PASSWORD` and that at least one item is decryptable. Rather than serve an empty vault, the service keeps the last good cache — and refuses to start if this happens on the first sync |
 | `missing authorization header` | No Bearer token in request | Add `-H "Authorization: Bearer YOUR_API_KEY"` to your request |
 | `secret not found` | Item name doesn't match, the item is in the trash, or it's out of the key's scope | Check the exact name in your Vaultwarden vault (matching is case-insensitive) and that the item isn't soft-deleted; for a scoped key, confirm the secret is within its allowed orgs/collections |
 | Container exits immediately | Missing required env vars | Ensure `VAULTWARDEN_URL`, `VAULTWARDEN_EMAIL`, `VAULTWARDEN_PASSWORD`, and one of `API_KEY` / `API_KEYS` / `API_KEYS_FILE` are set |
