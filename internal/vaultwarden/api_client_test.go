@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -49,7 +50,12 @@ func testOrgKey() SymmetricKey {
 
 // encryptType2Cipher builds a Bitwarden type-2 cipher string for unit tests.
 func encryptType2Cipher(plaintext string, key SymmetricKey) (string, error) {
-	data := []byte(plaintext)
+	return encryptType2CipherBytes([]byte(plaintext), key)
+}
+
+// encryptType2CipherBytes builds a Bitwarden type-2 cipher string over raw bytes.
+// Used for payloads that are not text, such as the 64-byte enc||mac symmetric key blob.
+func encryptType2CipherBytes(data []byte, key SymmetricKey) (string, error) {
 	padLen := aes.BlockSize - (len(data) % aes.BlockSize)
 	padded := make([]byte, len(data)+padLen)
 	copy(padded, data)
@@ -143,6 +149,146 @@ func TestSync_SkipsTrashedCiphers(t *testing.T) {
 	}
 	if items[0].Name != "active-item" {
 		t.Errorf("surviving item = %q, want active-item", items[0].Name)
+	}
+}
+
+func TestSync_401RefreshFailsFallsBackToFullReauth(t *testing.T) {
+	const testKDFIterations = 10000 // low on purpose: keeps the test fast
+
+	userKey := testUserKey()
+	cipherName := mustEncryptType2Cipher(t, "after-reauth", userKey)
+
+	// Build the encrypted symmetric key the password grant hands back: the raw
+	// enc||mac blob (64 bytes) as a type-2 cipher under the stretched master key,
+	// which is exactly what DecryptSymmetricKey unwraps.
+	masterKey, err := MakeMasterKey("password", "user@example.com", KdfPBKDF2, testKDFIterations, nil, nil)
+	if err != nil {
+		t.Fatalf("MakeMasterKey: %v", err)
+	}
+	stretched, err := StretchKey(masterKey)
+	if err != nil {
+		t.Fatalf("StretchKey: %v", err)
+	}
+	keyBlob := make([]byte, 0, 64)
+	keyBlob = append(keyBlob, userKey.EncKey...)
+	keyBlob = append(keyBlob, userKey.MacKey...)
+	encryptedUserKey, err := encryptType2CipherBytes(keyBlob, stretched)
+	if err != nil {
+		t.Fatalf("encryptType2CipherBytes: %v", err)
+	}
+
+	var syncCalls, refreshCalls, preloginCalls, passwordGrantCalls int
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		syncCalls++
+		// Only the token minted by the full re-authentication is accepted.
+		if r.Header.Get("Authorization") != "Bearer new-token" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		resp := SyncResponse{
+			Ciphers: []SyncCipher{
+				{
+					ID:   "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+					Type: CipherTypeLogin,
+					Name: cipherName,
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+	mux.HandleFunc("/identity/accounts/prelogin", func(w http.ResponseWriter, r *http.Request) {
+		preloginCalls++
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(PreloginResponse{KDF: KdfPBKDF2, KDFIterations: testKDFIterations}); err != nil {
+			t.Errorf("encode prelogin response: %v", err)
+		}
+	})
+	mux.HandleFunc("/identity/connect/token", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse token form: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		switch grant := r.PostFormValue("grant_type"); grant {
+		case "refresh_token":
+			// Refresh token is dead too (server restart / rotation / revocation).
+			refreshCalls++
+			w.WriteHeader(http.StatusBadRequest)
+		case "password":
+			passwordGrantCalls++
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(TokenResponse{
+				AccessToken:  "new-token",
+				ExpiresIn:    3600,
+				TokenType:    "Bearer",
+				RefreshToken: "new-refresh-token",
+				Key:          encryptedUserKey,
+			}); err != nil {
+				t.Errorf("encode token response: %v", err)
+			}
+		default:
+			t.Errorf("unexpected grant_type %q", grant)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	items, _, err := ac.Sync()
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("Sync() returned %d items, want 1", len(items))
+	}
+	if items[0].Name != "after-reauth" {
+		t.Errorf("item name = %q, want after-reauth", items[0].Name)
+	}
+	if refreshCalls != 1 {
+		t.Errorf("refresh grant calls = %d, want 1", refreshCalls)
+	}
+	if preloginCalls != 1 {
+		t.Errorf("prelogin calls = %d, want 1 (full re-authentication must be attempted) (#22)", preloginCalls)
+	}
+	if passwordGrantCalls != 1 {
+		t.Errorf("password grant calls = %d, want 1 (full re-authentication must be attempted) (#22)", passwordGrantCalls)
+	}
+	if syncCalls != 2 {
+		t.Errorf("sync calls = %d, want 2 (one 401, one retry after re-auth)", syncCalls)
+	}
+}
+
+func TestSync_401ReauthAlsoFailsReturnsError(t *testing.T) {
+	var preloginCalls int
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	mux.HandleFunc("/identity/connect/token", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	})
+	mux.HandleFunc("/identity/accounts/prelogin", func(w http.ResponseWriter, r *http.Request) {
+		preloginCalls++
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	_, _, err := ac.Sync()
+	if err == nil {
+		t.Fatal("Sync() expected error")
+	}
+	if preloginCalls == 0 {
+		t.Error("full re-authentication was never attempted after refresh failure (#22)")
+	}
+	if !strings.Contains(err.Error(), "re-authentication failed") {
+		t.Errorf("error %q should mention re-authentication failure", err)
 	}
 }
 

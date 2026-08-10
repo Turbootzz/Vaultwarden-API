@@ -431,7 +431,13 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 
 		// Token might be invalid, try to refresh and retry once.
 		if err := ac.RefreshAccessToken(); err != nil {
-			return nil, emptySyncNameMaps(), fmt.Errorf("sync auth failed, refresh failed: %w", err)
+			// The refresh token may be dead too (server restart, rotation,
+			// revocation). Fall back to a full re-authentication, mirroring
+			// EnsureValidToken, instead of serving a stale cache forever (#22).
+			logger.Warn.Printf("Sync token refresh failed, attempting full re-authentication: %v", err)
+			if authErr := ac.Authenticate(); authErr != nil {
+				return nil, emptySyncNameMaps(), fmt.Errorf("sync auth failed: refresh failed (%v); re-authentication failed: %w", err, authErr)
+			}
 		}
 		ac.mu.RLock()
 		token = ac.accessToken
