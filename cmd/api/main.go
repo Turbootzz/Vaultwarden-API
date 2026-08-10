@@ -105,7 +105,7 @@ func main() {
 		// Secret responses mix a caller-supplied name with the secret itself;
 		// compressing them leaks length information about the secret (#32).
 		Next: func(c *fiber.Ctx) bool {
-			return strings.HasPrefix(c.Path(), "/secret/")
+			return isSecretPath(c.Path())
 		},
 	}))
 
@@ -171,6 +171,14 @@ func main() {
 		logger.Error.Printf("Failed to start server: %v", err)
 		os.Exit(1)
 	}
+}
+
+// isSecretPath reports whether a request path reaches the secret endpoint, and
+// so must not be compressed. Matched case-insensitively: fiber's router is
+// case-insensitive by default, so /SECRET/x and /secret/x reach the same
+// handler and both return a secret.
+func isSecretPath(path string) bool {
+	return strings.HasPrefix(strings.ToLower(path), "/secret/")
 }
 
 // parseDurationEnv reads a duration from an env var with a fallback.

@@ -728,6 +728,12 @@ func TestDecryptCipher_PersonalItemStillWorks(t *testing.T) {
 // Regression for #31: the KDF parameters arrive in the server's prelogin
 // response, and argon2 panics on out-of-range values. They must come back as
 // errors so a hostile or broken server cannot take the process down.
+// aboveMaxIterations returns an iteration count outside the accepted range.
+func aboveMaxIterations() int {
+	max := argon2MaxIterations
+	return max + 1
+}
+
 func TestMakeMasterKey_Argon2idRejectsOutOfRangeParams(t *testing.T) {
 	t.Parallel()
 
@@ -746,7 +752,11 @@ func TestMakeMasterKey_Argon2idRejectsOutOfRangeParams(t *testing.T) {
 		{"parallelism above uint8", 3, ptr(64), ptr(256)},
 		{"zero memory", 3, ptr(0), ptr(4)},
 		{"negative memory", 3, ptr(-1), ptr(4)},
-		{"memory overflowing the KiB conversion", 3, ptr(1 << 40), ptr(4)},
+		{"memory above the ceiling", 3, ptr(argon2MaxMemoryMiB + 1), ptr(4)},
+		// Computed at runtime, not as a constant: on a 32-bit target the literal
+		// would not fit in an int. There it wraps negative and is rejected as
+		// below the floor; on 64-bit it is rejected as above the ceiling.
+		{"iterations past the uint32-safe ceiling", aboveMaxIterations(), ptr(64), ptr(4)},
 	}
 
 	for _, tt := range tests {

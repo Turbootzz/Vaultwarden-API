@@ -211,3 +211,57 @@ func TestFromCtxFallsBackWithoutMiddleware(t *testing.T) {
 		t.Errorf("FromCtx() = %q, want fiber's c.IP() %q", got, ctx.IP())
 	}
 }
+
+// A proxy may add its own X-Forwarded-For line instead of extending the
+// client's — HAProxy's forwardfor does. Reading only the first line would parse
+// the line the client wrote and hand back an address of its choosing.
+func TestClientIPReadsEveryForwardedForLine(t *testing.T) {
+	resolver := testResolver(t)
+
+	tests := []struct {
+		name  string
+		lines []string
+		want  string
+	}{
+		{
+			name:  "proxy appends its own line",
+			lines: []string{"10.0.0.5", "203.0.113.9"},
+			want:  "203.0.113.9",
+		},
+		{
+			name:  "spoofed line carries several entries",
+			lines: []string{"10.0.0.5, 10.0.0.6", "203.0.113.9"},
+			want:  "203.0.113.9",
+		},
+		{
+			name:  "trailing line holds only trusted proxies",
+			lines: []string{"203.0.113.9", "172.18.0.4, 127.0.0.1"},
+			want:  "203.0.113.9",
+		},
+		{
+			name:  "junk line between",
+			lines: []string{"10.0.0.5", "not-an-ip", "203.0.113.9"},
+			want:  "203.0.113.9",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			app := fiber.New()
+			fctx := &fasthttp.RequestCtx{}
+			fctx.SetRemoteAddr(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 54321})
+			ctx := app.AcquireCtx(fctx)
+			t.Cleanup(func() { app.ReleaseCtx(ctx) })
+
+			ctx.Request().Header.SetMethod("GET")
+			ctx.Request().URI().SetPath("/secret/db")
+			for _, line := range tt.lines {
+				ctx.Request().Header.Add(fiber.HeaderXForwardedFor, line)
+			}
+
+			if got := resolver.ClientIP(ctx); got != tt.want {
+				t.Errorf("ClientIP() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

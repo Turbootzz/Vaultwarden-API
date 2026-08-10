@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 
@@ -43,6 +44,12 @@ const (
 const (
 	argon2MaxMemoryMiB   = 4096
 	argon2MaxParallelism = 255
+	// Iterations are passed to argon2 as a uint32. Anything above this truncates
+	// on conversion, which either panics (a multiple of 2^32 becomes 0) or
+	// silently derives the key with far fewer rounds than the server asked for.
+	// MaxInt32 rather than MaxUint32: the value is compared against an int, and
+	// MaxUint32 does not fit in one on the 32-bit targets this builds for.
+	argon2MaxIterations = math.MaxInt32
 )
 
 // SymmetricKey holds the encryption and MAC keys for AES-CBC + HMAC-SHA256.
@@ -198,8 +205,8 @@ func MakeMasterKey(password, email string, kdfType, iterations int, memory, para
 		// The KDF parameters come from the server's prelogin response. argon2
 		// panics on out-of-range values and the memory conversion overflows, so
 		// they are bounds-checked here and reported as errors (#31).
-		if iterations < 1 {
-			return nil, fmt.Errorf("Argon2id iterations must be >= 1, got %d", iterations)
+		if iterations < 1 || iterations > argon2MaxIterations {
+			return nil, fmt.Errorf("Argon2id iterations must be between 1 and %d, got %d", argon2MaxIterations, iterations)
 		}
 		mem := 64 * 1024 // default 64 MiB
 		par := 4         // default parallelism

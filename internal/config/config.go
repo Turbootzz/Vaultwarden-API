@@ -47,13 +47,13 @@ func Load() (*Config, error) {
 		Environment: getEnv("ENVIRONMENT", "development"),
 
 		VaultwardenURL:    os.Getenv("VAULTWARDEN_URL"),
-		StrictSecretMatch: getEnv("STRICT_SECRET_MATCH", "false") == "true",
+		StrictSecretMatch: parseBool("STRICT_SECRET_MATCH", false),
 
 		ReadTimeout:        parseDuration(os.Getenv("READ_TIMEOUT"), "10s"),
 		WriteTimeout:       parseDuration(os.Getenv("WRITE_TIMEOUT"), "10s"),
 		CORSAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS", "http://localhost:3000"),
 
-		EnableGitHubIPRanges: getEnv("ENABLE_GITHUB_IP_RANGES", "false") == "true",
+		EnableGitHubIPRanges: parseBool("ENABLE_GITHUB_IP_RANGES", false),
 
 		RateLimitMax:    parseInt(getEnv("RATE_LIMIT_MAX", "30"), 30),
 		RateLimitWindow: parseDuration(os.Getenv("RATE_LIMIT_WINDOW"), "1m"),
@@ -120,6 +120,27 @@ func parseDuration(s, fallback string) time.Duration {
 	}
 	d, _ := time.ParseDuration(fallback)
 	return d
+}
+
+// parseBool reads a boolean env var. Accepts what strconv.ParseBool does plus
+// mixed case ("True", "TRUE", "1", "yes"), because a flag that silently stays
+// off on a near-miss spelling defeats the point of setting it.
+func parseBool(key string, fallback bool) bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if raw == "" {
+		return fallback
+	}
+	switch raw {
+	case "yes", "on":
+		return true
+	case "no", "off":
+		return false
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fallback
+	}
+	return v
 }
 
 // parseInt parses a positive integer with a fallback for empty/invalid/non-positive input.

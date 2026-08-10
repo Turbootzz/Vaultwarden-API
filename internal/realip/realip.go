@@ -80,7 +80,7 @@ func (r *Resolver) ClientIP(c *fiber.Ctx) string {
 		return peer.String()
 	}
 
-	forwarded := parseForwardedFor(c.Get(fiber.HeaderXForwardedFor))
+	forwarded := forwardedFor(c)
 	for i := len(forwarded) - 1; i >= 0; i-- {
 		if !r.IsTrustedProxy(forwarded[i]) {
 			return forwarded[i].String()
@@ -89,18 +89,20 @@ func (r *Resolver) ClientIP(c *fiber.Ctx) string {
 	return peer.String()
 }
 
-// parseForwardedFor extracts the valid addresses from an X-Forwarded-For value,
-// in header order. Malformed entries are dropped rather than aborting the parse,
-// so a client cannot hide the proxy-appended entries behind junk.
-func parseForwardedFor(header string) []net.IP {
-	if header == "" {
-		return nil
-	}
-	parts := strings.Split(header, ",")
-	ips := make([]net.IP, 0, len(parts))
-	for _, part := range parts {
-		if ip := parseHeaderIP(part); ip != nil {
-			ips = append(ips, ip)
+// forwardedFor extracts the valid addresses from the request's X-Forwarded-For
+// header lines, in order. Malformed entries are dropped rather than aborting the
+// parse, so a client cannot hide the proxy-appended entries behind junk.
+//
+// Every line is read, not just the first: a proxy is free to add its own header
+// line rather than extend the client's (HAProxy's forwardfor does), and reading
+// only the first would hand back the line the client wrote.
+func forwardedFor(c *fiber.Ctx) []net.IP {
+	var ips []net.IP
+	for _, line := range c.Request().Header.PeekAll(fiber.HeaderXForwardedFor) {
+		for _, part := range strings.Split(string(line), ",") {
+			if ip := parseHeaderIP(part); ip != nil {
+				ips = append(ips, ip)
+			}
 		}
 	}
 	return ips
