@@ -8,7 +8,7 @@ A lightweight, production-ready Go API that acts as a secrets bridge between you
 
 - **🚀 Zero external dependencies** — Pure Go binary, no Node.js, no Bitwarden CLI
 - **🔒 Native Bitwarden crypto** — AES-256-CBC + HMAC-SHA256, PBKDF2/Argon2id key derivation
-- **♻️ Auto token refresh** — Never worry about expired sessions again
+- **♻️ Auto token refresh** — Never worry about expired sessions again; if the session is invalidated server-side (restart, token revocation), the service automatically performs a full re-login instead of serving a stale cache
 - **📦 ~20MB Docker image** — Alpine-based, runs as non-root
 - **🛡️ Defense in depth** — API key auth, IP whitelisting, rate limiting, security headers
 - **⚡ Background vault sync** — Secrets always up-to-date (configurable interval)
@@ -115,13 +115,17 @@ You can also use **custom fields** or **notes** — the API returns the most rel
 | `API_KEYS_FILE` | Yes\* | — | Path to a JSON file of scoped keys; takes precedence over `API_KEYS` |
 | `VAULTWARDEN_CLIENT_ID` | No | — | API key client ID (bypasses 2FA — see below) |
 | `VAULTWARDEN_CLIENT_SECRET` | No | — | API key client secret (bypasses 2FA — see below) |
+| `API_PORT` | No | `8080` | Port the API listens on |
 | `ALLOWED_IPS` | No | (all) | Comma-separated IPs/CIDRs to whitelist |
 | `ENABLE_GITHUB_IP_RANGES` | No | `false` | Auto-whitelist GitHub Actions IPs |
 | `SYNC_INTERVAL` | No | `5m` | How often to re-sync the vault |
 | `CACHE_TTL` | No | `5m` | Secret cache duration |
 | `RATE_LIMIT_MAX` | No | `30` | Max requests per window, per IP |
 | `RATE_LIMIT_WINDOW` | No | `1m` | Rate-limit window duration |
-| `TRUSTED_PROXY_IP` | No | `localhost` | Trusted reverse proxy IPs |
+| `READ_TIMEOUT` | No | `10s` | HTTP server read timeout |
+| `WRITE_TIMEOUT` | No | `10s` | HTTP server write timeout |
+| `CORS_ALLOWED_ORIGINS` | No | `http://localhost:3000` | Comma-separated origins allowed by CORS |
+| `TRUSTED_PROXY_IP` | No | `127.0.0.1,::1` | Extra trusted reverse proxy IPs/CIDRs (comma-separated); loopback is always trusted |
 | `ENVIRONMENT` | No | `development` | Set to `production` to hide errors |
 | `DEBUG` | No | `false` | Enable debug logging |
 
@@ -298,7 +302,7 @@ resp, _ := http.DefaultClient.Do(req)
 - **Non-root user** in container
 - **No capabilities** (`cap_drop: ALL`)
 - **Security headers** via Helmet middleware
-- **No secret names in production logs** (only at debug level)
+- **No secret names or values in logs** — debug logs reference vault items by UUID
 - Secrets are **decrypted in-memory only** — never written to disk
 
 ## Project Structure
@@ -346,6 +350,8 @@ When you request `/secret/DATABASE_URL`, the API:
 
 This means you can name your Vaultwarden items naturally (e.g., "Database URL") and fetch them with any casing.
 
+**Trashed items are never served.** Items in the Vaultwarden trash (soft-deleted) are skipped during sync, so deleting an item removes it from the API on the next sync or `POST /refresh`. Restoring it from the trash brings it back the same way.
+
 **Colliding names**: By default, the first match will be selected and returned. To help distinguish between matches with the same name, you can split them up into different organizations, collections, or folders to your liking.
 You can then use either the ID or the name of these groupings as a filter for the request.
 Examples:
@@ -368,10 +374,11 @@ However, for each dimension (organization | collection | folder) you can only fi
 | `Two factor required` | Account has 2FA enabled | Set `VAULTWARDEN_CLIENT_ID` and `VAULTWARDEN_CLIENT_SECRET` (see [2FA section](#2fa--two-step-login)) |
 | `MAC verification failed` | Wrong password or org-owned items | Normal for items shared via organizations — they use a different key |
 | `missing authorization header` | No Bearer token in request | Add `-H "Authorization: Bearer YOUR_API_KEY"` to your request |
-| `secret not found` | Item name doesn't match, or out of the key's scope | Check the exact name in your Vaultwarden vault (matching is case-insensitive); for a scoped key, confirm the secret is within its allowed orgs/collections |
+| `secret not found` | Item name doesn't match, the item is in the trash, or it's out of the key's scope | Check the exact name in your Vaultwarden vault (matching is case-insensitive) and that the item isn't soft-deleted; for a scoped key, confirm the secret is within its allowed orgs/collections |
 | Container exits immediately | Missing required env vars | Ensure `VAULTWARDEN_URL`, `VAULTWARDEN_EMAIL`, `VAULTWARDEN_PASSWORD`, and one of `API_KEY` / `API_KEYS` / `API_KEYS_FILE` are set |
+| `Background sync failed N times in a row, cache is stale` | Vaultwarden unreachable, or the account credentials are no longer valid | Individual sync failures log a warning; after 3 consecutive failures they escalate to an error. Secrets keep being served from the last successful sync — check `VAULTWARDEN_URL` connectivity and your credentials |
 
-**Debug mode:** Set `DEBUG=true` to see detailed logs including secret names being synced (don't use in production).
+**Debug mode:** Set `DEBUG=true` to see detailed logs (sync results, token refreshes, per-item decrypt failures by UUID). Debug logs never contain secret names or values, but they are verbose — don't use in production.
 
 ## Contributing
 
