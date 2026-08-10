@@ -119,6 +119,11 @@ const (
 	CipherTypeIdentity   = 4
 )
 
+// FieldTypeLinked marks a custom field that points at another field rather than
+// holding a value. Its value is a plaintext field reference, not a cipher
+// string, so it is never decrypted.
+const FieldTypeLinked = 3
+
 // APIClient communicates directly with the Vaultwarden HTTP API.
 type APIClient struct {
 	baseURL      string
@@ -630,16 +635,29 @@ func decryptCipher(c SyncCipher, key SymmetricKey) (DecryptedItem, error) {
 		return item, fmt.Errorf("decrypt name: %w", err)
 	}
 
+	// Every field extractSecret can serve is fatal on failure. Swallowing these
+	// errors let a cipher whose name decrypted but whose value did not replace a
+	// good cache entry, so the caller got HTTP 200 with an empty secret and no
+	// signal anywhere (#28). Failing here instead marks the cipher, which routes
+	// it into the existing retain-last-known-good path.
 	if c.Notes != nil {
-		item.Notes, _ = DecryptStr(*c.Notes, key)
+		item.Notes, err = DecryptStr(*c.Notes, key)
+		if err != nil {
+			return item, fmt.Errorf("decrypt notes: %w", err)
+		}
 	}
 
 	if c.Login != nil {
+		if c.Login.Password != nil {
+			item.Password, err = DecryptStr(*c.Login.Password, key)
+			if err != nil {
+				return item, fmt.Errorf("decrypt password: %w", err)
+			}
+		}
+		// Username and URI are never served as a secret, so a failure on them is
+		// noted rather than fatal: it would only widen the blast radius.
 		if c.Login.Username != nil {
 			item.Username, _ = DecryptStr(*c.Login.Username, key)
-		}
-		if c.Login.Password != nil {
-			item.Password, _ = DecryptStr(*c.Login.Password, key)
 		}
 		if c.Login.URI != nil {
 			item.URI, _ = DecryptStr(*c.Login.URI, key)
@@ -650,12 +668,18 @@ func decryptCipher(c SyncCipher, key SymmetricKey) (DecryptedItem, error) {
 	}
 
 	for _, f := range c.Fields {
+		if f.Type == FieldTypeLinked {
+			continue
+		}
 		var name, value string
 		if f.Name != nil {
 			name, _ = DecryptStr(*f.Name, key)
 		}
 		if f.Value != nil {
-			value, _ = DecryptStr(*f.Value, key)
+			value, err = DecryptStr(*f.Value, key)
+			if err != nil {
+				return item, fmt.Errorf("decrypt field value: %w", err)
+			}
 		}
 		if name != "" {
 			item.Fields[name] = value
