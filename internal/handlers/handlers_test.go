@@ -150,7 +150,7 @@ func TestParseUUIDQuery(t *testing.T) {
 }
 
 func TestParseSecretFilters(t *testing.T) {
-	h := NewHandler(vaultwarden.NewClient(nil, 0, 0, vaultwarden.WithState(nil, testNameMaps())))
+	h := NewHandler(vaultwarden.NewClient(nil, 0, vaultwarden.WithState(nil, testNameMaps())))
 
 	// Test proper parsing of query arguments for secret filters
 	tests := []struct {
@@ -232,7 +232,7 @@ func TestParseSecretFilters(t *testing.T) {
 
 func TestGetSecret(t *testing.T) {
 	const fullKey = "full-access-key-for-getsecret-test-000000"
-	h := NewHandler(vaultwarden.NewClient(nil, 0, 0, vaultwarden.WithState(testVaultItems(), testNameMaps())))
+	h := NewHandler(vaultwarden.NewClient(nil, 0, vaultwarden.WithState(testVaultItems(), testNameMaps())))
 	app := fiber.New()
 	// Mirror production: auth runs first and attaches a (here unscoped) scope.
 	app.Use(auth.Middleware(auth.NewStore([]auth.APIKey{{Name: "full", Key: fullKey}})))
@@ -353,7 +353,7 @@ func TestGetSecret(t *testing.T) {
 // without the auth middleware (no scope in context), it denies rather than
 // granting full access.
 func TestGetSecretFailsClosedWithoutAuth(t *testing.T) {
-	h := NewHandler(vaultwarden.NewClient(nil, 0, 0, vaultwarden.WithState(testVaultItems(), testNameMaps())))
+	h := NewHandler(vaultwarden.NewClient(nil, 0, vaultwarden.WithState(testVaultItems(), testNameMaps())))
 	app := fiber.New()
 	app.Get("/secret/:name", h.GetSecret) // intentionally no auth.Middleware
 
@@ -370,7 +370,7 @@ func TestGetSecretFailsClosedWithoutAuth(t *testing.T) {
 }
 
 func TestGetSecretScoped(t *testing.T) {
-	h := NewHandler(vaultwarden.NewClient(nil, 0, 0, vaultwarden.WithState(testVaultItems(), testNameMaps())))
+	h := NewHandler(vaultwarden.NewClient(nil, 0, vaultwarden.WithState(testVaultItems(), testNameMaps())))
 
 	// Keys wired through the real auth middleware so scope flows via c.Locals.
 	const (

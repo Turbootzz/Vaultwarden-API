@@ -1,13 +1,21 @@
 package vaultwarden
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 const (
@@ -45,7 +53,11 @@ func testOrgKey() SymmetricKey {
 
 // encryptType2Cipher builds a Bitwarden type-2 cipher string for unit tests.
 func encryptType2Cipher(plaintext string, key SymmetricKey) (string, error) {
-	data := []byte(plaintext)
+	return encryptType2CipherBytes([]byte(plaintext), key)
+}
+
+// encryptType2CipherBytes builds a Bitwarden type-2 cipher string over raw bytes.
+func encryptType2CipherBytes(data []byte, key SymmetricKey) (string, error) {
 	padLen := aes.BlockSize - (len(data) % aes.BlockSize)
 	padded := make([]byte, len(data)+padLen)
 	copy(padded, data)
@@ -85,6 +97,577 @@ func mustEncryptType2Cipher(t *testing.T, plaintext string, key SymmetricKey) st
 		t.Fatalf("encryptType2Cipher: %v", err)
 	}
 	return s
+}
+
+// newSyncTestClient returns an APIClient in authenticated state pointed at a test server.
+func newSyncTestClient(t *testing.T, handler http.Handler) *APIClient {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	ac := NewAPIClient(srv.URL, "user@example.com", "password", "", "")
+	ac.accessToken = "test-token"
+	ac.refreshToken = "test-refresh-token"
+	ac.tokenExpiry = time.Now().Add(time.Hour)
+	ac.symKey = testUserKey()
+	return ac
+}
+
+func TestSync_SkipsTrashedCiphers(t *testing.T) {
+	userKey := testUserKey()
+	deleted := "2026-08-01T12:00:00.000000Z"
+
+	// Encrypt here, not in the handler: t.Fatalf from a handler goroutine is undefined.
+	activeName := mustEncryptType2Cipher(t, "active-item", userKey)
+	trashedName := mustEncryptType2Cipher(t, "trashed-item", userKey)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		resp := SyncResponse{
+			Ciphers: []SyncCipher{
+				{
+					ID:   "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+					Type: CipherTypeLogin,
+					Name: activeName,
+				},
+				{
+					ID:          "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+					Type:        CipherTypeLogin,
+					Name:        trashedName,
+					DeletedDate: &deleted,
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	items, _, err := ac.Sync()
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("Sync() returned %d items, want 1 (trashed cipher must be skipped)", len(items))
+	}
+	if items[0].Name != "active-item" {
+		t.Errorf("surviving item = %q, want active-item", items[0].Name)
+	}
+}
+
+func TestSync_401RefreshFailsFallsBackToFullReauth(t *testing.T) {
+	const testKDFIterations = 10000 // low on purpose: keeps the test fast
+
+	// Stands in for a key rotation: Sync must retry with this key, not the pre-401 snapshot.
+	rotatedKey := testOrgKey()
+	cipherName := mustEncryptType2Cipher(t, "after-reauth", rotatedKey)
+
+	// The enc||mac blob under the stretched master key is what DecryptSymmetricKey unwraps.
+	masterKey, err := MakeMasterKey("password", "user@example.com", KdfPBKDF2, testKDFIterations, nil, nil)
+	if err != nil {
+		t.Fatalf("MakeMasterKey: %v", err)
+	}
+	stretched, err := StretchKey(masterKey)
+	if err != nil {
+		t.Fatalf("StretchKey: %v", err)
+	}
+	keyBlob := make([]byte, 0, 64)
+	keyBlob = append(keyBlob, rotatedKey.EncKey...)
+	keyBlob = append(keyBlob, rotatedKey.MacKey...)
+	encryptedUserKey, err := encryptType2CipherBytes(keyBlob, stretched)
+	if err != nil {
+		t.Fatalf("encryptType2CipherBytes: %v", err)
+	}
+
+	var syncCalls, refreshCalls, preloginCalls, passwordGrantCalls int
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		syncCalls++
+		// Only the token minted by the full re-authentication is accepted.
+		if r.Header.Get("Authorization") != "Bearer new-token" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		resp := SyncResponse{
+			Ciphers: []SyncCipher{
+				{
+					ID:   "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+					Type: CipherTypeLogin,
+					Name: cipherName,
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+	mux.HandleFunc("/identity/accounts/prelogin", func(w http.ResponseWriter, r *http.Request) {
+		preloginCalls++
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(PreloginResponse{KDF: KdfPBKDF2, KDFIterations: testKDFIterations}); err != nil {
+			t.Errorf("encode prelogin response: %v", err)
+		}
+	})
+	mux.HandleFunc("/identity/connect/token", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse token form: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		switch grant := r.PostFormValue("grant_type"); grant {
+		case "refresh_token":
+			// Refresh token is dead too (server restart / rotation / revocation).
+			refreshCalls++
+			w.WriteHeader(http.StatusBadRequest)
+		case "password":
+			passwordGrantCalls++
+			w.Header().Set("Content-Type", "application/json")
+			if err := json.NewEncoder(w).Encode(TokenResponse{
+				AccessToken:  "new-token",
+				ExpiresIn:    3600,
+				TokenType:    "Bearer",
+				RefreshToken: "new-refresh-token",
+				Key:          encryptedUserKey,
+			}); err != nil {
+				t.Errorf("encode token response: %v", err)
+			}
+		default:
+			t.Errorf("unexpected grant_type %q", grant)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	items, _, err := ac.Sync()
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("Sync() returned %d items, want 1", len(items))
+	}
+	if items[0].Name != "after-reauth" {
+		t.Errorf("item name = %q, want after-reauth", items[0].Name)
+	}
+	if refreshCalls != 1 {
+		t.Errorf("refresh grant calls = %d, want 1", refreshCalls)
+	}
+	if preloginCalls != 1 {
+		t.Errorf("prelogin calls = %d, want 1 (full re-authentication must be attempted) (#22)", preloginCalls)
+	}
+	if passwordGrantCalls != 1 {
+		t.Errorf("password grant calls = %d, want 1 (full re-authentication must be attempted) (#22)", passwordGrantCalls)
+	}
+	if syncCalls != 2 {
+		t.Errorf("sync calls = %d, want 2 (one 401, one retry after re-auth)", syncCalls)
+	}
+}
+
+func TestSync_401ReauthAlsoFailsReturnsError(t *testing.T) {
+	var preloginCalls int
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	mux.HandleFunc("/identity/connect/token", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	})
+	mux.HandleFunc("/identity/accounts/prelogin", func(w http.ResponseWriter, r *http.Request) {
+		preloginCalls++
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	_, _, err := ac.Sync()
+	if err == nil {
+		t.Fatal("Sync() expected error")
+	}
+	if preloginCalls == 0 {
+		t.Error("full re-authentication was never attempted after refresh failure (#22)")
+	}
+	if !strings.Contains(err.Error(), "re-authentication failed") {
+		t.Errorf("error %q should mention re-authentication failure", err)
+	}
+}
+
+func TestSync_AllCiphersFailToDecryptReturnsError(t *testing.T) {
+	// Encrypted under a key the client does not hold, so every cipher fails its MAC check.
+	wrongKey := testOrgKey()
+	nameA := mustEncryptType2Cipher(t, "item-a", wrongKey)
+	nameB := mustEncryptType2Cipher(t, "item-b", wrongKey)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		resp := SyncResponse{
+			Ciphers: []SyncCipher{
+				{ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", Type: CipherTypeLogin, Name: nameA},
+				{ID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Type: CipherTypeLogin, Name: nameB},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	items, _, err := ac.Sync()
+	if err == nil {
+		t.Fatalf("Sync() returned %d items and no error; want an error when every cipher fails to decrypt", len(items))
+	}
+	if !strings.Contains(err.Error(), "decrypted 0 of 2") {
+		t.Errorf("error %q should report how many of the ciphers decrypted", err)
+	}
+}
+
+func TestSync_OrgCipherWithoutOrgKeyCountsAsFailure(t *testing.T) {
+	// No profile private key, so no org key can be derived. The name is encrypted under
+	// the *user* key on purpose: it would decrypt fine if the cipher were ever attempted.
+	userKey := testUserKey()
+	orgID := testOrgID
+	orgName := mustEncryptType2Cipher(t, "org-item", userKey)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		resp := SyncResponse{
+			Profile: SyncProfile{
+				Organizations: []SyncOrganization{{ID: orgID, Name: "Org"}},
+			},
+			Ciphers: []SyncCipher{
+				{
+					ID:             "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+					Type:           CipherTypeLogin,
+					OrganizationID: &orgID,
+					Name:           orgName,
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	items, _, err := ac.Sync()
+	if err == nil {
+		t.Fatalf("Sync() returned %d items and no error; want an error when the only cipher is org-owned and no org key is available", len(items))
+	}
+	if !strings.Contains(err.Error(), "refusing to replace cache") {
+		t.Errorf("error %q should refuse to replace the cache", err)
+	}
+	if !strings.Contains(err.Error(), "decrypted 0 of 1") {
+		t.Errorf("error %q should count the skipped org cipher as a failure", err)
+	}
+}
+
+func TestSync_OnlyTrashedCiphersSyncsEmpty(t *testing.T) {
+	// An all-trashed vault is empty, not broken: trashed skips are not decrypt failures.
+	userKey := testUserKey()
+	deleted := "2026-08-01T12:00:00.000000Z"
+	trashedName := mustEncryptType2Cipher(t, "trashed-item", userKey)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		resp := SyncResponse{
+			Ciphers: []SyncCipher{
+				{
+					ID:          "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+					Type:        CipherTypeLogin,
+					Name:        trashedName,
+					DeletedDate: &deleted,
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	items, _, err := ac.Sync()
+	if err != nil {
+		t.Fatalf("Sync() error: %v (an all-trashed vault is empty, not failed)", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("Sync() returned %d items, want 0", len(items))
+	}
+}
+
+func TestSync_RetryStill401ForcesReauthOnNextAttempt(t *testing.T) {
+	// The refresh grant mints a token the API still rejects (revoked session).
+	var syncCalls, refreshCalls, preloginCalls int
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		syncCalls++
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	mux.HandleFunc("/identity/accounts/prelogin", func(w http.ResponseWriter, r *http.Request) {
+		preloginCalls++
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/identity/connect/token", func(w http.ResponseWriter, r *http.Request) {
+		refreshCalls++
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken:  "refreshed-but-rejected-token",
+			ExpiresIn:    3600,
+			TokenType:    "Bearer",
+			RefreshToken: "another-refresh-token",
+		}); err != nil {
+			t.Errorf("encode token response: %v", err)
+		}
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	_, _, err := ac.Sync()
+	if err == nil {
+		t.Fatal("Sync() expected error")
+	}
+	if !strings.Contains(err.Error(), "forcing re-auth on next attempt") {
+		t.Errorf("error %q should say the next attempt is forced to re-authenticate", err)
+	}
+	ac.mu.RLock()
+	expiry := ac.tokenExpiry
+	ac.mu.RUnlock()
+	if !expiry.IsZero() {
+		t.Errorf("tokenExpiry = %v, want zero so EnsureValidToken re-runs the recovery ladder", expiry)
+	}
+	if syncCalls != 2 {
+		t.Errorf("sync calls = %d, want 2 (one 401, one retry — no extra retry loops)", syncCalls)
+	}
+	if refreshCalls != 1 {
+		t.Errorf("token endpoint calls = %d, want 1 (refresh succeeded, so no in-flight re-auth)", refreshCalls)
+	}
+	if preloginCalls != 0 {
+		t.Errorf("prelogin calls = %d, want 0 (recovery is deferred to the next attempt)", preloginCalls)
+	}
+}
+
+func TestSync_ConcurrentRenewalRunsOneLogin(t *testing.T) {
+	const staleToken = "test-token" // what newSyncTestClient seeds
+	const renewedToken = "renewed-token"
+	const callers = 2
+
+	userKey := testUserKey()
+	cipherName := mustEncryptType2Cipher(t, "after-renewal", userKey)
+
+	var mu sync.Mutex
+	var tokenCalls, syncCalls, staleSyncCalls int
+
+	// Barrier: hold every caller at the 401 until all have seen it, so they really do
+	// observe the same dead token concurrently.
+	release := make(chan struct{})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		syncCalls++
+		stale := r.Header.Get("Authorization") != "Bearer "+renewedToken
+		if stale {
+			staleSyncCalls++
+			if staleSyncCalls == callers {
+				close(release)
+			}
+		}
+		mu.Unlock()
+
+		if stale {
+			select {
+			case <-release:
+			case <-time.After(5 * time.Second):
+				t.Error("timed out waiting for all callers to reach the 401")
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		resp := SyncResponse{
+			Ciphers: []SyncCipher{
+				{ID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", Type: CipherTypeLogin, Name: cipherName},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+	mux.HandleFunc("/identity/connect/token", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		tokenCalls++
+		mu.Unlock()
+
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse token form: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if grant := r.PostFormValue("grant_type"); grant != "refresh_token" {
+			t.Errorf("grant_type = %q, want refresh_token", grant)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken:  renewedToken,
+			ExpiresIn:    3600,
+			TokenType:    "Bearer",
+			RefreshToken: "renewed-refresh-token",
+		}); err != nil {
+			t.Errorf("encode token response: %v", err)
+		}
+	})
+	mux.HandleFunc("/identity/accounts/prelogin", func(w http.ResponseWriter, r *http.Request) {
+		t.Error("full re-authentication attempted, but the refresh grant succeeds here")
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	ac := newSyncTestClient(t, mux)
+	if ac.accessToken != staleToken {
+		t.Fatalf("seeded accessToken = %q, want %q", ac.accessToken, staleToken)
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	counts := make([]int, callers)
+	for i := range callers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			items, _, err := ac.Sync()
+			errs[i] = err
+			counts[i] = len(items)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("Sync() #%d error: %v", i, err)
+		}
+		if counts[i] != 1 {
+			t.Errorf("Sync() #%d returned %d items, want 1", i, counts[i])
+		}
+	}
+	if tokenCalls != 1 {
+		t.Errorf("token endpoint calls = %d, want 1 (concurrent renewals must collapse into one)", tokenCalls)
+	}
+	if syncCalls != 2*callers {
+		t.Errorf("sync calls = %d, want %d (one 401 and one retry per caller)", syncCalls, 2*callers)
+	}
+}
+
+func TestRefreshAccessToken_EmptyAccessTokenIsError(t *testing.T) {
+	// A 200 with no access_token must not be success: it would store an empty bearer token.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/identity/connect/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write([]byte(`{}`)); err != nil {
+			t.Errorf("write token response: %v", err)
+		}
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	if err := ac.RefreshAccessToken(); err == nil {
+		t.Fatal("RefreshAccessToken() expected error for a 200 response with an empty access_token")
+	}
+
+	ac.mu.RLock()
+	token := ac.accessToken
+	ac.mu.RUnlock()
+	if token != "test-token" {
+		t.Errorf("accessToken = %q, want the prior token left untouched", token)
+	}
+}
+
+func TestDoTokenRequest_EmptyAccessTokenIsError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/identity/connect/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write([]byte(`{"expires_in":3600,"token_type":"Bearer"}`)); err != nil {
+			t.Errorf("write token response: %v", err)
+		}
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	if _, err := ac.doTokenRequest(url.Values{"grant_type": {"password"}}); err == nil {
+		t.Fatal("doTokenRequest() expected error for a 200 response with an empty access_token")
+	}
+}
+
+func TestAuthenticate_ProfileKeyFailureLeavesPriorStateIntact(t *testing.T) {
+	const testKDFIterations = 10000 // low on purpose: keeps the test fast
+
+	// API key login carries no Key, so the profile fetch supplies it; when that fails,
+	// a half-applied login (new token, old symKey) would decrypt nothing.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/identity/accounts/prelogin", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(PreloginResponse{KDF: KdfPBKDF2, KDFIterations: testKDFIterations}); err != nil {
+			t.Errorf("encode prelogin response: %v", err)
+		}
+	})
+	mux.HandleFunc("/identity/connect/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken:  "half-applied-token",
+			ExpiresIn:    3600,
+			TokenType:    "Bearer",
+			RefreshToken: "half-applied-refresh-token",
+		}); err != nil {
+			t.Errorf("encode token response: %v", err)
+		}
+	})
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	ac := NewAPIClient(srv.URL, "user@example.com", "password", "client-id", "client-secret")
+	priorExpiry := time.Now().Add(time.Hour)
+	ac.accessToken = "old-token"
+	ac.refreshToken = "old-refresh-token"
+	ac.tokenExpiry = priorExpiry
+	ac.symKey = testUserKey()
+
+	if err := ac.Authenticate(); err == nil {
+		t.Fatal("Authenticate() expected error when the profile key fetch fails")
+	}
+
+	ac.mu.RLock()
+	defer ac.mu.RUnlock()
+	if ac.accessToken != "old-token" {
+		t.Errorf("accessToken = %q, want old-token (failed login must not publish)", ac.accessToken)
+	}
+	if ac.refreshToken != "old-refresh-token" {
+		t.Errorf("refreshToken = %q, want old-refresh-token (failed login must not publish)", ac.refreshToken)
+	}
+	if !ac.tokenExpiry.Equal(priorExpiry) {
+		t.Errorf("tokenExpiry = %v, want %v (failed login must not publish)", ac.tokenExpiry, priorExpiry)
+	}
+	// The token fields staying put is only meaningful if the key did too.
+	priorKey := testUserKey()
+	if !bytes.Equal(ac.symKey.EncKey, priorKey.EncKey) {
+		t.Error("symKey.EncKey changed, want the prior key left untouched (failed login must not publish)")
+	}
+	if !bytes.Equal(ac.symKey.MacKey, priorKey.MacKey) {
+		t.Error("symKey.MacKey changed, want the prior key left untouched (failed login must not publish)")
+	}
 }
 
 func TestEmptySyncNameMaps(t *testing.T) {

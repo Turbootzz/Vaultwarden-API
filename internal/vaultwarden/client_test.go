@@ -15,7 +15,7 @@ func TestNewClient_withState(t *testing.T) {
 		Collections:   map[string]string{},
 	}
 
-	c := NewClient(nil, 0, 0, WithState(items, nameMaps))
+	c := NewClient(nil, 0, WithState(items, nameMaps))
 
 	val, err := c.GetSecret("db-password", SecretFilter{})
 	if err != nil || val != "pw" {
@@ -116,5 +116,25 @@ func TestMatchesSecretFilter_PersonalItemExcludedByOrgScope(t *testing.T) {
 	}
 	if !matchesSecretFilter(personal, SecretFilter{}) {
 		t.Error("personal item should match an empty (full-access) scope")
+	}
+}
+
+func TestShouldEscalateSyncFailure(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		consecutive int
+		want        bool
+	}{
+		{0, false},
+		{1, false},
+		{2, false},
+		{3, true},
+		{4, true},
+	}
+	for _, tt := range tests {
+		if got := shouldEscalateSyncFailure(tt.consecutive); got != tt.want {
+			t.Errorf("shouldEscalateSyncFailure(%d) = %v, want %v", tt.consecutive, got, tt.want)
+		}
 	}
 }

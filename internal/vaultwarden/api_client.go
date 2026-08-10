@@ -78,6 +78,7 @@ type SyncCipher struct {
 	CollectionIDs  []string    `json:"collectionIds"`
 	FolderID       *string     `json:"folderId"`
 	Name           string      `json:"name"`
+	DeletedDate    *string     `json:"deletedDate"`
 	Notes          *string     `json:"notes"`
 	Login          *SyncLogin  `json:"login"`
 	Card           *SyncCard   `json:"card"`
@@ -125,6 +126,9 @@ type APIClient struct {
 	clientSecret string // Optional: for API key login (bypasses 2FA)
 	httpClient   *http.Client
 	deviceID     string
+
+	// renewMu serializes credential renewal. Lock order: renewMu before mu, never the reverse.
+	renewMu sync.Mutex
 
 	mu           sync.RWMutex
 	accessToken  string
@@ -187,23 +191,10 @@ func (ac *APIClient) Authenticate() error {
 	// so we get it from the sync/profile endpoint.
 	encryptedKey := tokenResp.Key
 	if encryptedKey == "" {
-		// Fetch from sync profile.
-		ac.mu.Lock()
-		ac.accessToken = tokenResp.AccessToken
-		ac.refreshToken = tokenResp.RefreshToken
-		ac.tokenExpiry = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
-		ac.mu.Unlock()
-
-		encryptedKey, err = ac.fetchProfileKey()
+		encryptedKey, err = ac.fetchProfileKey(tokenResp.AccessToken)
 		if err != nil {
 			return fmt.Errorf("fetch profile key: %w", err)
 		}
-	} else {
-		ac.mu.Lock()
-		ac.accessToken = tokenResp.AccessToken
-		ac.refreshToken = tokenResp.RefreshToken
-		ac.tokenExpiry = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
-		ac.mu.Unlock()
 	}
 
 	// Step 5: Decrypt the symmetric key.
@@ -212,7 +203,11 @@ func (ac *APIClient) Authenticate() error {
 		return fmt.Errorf("decrypt symmetric key: %w", err)
 	}
 
+	// Step 6: Publish tokens and key under one lock so no reader pairs a new token with the old key.
 	ac.mu.Lock()
+	ac.accessToken = tokenResp.AccessToken
+	ac.refreshToken = tokenResp.RefreshToken
+	ac.tokenExpiry = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
 	ac.symKey = symKey
 	ac.mu.Unlock()
 
@@ -252,6 +247,11 @@ func (ac *APIClient) RefreshAccessToken() error {
 		return fmt.Errorf("decode refresh response: %w", err)
 	}
 
+	// A 200 without a token is a failed refresh; reporting success would hide it from the re-auth fallback.
+	if tokenResp.AccessToken == "" {
+		return fmt.Errorf("refresh response contained an empty access token")
+	}
+
 	ac.mu.Lock()
 	ac.accessToken = tokenResp.AccessToken
 	if tokenResp.RefreshToken != "" {
@@ -264,20 +264,45 @@ func (ac *APIClient) RefreshAccessToken() error {
 	return nil
 }
 
+// refreshOrReauthenticate renews credentials: refresh grant first, full login as fallback (#22).
+// Serialized on renewMu so concurrent callers cost one login, not one each.
+// The skip compares staleToken, not tokenExpiry: a 401'd token is dead while its expiry can still be an hour out.
+func (ac *APIClient) refreshOrReauthenticate(staleToken string) error {
+	ac.renewMu.Lock()
+	defer ac.renewMu.Unlock()
+
+	ac.mu.RLock()
+	current := ac.accessToken
+	ac.mu.RUnlock()
+	if current != staleToken {
+		logger.Debug.Println("Credentials already renewed by a concurrent caller, skipping")
+		return nil
+	}
+
+	refreshErr := ac.RefreshAccessToken()
+	if refreshErr == nil {
+		return nil
+	}
+
+	logger.Warn.Printf("Token refresh failed, attempting full re-authentication: %v", refreshErr)
+	if authErr := ac.Authenticate(); authErr != nil {
+		return fmt.Errorf("refresh failed (%v); re-authentication failed: %w", refreshErr, authErr)
+	}
+	return nil
+}
+
 // EnsureValidToken refreshes the access token if it's expired or about to expire.
 func (ac *APIClient) EnsureValidToken() error {
+	// One snapshot: refreshOrReauthenticate compares the token it is handed against the current one.
 	ac.mu.RLock()
 	expiry := ac.tokenExpiry
+	token := ac.accessToken
 	ac.mu.RUnlock()
 
 	// Refresh 60 seconds before actual expiry.
 	if time.Now().After(expiry.Add(-60 * time.Second)) {
 		logger.Debug.Println("Token expiring soon, refreshing...")
-		if err := ac.RefreshAccessToken(); err != nil {
-			// If refresh fails, try full re-authentication.
-			logger.Warn.Println("Token refresh failed, attempting full re-authentication")
-			return ac.Authenticate()
-		}
+		return ac.refreshOrReauthenticate(token)
 	}
 	return nil
 }
@@ -422,20 +447,23 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 		return nil, emptySyncNameMaps(), fmt.Errorf("sync request: %w", err)
 	}
 
+	retriedAfterRenewal := false
 	if resp.StatusCode == http.StatusUnauthorized {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		if closeErr := resp.Body.Close(); closeErr != nil {
 			logger.Warn.Printf("close sync 401 response body: %v", closeErr)
 		}
 
-		// Token might be invalid, try to refresh and retry once.
-		if err := ac.RefreshAccessToken(); err != nil {
-			return nil, emptySyncNameMaps(), fmt.Errorf("sync auth failed, refresh failed: %w", err)
+		// Renew and retry once; pass the token that drew the 401 so a concurrent renewal isn't repeated.
+		if err := ac.refreshOrReauthenticate(token); err != nil {
+			return nil, emptySyncNameMaps(), fmt.Errorf("sync auth failed: %w", err)
 		}
 		ac.mu.RLock()
 		token = ac.accessToken
+		key = ac.symKey // Authenticate() may have rotated it
 		ac.mu.RUnlock()
 
+		retriedAfterRenewal = true
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp, err = ac.httpClient.Do(req)
 		if err != nil {
@@ -450,6 +478,16 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		if retriedAfterRenewal && resp.StatusCode == http.StatusUnauthorized {
+			// Renewal succeeded but the server still rejects the token (revoked session).
+			// Zero the expiry, or EnsureValidToken no-ops every tick and the cache freezes.
+			ac.mu.Lock()
+			ac.tokenExpiry = time.Time{}
+			ac.mu.Unlock()
+			return nil, emptySyncNameMaps(), fmt.Errorf(
+				"sync failed (HTTP %d) after token refresh/re-auth; forcing re-auth on next attempt: %s",
+				resp.StatusCode, string(body))
+		}
 		return nil, emptySyncNameMaps(), fmt.Errorf("sync failed (HTTP %d): %s", resp.StatusCode, string(body))
 	}
 
@@ -480,7 +518,14 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 
 	// Decrypt all ciphers.
 	items := make([]DecryptedItem, 0, len(syncResp.Ciphers))
+	decryptFailures := 0
 	for _, c := range syncResp.Ciphers {
+		// Trashed ciphers stay in the sync payload; they must not resolve (#20).
+		if c.DeletedDate != nil && strings.TrimSpace(*c.DeletedDate) != "" {
+			logger.Debug.Printf("Skipping trashed cipher %s", c.ID)
+			continue
+		}
+
 		// Select the correct decryption key.
 		decryptKey := key
 		if c.OrganizationID != nil && *c.OrganizationID != "" {
@@ -488,6 +533,7 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 				decryptKey = orgKey
 			} else {
 				logger.Debug.Printf("No org key for cipher %s (org %s), skipping", c.ID, *c.OrganizationID)
+				decryptFailures++
 				continue
 			}
 		}
@@ -495,9 +541,18 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 		item, err := decryptCipher(c, decryptKey)
 		if err != nil {
 			logger.Debug.Printf("Failed to decrypt cipher %s: %v", c.ID, err)
+			decryptFailures++
 			continue
 		}
 		items = append(items, item)
+	}
+
+	// Nothing decrypted while ciphers failed means a broken key, not an empty vault:
+	// succeeding here would let syncVault replace a healthy cache with an empty one.
+	if len(items) == 0 && decryptFailures > 0 {
+		return nil, emptySyncNameMaps(), fmt.Errorf(
+			"sync decrypted 0 of %d ciphers (%d failures), refusing to replace cache",
+			len(syncResp.Ciphers), decryptFailures)
 	}
 
 	logger.Info.Printf("Synced and decrypted %d vault items", len(items))
@@ -663,16 +718,17 @@ func (ac *APIClient) doTokenRequest(data url.Values) (*TokenResponse, error) {
 		return nil, fmt.Errorf("decode login response: %w", err)
 	}
 
+	if tokenResp.AccessToken == "" {
+		return nil, fmt.Errorf("login response contained an empty access token")
+	}
+
 	return &tokenResp, nil
 }
 
 // fetchProfileKey gets the encrypted symmetric key from the user's profile.
 // Used when API key login doesn't return the Key in the token response.
-func (ac *APIClient) fetchProfileKey() (string, error) {
-	ac.mu.RLock()
-	token := ac.accessToken
-	ac.mu.RUnlock()
-
+// The token is passed in because Authenticate has not published it yet.
+func (ac *APIClient) fetchProfileKey(token string) (string, error) {
 	req, err := http.NewRequest("GET", ac.baseURL+"/api/sync", nil)
 	if err != nil {
 		return "", fmt.Errorf("create sync request: %w", err)

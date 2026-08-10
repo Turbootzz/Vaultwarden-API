@@ -15,7 +15,6 @@ import (
 // Client manages vault access, caching, and background sync.
 type Client struct {
 	api       *APIClient
-	cacheTTL  time.Duration
 	syncEvery time.Duration
 
 	mu    sync.RWMutex
@@ -41,10 +40,9 @@ func WithState(items map[string]DecryptedItem, nameMaps SyncNameMaps) ClientOpti
 }
 
 // NewClient creates a vault client. Pass WithState to preload cache data without calling Initialize.
-func NewClient(api *APIClient, cacheTTL, syncInterval time.Duration, opts ...ClientOption) *Client {
+func NewClient(api *APIClient, syncInterval time.Duration, opts ...ClientOption) *Client {
 	c := &Client{
 		api:       api,
-		cacheTTL:  cacheTTL,
 		syncEvery: syncInterval,
 		items:     make(map[string]DecryptedItem),
 		nameMaps:  emptySyncNameMaps(),
@@ -208,17 +206,32 @@ func (c *Client) syncVault() error {
 	return nil
 }
 
+// syncFailureEscalationThreshold is the consecutive background-sync failure count at which the log escalates to error.
+const syncFailureEscalationThreshold = 3
+
+// shouldEscalateSyncFailure reports whether consecutive sync failures have reached the escalation threshold.
+func shouldEscalateSyncFailure(consecutiveFailures int) bool {
+	return consecutiveFailures >= syncFailureEscalationThreshold
+}
+
 // backgroundSync periodically syncs the vault to pick up changes.
 func (c *Client) backgroundSync() {
 	ticker := time.NewTicker(c.syncEvery)
 	defer ticker.Stop()
 
+	consecutiveFailures := 0
 	for {
 		select {
 		case <-ticker.C:
 			if err := c.syncVault(); err != nil {
-				logger.Warn.Printf("Background sync failed: %v", err)
+				consecutiveFailures++
+				if shouldEscalateSyncFailure(consecutiveFailures) {
+					logger.Error.Printf("Background sync failed %d times in a row, cache is stale: %v", consecutiveFailures, err)
+				} else {
+					logger.Warn.Printf("Background sync failed: %v", err)
+				}
 			} else {
+				consecutiveFailures = 0
 				logger.Debug.Println("Background vault sync completed")
 			}
 		case <-c.stopSync:
