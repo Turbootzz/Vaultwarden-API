@@ -1,7 +1,9 @@
 package vaultwarden
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"maps"
 	"net/http"
 	"strings"
@@ -580,4 +582,53 @@ func TestExtractSecret_PriorityFieldsWinOverFallback(t *testing.T) {
 	if got := extractSecret(item); got != "priority" {
 		t.Errorf("extractSecret = %q, want %q", got, "priority")
 	}
+}
+
+// Stop must abandon a vault request that is already in flight. Without a
+// cancellable context, shutdown waits out the 30s HTTP client timeout while the
+// server sits on the connection.
+func TestStop_CancelsInFlightSync(t *testing.T) {
+	released := make(chan struct{})
+	reached := make(chan struct{})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		close(reached)
+		select {
+		case <-r.Context().Done(): // client went away
+		case <-released:
+		}
+	})
+
+	c := NewClient(newSyncTestClient(t, mux), time.Hour)
+	t.Cleanup(func() { close(released) })
+
+	done := make(chan error, 1)
+	go func() { done <- c.syncVault() }()
+
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sync never reached the server")
+	}
+
+	c.Stop()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("syncVault returned nil; want the cancellation error")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("syncVault error = %v, want it to wrap context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("syncVault did not return after Stop; the request was not cancelled")
+	}
+}
+
+func TestStop_IsIdempotent(t *testing.T) {
+	c := NewClient(nil, time.Hour)
+	c.Stop()
+	c.Stop() // must not panic on a second close
 }

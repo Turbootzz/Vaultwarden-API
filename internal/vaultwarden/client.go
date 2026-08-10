@@ -3,6 +3,7 @@
 package vaultwarden
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"sort"
@@ -35,6 +36,12 @@ type Client struct {
 	nameMaps SyncNameMaps
 
 	stopSync chan struct{}
+
+	// ctx is cancelled by Stop so an in-flight vault request is abandoned at
+	// shutdown instead of holding the process for the client timeout.
+	ctx      context.Context
+	cancel   context.CancelFunc
+	stopOnce sync.Once
 }
 
 // ClientOption configures NewClient.
@@ -60,12 +67,15 @@ func WithStrictMatch(strict bool) ClientOption {
 
 // NewClient creates a vault client. Pass WithState to preload cache data without calling Initialize.
 func NewClient(api *APIClient, syncInterval time.Duration, opts ...ClientOption) *Client {
+	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{
 		api:       api,
 		syncEvery: syncInterval,
 		items:     make(map[string]DecryptedItem),
 		nameMaps:  emptySyncNameMaps(),
 		stopSync:  make(chan struct{}),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -75,7 +85,7 @@ func NewClient(api *APIClient, syncInterval time.Duration, opts ...ClientOption)
 
 // Initialize authenticates and performs the initial vault sync.
 func (c *Client) Initialize() error {
-	if err := c.api.Authenticate(); err != nil {
+	if err := c.api.Authenticate(c.ctx); err != nil {
 		return fmt.Errorf("authenticate: %w", err)
 	}
 
@@ -221,9 +231,13 @@ func (c *Client) ClearCache() {
 	}
 }
 
-// Stop stops the background sync goroutine.
+// Stop stops the background sync goroutine and cancels any in-flight request.
+// Safe to call more than once.
 func (c *Client) Stop() {
-	close(c.stopSync)
+	c.stopOnce.Do(func() {
+		close(c.stopSync)
+		c.cancel()
+	})
 }
 
 // NameMaps returns a copy of decrypted organization, folder, and collection names
@@ -264,7 +278,7 @@ func (c *Client) syncVault() error {
 	c.syncMu.Lock()
 	defer c.syncMu.Unlock()
 
-	items, nameMaps, failed, err := c.api.Sync()
+	items, nameMaps, failed, err := c.api.Sync(c.ctx)
 	if err != nil {
 		// A non-empty failure list means the payload was authentic but nothing decrypted (#25):
 		// reconcile placement and drop removed items, instead of serving stale scopes for the whole

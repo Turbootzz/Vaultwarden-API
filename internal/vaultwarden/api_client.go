@@ -2,6 +2,7 @@ package vaultwarden
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -157,9 +158,9 @@ func NewAPIClient(baseURL, email, password, clientID, clientSecret string) *APIC
 // Authenticate performs the full login flow.
 // If API key credentials are set, uses client_credentials grant (bypasses 2FA).
 // Otherwise, uses password grant (requires 2FA to be disabled or handled).
-func (ac *APIClient) Authenticate() error {
+func (ac *APIClient) Authenticate(ctx context.Context) error {
 	// Step 1: Get KDF parameters.
-	prelogin, err := ac.prelogin()
+	prelogin, err := ac.prelogin(ctx)
 	if err != nil {
 		return fmt.Errorf("prelogin: %w", err)
 	}
@@ -177,11 +178,11 @@ func (ac *APIClient) Authenticate() error {
 	if ac.clientID != "" && ac.clientSecret != "" {
 		// API key login — bypasses 2FA.
 		logger.Info.Println("Using API key authentication (2FA bypass)")
-		tokenResp, err = ac.loginWithAPIKey()
+		tokenResp, err = ac.loginWithAPIKey(ctx)
 	} else {
 		// Password login — requires no 2FA or 2FA handling.
 		hashedPassword := HashPassword(ac.password, masterKey)
-		tokenResp, err = ac.loginWithPassword(hashedPassword)
+		tokenResp, err = ac.loginWithPassword(ctx, hashedPassword)
 	}
 	if err != nil {
 		return fmt.Errorf("login: %w", err)
@@ -192,7 +193,7 @@ func (ac *APIClient) Authenticate() error {
 	// so we get it from the sync/profile endpoint.
 	encryptedKey := tokenResp.Key
 	if encryptedKey == "" {
-		encryptedKey, err = ac.fetchProfileKey(tokenResp.AccessToken)
+		encryptedKey, err = ac.fetchProfileKey(ctx, tokenResp.AccessToken)
 		if err != nil {
 			return fmt.Errorf("fetch profile key: %w", err)
 		}
@@ -217,7 +218,7 @@ func (ac *APIClient) Authenticate() error {
 }
 
 // RefreshAccessToken uses the refresh token to get a new access token.
-func (ac *APIClient) RefreshAccessToken() error {
+func (ac *APIClient) RefreshAccessToken(ctx context.Context) error {
 	ac.mu.RLock()
 	rt := ac.refreshToken
 	ac.mu.RUnlock()
@@ -232,7 +233,7 @@ func (ac *APIClient) RefreshAccessToken() error {
 		"client_id":     {"web"},
 	}
 
-	resp, err := ac.httpClient.PostForm(ac.baseURL+"/identity/connect/token", data)
+	resp, err := ac.postForm(ctx, data)
 	if err != nil {
 		return fmt.Errorf("refresh request: %w", err)
 	}
@@ -268,7 +269,7 @@ func (ac *APIClient) RefreshAccessToken() error {
 // refreshOrReauthenticate renews credentials: refresh grant first, full login as fallback (#22).
 // Serialized on renewMu so concurrent callers cost one login, not one each.
 // The skip compares staleToken, not tokenExpiry: a 401'd token is dead while its expiry can still be an hour out.
-func (ac *APIClient) refreshOrReauthenticate(staleToken string) error {
+func (ac *APIClient) refreshOrReauthenticate(ctx context.Context, staleToken string) error {
 	ac.renewMu.Lock()
 	defer ac.renewMu.Unlock()
 
@@ -280,20 +281,20 @@ func (ac *APIClient) refreshOrReauthenticate(staleToken string) error {
 		return nil
 	}
 
-	refreshErr := ac.RefreshAccessToken()
+	refreshErr := ac.RefreshAccessToken(ctx)
 	if refreshErr == nil {
 		return nil
 	}
 
 	logger.Warn.Printf("Token refresh failed, attempting full re-authentication: %v", refreshErr)
-	if authErr := ac.Authenticate(); authErr != nil {
+	if authErr := ac.Authenticate(ctx); authErr != nil {
 		return fmt.Errorf("refresh failed (%v); re-authentication failed: %w", refreshErr, authErr)
 	}
 	return nil
 }
 
 // EnsureValidToken refreshes the access token if it's expired or about to expire.
-func (ac *APIClient) EnsureValidToken() error {
+func (ac *APIClient) EnsureValidToken(ctx context.Context) error {
 	// One snapshot: refreshOrReauthenticate compares the token it is handed against the current one.
 	ac.mu.RLock()
 	expiry := ac.tokenExpiry
@@ -303,7 +304,7 @@ func (ac *APIClient) EnsureValidToken() error {
 	// Refresh 60 seconds before actual expiry.
 	if time.Now().After(expiry.Add(-60 * time.Second)) {
 		logger.Debug.Println("Token expiring soon, refreshing...")
-		return ac.refreshOrReauthenticate(token)
+		return ac.refreshOrReauthenticate(ctx, token)
 	}
 	return nil
 }
@@ -453,8 +454,8 @@ func newFailedCipher(c SyncCipher) FailedCipher {
 // organization, folder, and collection names, plus the ciphers that failed to decrypt and
 // their current placement (trashed ciphers are skipped, not failures). The failure list is
 // also returned with the error raised when nothing decrypted.
-func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, []FailedCipher, error) {
-	if err := ac.EnsureValidToken(); err != nil {
+func (ac *APIClient) Sync(ctx context.Context) ([]DecryptedItem, SyncNameMaps, []FailedCipher, error) {
+	if err := ac.EnsureValidToken(ctx); err != nil {
 		return nil, emptySyncNameMaps(), nil, fmt.Errorf("ensure valid token: %w", err)
 	}
 
@@ -463,7 +464,7 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, []FailedCipher, erro
 	key := ac.symKey
 	ac.mu.RUnlock()
 
-	req, err := http.NewRequest("GET", ac.baseURL+"/api/sync", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ac.baseURL+"/api/sync", nil)
 	if err != nil {
 		return nil, emptySyncNameMaps(), nil, fmt.Errorf("create sync request: %w", err)
 	}
@@ -482,7 +483,7 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, []FailedCipher, erro
 		}
 
 		// Renew and retry once; pass the token that drew the 401 so a concurrent renewal isn't repeated.
-		if err := ac.refreshOrReauthenticate(token); err != nil {
+		if err := ac.refreshOrReauthenticate(ctx, token); err != nil {
 			return nil, emptySyncNameMaps(), nil, fmt.Errorf("sync auth failed: %w", err)
 		}
 		ac.mu.RLock()
@@ -674,17 +675,31 @@ func decryptCipher(c SyncCipher, key SymmetricKey) (DecryptedItem, error) {
 	return item, nil
 }
 
+// postForm sends a form-encoded POST to the token endpoint under ctx.
+func (ac *APIClient) postForm(ctx context.Context, data url.Values) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		ac.baseURL+"/identity/connect/token", strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("create token request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return ac.httpClient.Do(req)
+}
+
 // prelogin fetches KDF parameters for the given email.
-func (ac *APIClient) prelogin() (*PreloginResponse, error) {
+func (ac *APIClient) prelogin(ctx context.Context) (*PreloginResponse, error) {
 	body, err := json.Marshal(map[string]string{"email": ac.email})
 	if err != nil {
 		return nil, fmt.Errorf("encode prelogin request: %w", err)
 	}
-	resp, err := ac.httpClient.Post(
-		ac.baseURL+"/identity/accounts/prelogin",
-		"application/json",
-		bytes.NewReader(body),
-	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		ac.baseURL+"/identity/accounts/prelogin", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create prelogin request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := ac.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("prelogin request: %w", err)
 	}
@@ -704,7 +719,7 @@ func (ac *APIClient) prelogin() (*PreloginResponse, error) {
 }
 
 // loginWithPassword authenticates with email + hashed password (requires no 2FA or 2FA handling).
-func (ac *APIClient) loginWithPassword(hashedPassword string) (*TokenResponse, error) {
+func (ac *APIClient) loginWithPassword(ctx context.Context, hashedPassword string) (*TokenResponse, error) {
 	data := url.Values{
 		"grant_type":       {"password"},
 		"username":         {ac.email},
@@ -716,11 +731,11 @@ func (ac *APIClient) loginWithPassword(hashedPassword string) (*TokenResponse, e
 		"deviceName":       {"vaultwarden-api"},
 	}
 
-	return ac.doTokenRequest(data)
+	return ac.doTokenRequest(ctx, data)
 }
 
 // loginWithAPIKey authenticates with API key (client_credentials). Bypasses 2FA.
-func (ac *APIClient) loginWithAPIKey() (*TokenResponse, error) {
+func (ac *APIClient) loginWithAPIKey(ctx context.Context) (*TokenResponse, error) {
 	data := url.Values{
 		"grant_type":       {"client_credentials"},
 		"client_id":        {ac.clientID},
@@ -731,12 +746,12 @@ func (ac *APIClient) loginWithAPIKey() (*TokenResponse, error) {
 		"deviceName":       {"vaultwarden-api"},
 	}
 
-	return ac.doTokenRequest(data)
+	return ac.doTokenRequest(ctx, data)
 }
 
 // doTokenRequest sends a token request and parses the response.
-func (ac *APIClient) doTokenRequest(data url.Values) (*TokenResponse, error) {
-	resp, err := ac.httpClient.PostForm(ac.baseURL+"/identity/connect/token", data)
+func (ac *APIClient) doTokenRequest(ctx context.Context, data url.Values) (*TokenResponse, error) {
+	resp, err := ac.postForm(ctx, data)
 	if err != nil {
 		return nil, fmt.Errorf("token request: %w", err)
 	}
@@ -762,8 +777,8 @@ func (ac *APIClient) doTokenRequest(data url.Values) (*TokenResponse, error) {
 // fetchProfileKey gets the encrypted symmetric key from the user's profile.
 // Used when API key login doesn't return the Key in the token response.
 // The token is passed in because Authenticate has not published it yet.
-func (ac *APIClient) fetchProfileKey(token string) (string, error) {
-	req, err := http.NewRequest("GET", ac.baseURL+"/api/sync", nil)
+func (ac *APIClient) fetchProfileKey(ctx context.Context, token string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ac.baseURL+"/api/sync", nil)
 	if err != nil {
 		return "", fmt.Errorf("create sync request: %w", err)
 	}

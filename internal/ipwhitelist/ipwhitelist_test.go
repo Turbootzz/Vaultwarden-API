@@ -44,7 +44,8 @@ func TestIsAllowed(t *testing.T) {
 // that made the whitelist spoofable in #29.
 func serve(t *testing.T, app *fiber.App) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
