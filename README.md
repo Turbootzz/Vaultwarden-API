@@ -301,7 +301,8 @@ resp, _ := http.DefaultClient.Do(req)
 - **Non-root user** in container
 - **No capabilities** (`cap_drop: ALL`)
 - **Security headers** via Helmet middleware
-- **No secret names or values in logs** — debug logs reference vault items by UUID
+- **No secret values in logs** — secret values are never written to logs at any level; vault items are referenced by UUID
+- **Secret names can appear in request-path logs** — two default-level paths log the requested URL, which embeds the secret name for `GET /api/secret/:name`: the blocked-IP warning from the IP whitelist, and the error handler's log for unmatched routes. Values are still never logged
 - Secrets are **decrypted in-memory only** — never written to disk
 
 ## Project Structure
@@ -377,7 +378,7 @@ However, for each dimension (organization | collection | folder) you can only fi
 | Container exits immediately | Missing required env vars | Ensure `VAULTWARDEN_URL`, `VAULTWARDEN_EMAIL`, `VAULTWARDEN_PASSWORD`, and one of `API_KEY` / `API_KEYS` / `API_KEYS_FILE` are set |
 | `Background sync failed N times in a row, cache is stale` | Vaultwarden unreachable, or the account credentials are no longer valid | Individual sync failures log a warning; after 3 consecutive failures they escalate to an error. Secrets keep being served from the last successful sync — check `VAULTWARDEN_URL` connectivity and your credentials |
 
-**Debug mode:** Set `DEBUG=true` to see detailed logs (sync results, token refreshes, per-item decrypt failures by UUID). Debug logs never contain secret names or values, but they are verbose — don't use in production.
+**Debug mode:** Set `DEBUG=true` to see detailed logs (sync results, token refreshes, per-item decrypt failures by UUID). Debug logging itself adds no secret names or values — it references vault items by UUID — but it is verbose, so don't use it in production. Secret values are never logged at any level; secret *names* can appear in blocked-request warnings and routing-error logs, which include the requested path (see [Security](#security)).
 
 ## Contributing
 
