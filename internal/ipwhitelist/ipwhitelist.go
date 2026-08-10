@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Turbootzz/vaultwarden-api/internal/realip"
 	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
 	"github.com/gofiber/fiber/v2"
 )
@@ -86,7 +87,7 @@ func (wl *IPWhitelist) Middleware() fiber.Handler {
 			return c.Next()
 		}
 
-		clientIP := c.IP()
+		clientIP := realip.FromCtx(c)
 
 		if wl.IsAllowed(clientIP) {
 			logger.Debug.Printf("IP allowed: %s", clientIP)

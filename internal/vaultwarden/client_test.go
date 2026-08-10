@@ -373,3 +373,106 @@ func TestShouldEscalateSyncFailure(t *testing.T) {
 		}
 	}
 }
+
+func lookupTestItems() map[string]DecryptedItem {
+	return map[string]DecryptedItem{
+		"cipher-b": {ID: "cipher-b", Name: "api-key", Password: "beta"},
+		"cipher-a": {ID: "cipher-a", Name: "API-KEY", Password: "alpha"},
+		"cipher-c": {ID: "cipher-c", Name: "stripe-api-key-prod", Password: "gamma"},
+	}
+}
+
+// Regression for #30: ranging over the item map made the winner depend on Go's
+// randomized map iteration order, so the same request could return a different
+// secret each time. Candidates are now ordered by cipher id.
+func TestGetSecret_AmbiguousMatchIsDeterministic(t *testing.T) {
+	t.Parallel()
+
+	client := NewClient(nil, time.Minute, WithState(lookupTestItems(), emptySyncNameMaps()))
+
+	for _, name := range []string{"api-key", "api"} {
+		first, err := client.GetSecret(name, SecretFilter{})
+		if err != nil {
+			t.Fatalf("GetSecret(%q): %v", name, err)
+		}
+		for i := range 50 {
+			got, err := client.GetSecret(name, SecretFilter{})
+			if err != nil {
+				t.Fatalf("GetSecret(%q) attempt %d: %v", name, i, err)
+			}
+			if got != first {
+				t.Fatalf("GetSecret(%q) returned %q then %q; lookup is not deterministic", name, first, got)
+			}
+		}
+		// Lowest cipher id among the matches.
+		if first != "alpha" {
+			t.Errorf("GetSecret(%q) = %q, want %q (cipher-a sorts first)", name, first, "alpha")
+		}
+	}
+}
+
+// An exact match always beats a substring match, whatever the id ordering.
+func TestGetSecret_ExactMatchWinsOverSubstring(t *testing.T) {
+	t.Parallel()
+
+	items := map[string]DecryptedItem{
+		"cipher-a": {ID: "cipher-a", Name: "stripe-api-key-prod", Password: "substring"},
+		"cipher-z": {ID: "cipher-z", Name: "api-key", Password: "exact"},
+	}
+	client := NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps()))
+
+	got, err := client.GetSecret("api-key", SecretFilter{})
+	if err != nil {
+		t.Fatalf("GetSecret: %v", err)
+	}
+	if got != "exact" {
+		t.Errorf("GetSecret = %q, want %q", got, "exact")
+	}
+}
+
+func TestGetSecret_StrictMatchDisablesSubstringFallback(t *testing.T) {
+	t.Parallel()
+
+	items := lookupTestItems()
+
+	strict := NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps()), WithStrictMatch(true))
+	if _, err := strict.GetSecret("api", SecretFilter{}); err == nil {
+		t.Error("strict client resolved a substring match, want an error")
+	}
+	// An exact match still resolves, case-insensitively.
+	if _, err := strict.GetSecret("API-key", SecretFilter{}); err != nil {
+		t.Errorf("strict client rejected an exact match: %v", err)
+	}
+
+	lenient := NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps()))
+	if _, err := lenient.GetSecret("api", SecretFilter{}); err != nil {
+		t.Errorf("default client rejected a substring match: %v", err)
+	}
+}
+
+func TestGetSecret_ScopeStillAppliesToAmbiguousNames(t *testing.T) {
+	t.Parallel()
+
+	items := map[string]DecryptedItem{
+		"cipher-a": {ID: "cipher-a", Name: "api-key", Password: "out-of-scope", OrganizationID: "org-other"},
+		"cipher-b": {ID: "cipher-b", Name: "api-key", Password: "in-scope", OrganizationID: "org-mine"},
+	}
+	client := NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps()))
+
+	got, err := client.GetSecret("api-key", SecretFilter{OrganizationIDs: []string{"org-mine"}})
+	if err != nil {
+		t.Fatalf("GetSecret: %v", err)
+	}
+	if got != "in-scope" {
+		t.Errorf("GetSecret = %q, want %q — cipher-a sorts first but is out of scope", got, "in-scope")
+	}
+}
+
+func TestGetSecret_EmptyName(t *testing.T) {
+	t.Parallel()
+
+	client := NewClient(nil, time.Minute, WithState(lookupTestItems(), emptySyncNameMaps()))
+	if _, err := client.GetSecret("", SecretFilter{}); err == nil {
+		t.Error("expected an error for an empty name")
+	}
+}

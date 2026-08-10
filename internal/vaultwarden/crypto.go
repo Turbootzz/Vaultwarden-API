@@ -37,6 +37,14 @@ const (
 	KdfArgon2id = 1
 )
 
+// Accepted bounds for server-supplied Argon2id parameters. The memory ceiling
+// sits far below the point where the MiB->KiB conversion overflows; the
+// parallelism ceiling is the width of argon2's threads argument.
+const (
+	argon2MaxMemoryMiB   = 4096
+	argon2MaxParallelism = 255
+)
+
 // SymmetricKey holds the encryption and MAC keys for AES-CBC + HMAC-SHA256.
 type SymmetricKey struct {
 	EncKey []byte // 32 bytes for AES-256
@@ -187,12 +195,24 @@ func MakeMasterKey(password, email string, kdfType, iterations int, memory, para
 		return pbkdf2.Key([]byte(password), salt, iterations, 32, sha256.New), nil
 
 	case KdfArgon2id:
+		// The KDF parameters come from the server's prelogin response. argon2
+		// panics on out-of-range values and the memory conversion overflows, so
+		// they are bounds-checked here and reported as errors (#31).
+		if iterations < 1 {
+			return nil, fmt.Errorf("Argon2id iterations must be >= 1, got %d", iterations)
+		}
 		mem := 64 * 1024 // default 64 MiB
 		par := 4         // default parallelism
 		if memory != nil {
+			if *memory < 1 || *memory > argon2MaxMemoryMiB {
+				return nil, fmt.Errorf("Argon2id memory must be between 1 and %d MiB, got %d", argon2MaxMemoryMiB, *memory)
+			}
 			mem = *memory * 1024 // API returns MiB, argon2 wants KiB
 		}
 		if parallelism != nil {
+			if *parallelism < 1 || *parallelism > argon2MaxParallelism {
+				return nil, fmt.Errorf("Argon2id parallelism must be between 1 and %d, got %d", argon2MaxParallelism, *parallelism)
+			}
 			par = *parallelism
 		}
 		return argon2.IDKey([]byte(password), salt, uint32(iterations), uint32(mem), uint8(par), 32), nil

@@ -724,3 +724,79 @@ func TestDecryptCipher_PersonalItemStillWorks(t *testing.T) {
 		t.Errorf("got name %q, want %q", item.Name, "PERSONAL_SECRET")
 	}
 }
+
+// Regression for #31: the KDF parameters arrive in the server's prelogin
+// response, and argon2 panics on out-of-range values. They must come back as
+// errors so a hostile or broken server cannot take the process down.
+func TestMakeMasterKey_Argon2idRejectsOutOfRangeParams(t *testing.T) {
+	t.Parallel()
+
+	ptr := func(n int) *int { return &n }
+
+	tests := []struct {
+		name        string
+		iterations  int
+		memory      *int
+		parallelism *int
+	}{
+		{"zero iterations", 0, ptr(64), ptr(4)},
+		{"negative iterations", -1, ptr(64), ptr(4)},
+		{"zero parallelism", 3, ptr(64), ptr(0)},
+		{"negative parallelism", 3, ptr(64), ptr(-1)},
+		{"parallelism above uint8", 3, ptr(64), ptr(256)},
+		{"zero memory", 3, ptr(0), ptr(4)},
+		{"negative memory", 3, ptr(-1), ptr(4)},
+		{"memory overflowing the KiB conversion", 3, ptr(1 << 40), ptr(4)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("MakeMasterKey panicked instead of returning an error: %v", r)
+				}
+			}()
+			if _, err := MakeMasterKey("pw", "user@example.com", KdfArgon2id, tt.iterations, tt.memory, tt.parallelism); err == nil {
+				t.Error("expected an error, got nil")
+			}
+		})
+	}
+}
+
+func TestMakeMasterKey_Argon2idAcceptsBoundaryParams(t *testing.T) {
+	t.Parallel()
+
+	ptr := func(n int) *int { return &n }
+
+	tests := []struct {
+		name        string
+		memory      *int
+		parallelism *int
+	}{
+		{"defaults when unset", nil, nil},
+		{"minimum memory and parallelism", ptr(1), ptr(1)},
+		{"maximum parallelism", ptr(16), ptr(255)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			key, err := MakeMasterKey("pw", "user@example.com", KdfArgon2id, 1, tt.memory, tt.parallelism)
+			if err != nil {
+				t.Fatalf("MakeMasterKey: %v", err)
+			}
+			if len(key) != 32 {
+				t.Errorf("expected 32 bytes, got %d", len(key))
+			}
+		})
+	}
+}
+
+func TestMakeMasterKey_PBKDF2RejectsZeroIterations(t *testing.T) {
+	t.Parallel()
+
+	if _, err := MakeMasterKey("pw", "user@example.com", KdfPBKDF2, 0, nil, nil); err == nil {
+		t.Error("expected an error, got nil")
+	}
+}

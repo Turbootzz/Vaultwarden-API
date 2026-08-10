@@ -119,12 +119,13 @@ You can also use **custom fields** or **notes** — the API returns the most rel
 | `ALLOWED_IPS` | No | (all) | Comma-separated IPs/CIDRs to whitelist |
 | `ENABLE_GITHUB_IP_RANGES` | No | `false` | Auto-whitelist GitHub Actions IPs |
 | `SYNC_INTERVAL` | No | `5m` | How often to re-sync the vault |
+| `STRICT_SECRET_MATCH` | No | `false` | Require an exact name match; `true` returns 404 instead of falling back to a partial match |
 | `RATE_LIMIT_MAX` | No | `30` | Max requests per window, per IP |
 | `RATE_LIMIT_WINDOW` | No | `1m` | Rate-limit window duration |
 | `READ_TIMEOUT` | No | `10s` | HTTP server read timeout |
 | `WRITE_TIMEOUT` | No | `10s` | HTTP server write timeout |
 | `CORS_ALLOWED_ORIGINS` | No | `http://localhost:3000` | Comma-separated origins allowed by CORS |
-| `TRUSTED_PROXY_IP` | No | `127.0.0.1,::1` | Extra trusted reverse proxy IPs/CIDRs (comma-separated); loopback is always trusted |
+| `TRUSTED_PROXY_IP` | No | `127.0.0.1,::1` | Extra trusted reverse proxy IPs/CIDRs (comma-separated); loopback is always trusted. See [Client IP behind a proxy](#client-ip-behind-a-proxy) |
 | `ENVIRONMENT` | No | `development` | Set to `production` to hide errors |
 | `DEBUG` | No | `false` | Enable debug logging |
 
@@ -301,9 +302,37 @@ resp, _ := http.DefaultClient.Do(req)
 - **Non-root user** in container
 - **No capabilities** (`cap_drop: ALL`)
 - **Security headers** via Helmet middleware
+- **Spoof-resistant client IP** — see [Client IP behind a proxy](#client-ip-behind-a-proxy)
+- **No caching or compression of secret responses** — `GET /secret/:name` answers carry `Cache-Control: no-store` and are excluded from response compression, so a secret is neither storable by an intermediary nor measurable through compressed length
 - **No secret values in logs** — secret values are never written to logs at any level; vault items are referenced by UUID
 - **Secret names can appear in request-path logs** — two default-level paths log the requested URL, which embeds the secret name for `GET /api/secret/:name`: the blocked-IP warning from the IP whitelist, and the error handler's log for unmatched routes. Values are still never logged
 - Secrets are **decrypted in-memory only** — never written to disk
+
+### Client IP behind a proxy
+
+`ALLOWED_IPS` and the rate limiter act on the client address, so how that address
+is derived is itself a security control.
+
+The socket peer is authoritative unless it is a trusted proxy — loopback, plus
+anything in `TRUSTED_PROXY_IP`. Only for a trusted peer is `X-Forwarded-For`
+consulted, and it is read **right to left**: the first entry that is not a
+trusted proxy is the client. That direction is what makes it unspoofable. A
+proxy running the standard `proxy_set_header X-Forwarded-For
+$proxy_add_x_forwarded_for;` *appends* the address it saw, so everything to the
+left of that entry is client-written and ignored. Prepending
+`X-Forwarded-For: <whitelisted-ip>` to a request does not get it past the
+whitelist.
+
+Two consequences worth knowing:
+
+- **Set `TRUSTED_PROXY_IP` to your proxy, and only your proxy.** Anything that can
+  connect from a trusted address *is* the proxy as far as this service can tell,
+  and can therefore claim any client address. A broad range like `172.16.0.0/12`
+  hands that power to every container on the bridge network.
+- **Loopback is always trusted**, so any process on the same host can assert a
+  client address. This is what makes the documented `127.0.0.1:8080` compose
+  binding work with a same-host proxy; if you expose the service some other way,
+  scope the port accordingly.
 
 ## Project Structure
 
@@ -314,6 +343,7 @@ resp, _ := http.DefaultClient.Do(req)
 │   ├── config/config.go              # Configuration
 │   ├── handlers/handlers.go          # HTTP handlers
 │   ├── ipwhitelist/ipwhitelist.go    # IP access control
+│   ├── realip/realip.go              # Proxy-aware client IP resolution
 │   ├── validators/validators.go      # Input validation
 │   └── vaultwarden/
 │       ├── api_client.go             # Native HTTP client for Vaultwarden
@@ -352,8 +382,9 @@ This means you can name your Vaultwarden items naturally (e.g., "Database URL") 
 
 **Trashed items are never served.** Items in the Vaultwarden trash (soft-deleted) are skipped during sync, so deleting an item removes it from the API on the next sync or `POST /refresh`. Restoring it from the trash brings it back the same way.
 
-**Colliding names**: By default, the first match will be selected and returned. To help distinguish between matches with the same name, you can split them up into different organizations, collections, or folders to your liking.
-You can then use either the ID or the name of these groupings as a filter for the request.
+**Colliding names**: When several items match, the one with the lowest cipher UUID wins, and the API logs a warning naming it. The choice is stable — the same request always returns the same secret — but it is arbitrary, so treat the warning as a prompt to disambiguate. Split colliding items across organizations, collections, or folders, then pass the ID or name of that grouping as a filter.
+
+**Strict matching**: Set `STRICT_SECRET_MATCH=true` to turn off the partial-match fallback. A name that matches no item exactly then returns 404 rather than the nearest substring hit — worth it if you would rather a consumer fail loudly than silently receive a different secret after a rename. Exact matching stays case-insensitive.
 Examples:
 - `GET /secret/DATABASE_URL?organization_name=Organization1`
 - `GET /secret/DATABASE_URL?organization_id=<organization_uuid>`

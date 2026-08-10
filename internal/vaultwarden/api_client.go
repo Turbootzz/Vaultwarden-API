@@ -1,6 +1,7 @@
 package vaultwarden
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -675,11 +676,14 @@ func decryptCipher(c SyncCipher, key SymmetricKey) (DecryptedItem, error) {
 
 // prelogin fetches KDF parameters for the given email.
 func (ac *APIClient) prelogin() (*PreloginResponse, error) {
-	body := fmt.Sprintf(`{"email":"%s"}`, ac.email)
+	body, err := json.Marshal(map[string]string{"email": ac.email})
+	if err != nil {
+		return nil, fmt.Errorf("encode prelogin request: %w", err)
+	}
 	resp, err := ac.httpClient.Post(
 		ac.baseURL+"/identity/accounts/prelogin",
 		"application/json",
-		strings.NewReader(body),
+		bytes.NewReader(body),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("prelogin request: %w", err)

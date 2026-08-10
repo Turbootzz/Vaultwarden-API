@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"strings"
 
+	"github.com/Turbootzz/vaultwarden-api/internal/realip"
 	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
 	"github.com/gofiber/fiber/v2"
 )
@@ -92,7 +93,7 @@ func Middleware(store *Store) fiber.Handler {
 
 		key, ok := store.Match(providedKey)
 		if !ok {
-			logger.Warn.Printf("Invalid API key from IP: %s", c.IP())
+			logger.Warn.Printf("Invalid API key from IP: %s", realip.FromCtx(c))
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 				"error": "invalid api key",
 			})

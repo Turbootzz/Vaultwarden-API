@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/Turbootzz/vaultwarden-api/internal/auth"
+	"github.com/Turbootzz/vaultwarden-api/internal/realip"
 	"github.com/Turbootzz/vaultwarden-api/internal/validators"
 	"github.com/Turbootzz/vaultwarden-api/internal/vaultwarden"
 	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
@@ -58,11 +59,21 @@ func decodeSecretPathParam(raw string) (string, error) {
 	return "", errors.New("path encoding depth exceeded")
 }
 
+// denyCaching marks a response as non-storable. Applied to every secret
+// response, hits and misses alike, so an intermediary cannot retain a body that
+// carries plaintext secrets (#32).
+func denyCaching(c *fiber.Ctx) {
+	c.Set(fiber.HeaderCacheControl, "no-store, no-cache, must-revalidate, private")
+	c.Set(fiber.HeaderPragma, "no-cache")
+}
+
 // GetSecret handles GET /secret/:name.
 func (h *Handler) GetSecret(c *fiber.Ctx) error {
+	denyCaching(c)
+
 	secretName, err := decodeSecretPathParam(c.Params("name"))
 	if err != nil {
-		logger.Warn.Printf("Invalid secret path encoding from IP: %s", c.IP())
+		logger.Warn.Printf("Invalid secret path encoding from IP: %s", realip.FromCtx(c))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "invalid secret name format",
 		})
@@ -76,7 +87,7 @@ func (h *Handler) GetSecret(c *fiber.Ctx) error {
 	}
 
 	if !validators.IsValidSecretName(secretName) {
-		logger.Warn.Printf("Invalid secret name format attempted from IP: %s", c.IP())
+		logger.Warn.Printf("Invalid secret name format attempted from IP: %s", realip.FromCtx(c))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "invalid secret name format",
 		})
@@ -86,7 +97,7 @@ func (h *Handler) GetSecret(c *fiber.Ctx) error {
 	if err != nil {
 		// Don't leak information about existence of correct filters
 		// Security through obscurity ;)
-		logger.Warn.Printf("Invalid secret filters attempted from IP: %s - %v", c.IP(), err)
+		logger.Warn.Printf("Invalid secret filters attempted from IP: %s - %v", realip.FromCtx(c), err)
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "secret not found",
 		})
@@ -94,7 +105,7 @@ func (h *Handler) GetSecret(c *fiber.Ctx) error {
 
 	// Enforce the authenticated key's scope server-side, regardless of query filters.
 	if !h.applyKeyScope(c, &filter) {
-		logger.Warn.Printf("Request denied by key scope from IP: %s", c.IP())
+		logger.Warn.Printf("Request denied by key scope from IP: %s", realip.FromCtx(c))
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "secret not found",
 		})
@@ -102,7 +113,7 @@ func (h *Handler) GetSecret(c *fiber.Ctx) error {
 
 	value, err := h.vaultClient.GetSecret(secretName, filter)
 	if err != nil {
-		logger.Error.Printf("Failed to fetch secret (requested by IP: %s)", c.IP())
+		logger.Error.Printf("Failed to fetch secret (requested by IP: %s)", realip.FromCtx(c))
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "secret not found",
 		})
