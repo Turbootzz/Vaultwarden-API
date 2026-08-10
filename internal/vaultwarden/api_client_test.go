@@ -155,8 +155,13 @@ func TestSync_SkipsTrashedCiphers(t *testing.T) {
 func TestSync_401RefreshFailsFallsBackToFullReauth(t *testing.T) {
 	const testKDFIterations = 10000 // low on purpose: keeps the test fast
 
-	userKey := testUserKey()
-	cipherName := mustEncryptType2Cipher(t, "after-reauth", userKey)
+	// The re-authentication hands back a symmetric key that differs from the one
+	// newSyncTestClient seeded (testUserKey), standing in for an account key rotation.
+	// Sync() must decrypt the retried payload with this fresh key, not with the
+	// snapshot it took before the 401 — otherwise every cipher fails its HMAC and
+	// Sync silently returns an empty vault.
+	rotatedKey := testOrgKey()
+	cipherName := mustEncryptType2Cipher(t, "after-reauth", rotatedKey)
 
 	// Build the encrypted symmetric key the password grant hands back: the raw
 	// enc||mac blob (64 bytes) as a type-2 cipher under the stretched master key,
@@ -170,8 +175,8 @@ func TestSync_401RefreshFailsFallsBackToFullReauth(t *testing.T) {
 		t.Fatalf("StretchKey: %v", err)
 	}
 	keyBlob := make([]byte, 0, 64)
-	keyBlob = append(keyBlob, userKey.EncKey...)
-	keyBlob = append(keyBlob, userKey.MacKey...)
+	keyBlob = append(keyBlob, rotatedKey.EncKey...)
+	keyBlob = append(keyBlob, rotatedKey.MacKey...)
 	encryptedUserKey, err := encryptType2CipherBytes(keyBlob, stretched)
 	if err != nil {
 		t.Fatalf("encryptType2CipherBytes: %v", err)

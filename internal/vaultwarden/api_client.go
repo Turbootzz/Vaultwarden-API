@@ -441,6 +441,7 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 		}
 		ac.mu.RLock()
 		token = ac.accessToken
+		key = ac.symKey // Authenticate() may have rotated it
 		ac.mu.RUnlock()
 
 		req.Header.Set("Authorization", "Bearer "+token)
