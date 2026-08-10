@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -475,6 +476,123 @@ func TestSync_RetryStill401ForcesReauthOnNextAttempt(t *testing.T) {
 	}
 	if preloginCalls != 0 {
 		t.Errorf("prelogin calls = %d, want 0 (recovery is deferred to the next attempt)", preloginCalls)
+	}
+}
+
+func TestSync_ConcurrentRenewalRunsOneLogin(t *testing.T) {
+	// The background sync ticker and a manual POST /refresh (ClearCache ->
+	// syncVault -> Sync) can meet the same dead token at the same moment. Both
+	// then walk the renewal ladder, and unserialized that is two logins against
+	// the identity endpoint for one dead token.
+	const staleToken = "test-token" // what newSyncTestClient seeds
+	const renewedToken = "renewed-token"
+	const callers = 2
+
+	userKey := testUserKey()
+	cipherName := mustEncryptType2Cipher(t, "after-renewal", userKey)
+
+	var mu sync.Mutex
+	var tokenCalls, syncCalls, staleSyncCalls int
+
+	// Hold every caller at the 401 until all of them have seen it. That is the
+	// interleaving this test is about: two callers observing the same dead token.
+	// Without the barrier the first could finish renewing before the second even
+	// sends its request, and the test would pass while proving nothing.
+	release := make(chan struct{})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		syncCalls++
+		stale := r.Header.Get("Authorization") != "Bearer "+renewedToken
+		if stale {
+			staleSyncCalls++
+			if staleSyncCalls == callers {
+				close(release)
+			}
+		}
+		mu.Unlock()
+
+		if stale {
+			select {
+			case <-release:
+			case <-time.After(5 * time.Second):
+				t.Error("timed out waiting for all callers to reach the 401")
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		resp := SyncResponse{
+			Ciphers: []SyncCipher{
+				{ID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", Type: CipherTypeLogin, Name: cipherName},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+	mux.HandleFunc("/identity/connect/token", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		tokenCalls++
+		mu.Unlock()
+
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse token form: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if grant := r.PostFormValue("grant_type"); grant != "refresh_token" {
+			t.Errorf("grant_type = %q, want refresh_token", grant)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken:  renewedToken,
+			ExpiresIn:    3600,
+			TokenType:    "Bearer",
+			RefreshToken: "renewed-refresh-token",
+		}); err != nil {
+			t.Errorf("encode token response: %v", err)
+		}
+	})
+	mux.HandleFunc("/identity/accounts/prelogin", func(w http.ResponseWriter, r *http.Request) {
+		t.Error("full re-authentication attempted, but the refresh grant succeeds here")
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	ac := newSyncTestClient(t, mux)
+	if ac.accessToken != staleToken {
+		t.Fatalf("seeded accessToken = %q, want %q", ac.accessToken, staleToken)
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	counts := make([]int, callers)
+	for i := range callers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			items, _, err := ac.Sync()
+			errs[i] = err
+			counts[i] = len(items)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("Sync() #%d error: %v", i, err)
+		}
+		if counts[i] != 1 {
+			t.Errorf("Sync() #%d returned %d items, want 1", i, counts[i])
+		}
+	}
+	if tokenCalls != 1 {
+		t.Errorf("token endpoint calls = %d, want 1 (concurrent renewals must collapse into one)", tokenCalls)
+	}
+	if syncCalls != 2*callers {
+		t.Errorf("sync calls = %d, want %d (one 401 and one retry per caller)", syncCalls, 2*callers)
 	}
 }
 

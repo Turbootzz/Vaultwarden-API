@@ -127,6 +127,11 @@ type APIClient struct {
 	httpClient   *http.Client
 	deviceID     string
 
+	// renewMu serializes credential renewal so one dead token costs one login
+	// rather than one per concurrent caller. Lock ordering is renewMu before mu,
+	// never the reverse. See refreshOrReauthenticate.
+	renewMu sync.Mutex
+
 	mu           sync.RWMutex
 	accessToken  string
 	refreshToken string
@@ -276,7 +281,31 @@ func (ac *APIClient) RefreshAccessToken() error {
 //
 // This is the single definition of the policy; both EnsureValidToken and the
 // Sync 401 path go through it so they cannot drift apart.
-func (ac *APIClient) refreshOrReauthenticate() error {
+//
+// Renewal is serialized on renewMu: the background sync ticker and a manual
+// POST /refresh (ClearCache -> syncVault -> Sync) can meet the same dead token
+// at the same moment, and without the lock each would run its own full ladder —
+// two expensive logins for one dead token.
+//
+// staleToken is the access token the caller saw fail. Once the lock is held, a
+// current token that differs from it means another caller renewed while this one
+// waited, so its work is already done and there is nothing left to do. The skip
+// condition compares tokens rather than re-reading tokenExpiry on purpose: on
+// the Sync 401 path the token is dead server-side while its expiry still sits an
+// hour out, so an expiry re-check would decide no renewal was needed and skip
+// the very recovery that path exists to perform.
+func (ac *APIClient) refreshOrReauthenticate(staleToken string) error {
+	ac.renewMu.Lock()
+	defer ac.renewMu.Unlock()
+
+	ac.mu.RLock()
+	current := ac.accessToken
+	ac.mu.RUnlock()
+	if current != staleToken {
+		logger.Debug.Println("Credentials already renewed by a concurrent caller, skipping")
+		return nil
+	}
+
 	refreshErr := ac.RefreshAccessToken()
 	if refreshErr == nil {
 		return nil
@@ -291,14 +320,18 @@ func (ac *APIClient) refreshOrReauthenticate() error {
 
 // EnsureValidToken refreshes the access token if it's expired or about to expire.
 func (ac *APIClient) EnsureValidToken() error {
+	// Token and expiry come from one snapshot: refreshOrReauthenticate compares
+	// the token it is handed against the current one to detect a renewal that
+	// landed in the meantime, so the two must describe the same credential.
 	ac.mu.RLock()
 	expiry := ac.tokenExpiry
+	token := ac.accessToken
 	ac.mu.RUnlock()
 
 	// Refresh 60 seconds before actual expiry.
 	if time.Now().After(expiry.Add(-60 * time.Second)) {
 		logger.Debug.Println("Token expiring soon, refreshing...")
-		return ac.refreshOrReauthenticate()
+		return ac.refreshOrReauthenticate(token)
 	}
 	return nil
 }
@@ -450,8 +483,10 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 			logger.Warn.Printf("close sync 401 response body: %v", closeErr)
 		}
 
-		// Token might be invalid: renew credentials and retry once.
-		if err := ac.refreshOrReauthenticate(); err != nil {
+		// Token might be invalid: renew credentials and retry once. The token that
+		// just drew the 401 is passed along so a renewal another caller already
+		// completed is not repeated.
+		if err := ac.refreshOrReauthenticate(token); err != nil {
 			return nil, emptySyncNameMaps(), fmt.Errorf("sync auth failed: %w", err)
 		}
 		ac.mu.RLock()
