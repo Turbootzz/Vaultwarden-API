@@ -208,17 +208,35 @@ func (c *Client) syncVault() error {
 	return nil
 }
 
+// syncFailureEscalationThreshold is the number of consecutive background-sync
+// failures after which the warning escalates to an error, so a dead sync loop
+// (stale cache) is visible in default log levels.
+const syncFailureEscalationThreshold = 3
+
+// shouldEscalateSyncFailure reports whether a run of consecutive background-sync
+// failures has reached the threshold where the log level escalates to error.
+func shouldEscalateSyncFailure(consecutiveFailures int) bool {
+	return consecutiveFailures >= syncFailureEscalationThreshold
+}
+
 // backgroundSync periodically syncs the vault to pick up changes.
 func (c *Client) backgroundSync() {
 	ticker := time.NewTicker(c.syncEvery)
 	defer ticker.Stop()
 
+	consecutiveFailures := 0
 	for {
 		select {
 		case <-ticker.C:
 			if err := c.syncVault(); err != nil {
-				logger.Warn.Printf("Background sync failed: %v", err)
+				consecutiveFailures++
+				if shouldEscalateSyncFailure(consecutiveFailures) {
+					logger.Error.Printf("Background sync failed %d times in a row, cache is stale: %v", consecutiveFailures, err)
+				} else {
+					logger.Warn.Printf("Background sync failed: %v", err)
+				}
 			} else {
+				consecutiveFailures = 0
 				logger.Debug.Println("Background vault sync completed")
 			}
 		case <-c.stopSync:
