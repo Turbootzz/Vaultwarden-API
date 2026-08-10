@@ -728,10 +728,15 @@ func TestDecryptCipher_PersonalItemStillWorks(t *testing.T) {
 // Regression for #31: the KDF parameters arrive in the server's prelogin
 // response, and argon2 panics on out-of-range values. They must come back as
 // errors so a hostile or broken server cannot take the process down.
-// aboveMaxIterations returns an iteration count outside the accepted range.
-func aboveMaxIterations() int {
-	max := argon2MaxIterations
-	return max + 1
+// uint32Overflow returns an iteration count that truncates to 0 when converted
+// to a uint32 on a 64-bit target, and wraps negative on a 32-bit one. Either way
+// it must be rejected.
+func uint32Overflow() int {
+	v := 1
+	for range 32 {
+		v *= 2
+	}
+	return v
 }
 
 func TestMakeMasterKey_Argon2idRejectsOutOfRangeParams(t *testing.T) {
@@ -749,14 +754,15 @@ func TestMakeMasterKey_Argon2idRejectsOutOfRangeParams(t *testing.T) {
 		{"negative iterations", -1, ptr(64), ptr(4)},
 		{"zero parallelism", 3, ptr(64), ptr(0)},
 		{"negative parallelism", 3, ptr(64), ptr(-1)},
-		{"parallelism above uint8", 3, ptr(64), ptr(256)},
+		{"parallelism above the ceiling", 3, ptr(64), ptr(argon2MaxParallelism + 1)},
 		{"zero memory", 3, ptr(0), ptr(4)},
 		{"negative memory", 3, ptr(-1), ptr(4)},
 		{"memory above the ceiling", 3, ptr(argon2MaxMemoryMiB + 1), ptr(4)},
-		// Computed at runtime, not as a constant: on a 32-bit target the literal
-		// would not fit in an int. There it wraps negative and is rejected as
-		// below the floor; on 64-bit it is rejected as above the ceiling.
-		{"iterations past the uint32-safe ceiling", aboveMaxIterations(), ptr(64), ptr(4)},
+		{"iterations above the ceiling", argon2MaxIterations + 1, ptr(64), ptr(4)},
+		// Would truncate to 0 on the uint32 conversion and panic if unbounded.
+		// Computed at runtime: as a constant the literal would not fit in an int
+		// on the 32-bit targets this builds for.
+		{"iterations overflowing uint32", uint32Overflow(), ptr(64), ptr(4)},
 	}
 
 	for _, tt := range tests {
@@ -786,7 +792,8 @@ func TestMakeMasterKey_Argon2idAcceptsBoundaryParams(t *testing.T) {
 	}{
 		{"defaults when unset", nil, nil},
 		{"minimum memory and parallelism", ptr(1), ptr(1)},
-		{"maximum parallelism", ptr(16), ptr(255)},
+		{"maximum parallelism", ptr(16), ptr(argon2MaxParallelism)},
+		{"maximum iterations is bounded", ptr(16), ptr(4)},
 	}
 
 	for _, tt := range tests {

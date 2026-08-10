@@ -226,6 +226,9 @@ func TestParseBool(t *testing.T) {
 func TestLoadStrictSecretMatch(t *testing.T) {
 	for _, raw := range []string{"true", "True", "TRUE", "1"} {
 		t.Run(raw, func(t *testing.T) {
+			// API_KEYS_FILE / API_KEYS take precedence over API_KEY, so an
+			// inherited value would decide this test instead of the fixture.
+			clearKeyEnv(t)
 			t.Setenv("VAULTWARDEN_URL", "https://vault.example.com")
 			t.Setenv("API_KEY", strings.Repeat("k", 32))
 			t.Setenv("STRICT_SECRET_MATCH", raw)

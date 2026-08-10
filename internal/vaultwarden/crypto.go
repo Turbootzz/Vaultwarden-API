@@ -14,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"strconv"
 	"strings"
 
@@ -38,18 +37,22 @@ const (
 	KdfArgon2id = 1
 )
 
-// Accepted bounds for server-supplied Argon2id parameters. The memory ceiling
-// sits far below the point where the MiB->KiB conversion overflows; the
-// parallelism ceiling is the width of argon2's threads argument.
+// Accepted bounds for server-supplied Argon2id parameters.
+//
+// These are operational limits, not merely the points at which the conversion
+// to argon2's uint32 arguments would overflow. The parameters arrive in the
+// server's prelogin response, and deriving the key allocates memory MiB and
+// spends iterations passes over it — so a hostile or misconfigured server
+// otherwise dictates how much of this process's memory and CPU to burn, in a
+// container that docker-compose caps at 128 MiB.
+//
+// The ceilings sit an order of magnitude above what Bitwarden and Vaultwarden
+// clients can actually configure (memory 16-1024 MiB, parallelism 1-16,
+// iterations 2-10), so a legitimate server is never rejected.
 const (
-	argon2MaxMemoryMiB   = 4096
-	argon2MaxParallelism = 255
-	// Iterations are passed to argon2 as a uint32. Anything above this truncates
-	// on conversion, which either panics (a multiple of 2^32 becomes 0) or
-	// silently derives the key with far fewer rounds than the server asked for.
-	// MaxInt32 rather than MaxUint32: the value is compared against an int, and
-	// MaxUint32 does not fit in one on the 32-bit targets this builds for.
-	argon2MaxIterations = math.MaxInt32
+	argon2MaxMemoryMiB   = 1024
+	argon2MaxParallelism = 64
+	argon2MaxIterations  = 100
 )
 
 // SymmetricKey holds the encryption and MAC keys for AES-CBC + HMAC-SHA256.
