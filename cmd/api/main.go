@@ -50,7 +50,6 @@ func main() {
 		password,
 		clientID,
 		clientSecret,
-		cfg.CacheTTL,
 		syncInterval,
 	)
 	if err != nil {

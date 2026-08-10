@@ -15,7 +15,6 @@ import (
 // Client manages vault access, caching, and background sync.
 type Client struct {
 	api       *APIClient
-	cacheTTL  time.Duration
 	syncEvery time.Duration
 
 	mu    sync.RWMutex
@@ -41,10 +40,9 @@ func WithState(items map[string]DecryptedItem, nameMaps SyncNameMaps) ClientOpti
 }
 
 // NewClient creates a vault client. Pass WithState to preload cache data without calling Initialize.
-func NewClient(api *APIClient, cacheTTL, syncInterval time.Duration, opts ...ClientOption) *Client {
+func NewClient(api *APIClient, syncInterval time.Duration, opts ...ClientOption) *Client {
 	c := &Client{
 		api:       api,
-		cacheTTL:  cacheTTL,
 		syncEvery: syncInterval,
 		items:     make(map[string]DecryptedItem),
 		nameMaps:  emptySyncNameMaps(),

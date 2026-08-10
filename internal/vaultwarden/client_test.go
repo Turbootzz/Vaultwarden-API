@@ -15,7 +15,7 @@ func TestNewClient_withState(t *testing.T) {
 		Collections:   map[string]string{},
 	}
 
-	c := NewClient(nil, 0, 0, WithState(items, nameMaps))
+	c := NewClient(nil, 0, WithState(items, nameMaps))
 
 	val, err := c.GetSecret("db-password", SecretFilter{})
 	if err != nil || val != "pw" {

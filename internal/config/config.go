@@ -33,7 +33,6 @@ type Config struct {
 	VaultwardenToken string
 
 	// Performance
-	CacheTTL           time.Duration
 	CORSAllowedOrigins string
 
 	// Rate limiting
@@ -52,7 +51,6 @@ func Load() (*Config, error) {
 
 		ReadTimeout:        parseDuration(os.Getenv("READ_TIMEOUT"), "10s"),
 		WriteTimeout:       parseDuration(os.Getenv("WRITE_TIMEOUT"), "10s"),
-		CacheTTL:           parseDuration(os.Getenv("CACHE_TTL"), "5m"),
 		CORSAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS", "http://localhost:3000"),
 
 		EnableGitHubIPRanges: getEnv("ENABLE_GITHUB_IP_RANGES", "false") == "true",
