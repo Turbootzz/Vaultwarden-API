@@ -1,6 +1,7 @@
 package vaultwarden
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -571,6 +572,15 @@ func TestAuthenticate_ProfileKeyFailureLeavesPriorStateIntact(t *testing.T) {
 	}
 	if !ac.tokenExpiry.Equal(priorExpiry) {
 		t.Errorf("tokenExpiry = %v, want %v (failed login must not publish)", ac.tokenExpiry, priorExpiry)
+	}
+	// The symmetric key is the other half of "new token, old symKey": the token
+	// fields staying put is only meaningful if the key did too.
+	priorKey := testUserKey()
+	if !bytes.Equal(ac.symKey.EncKey, priorKey.EncKey) {
+		t.Error("symKey.EncKey changed, want the prior key left untouched (failed login must not publish)")
+	}
+	if !bytes.Equal(ac.symKey.MacKey, priorKey.MacKey) {
+		t.Error("symKey.MacKey changed, want the prior key left untouched (failed login must not publish)")
 	}
 }
 
