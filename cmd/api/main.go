@@ -13,6 +13,7 @@ import (
 	"github.com/Turbootzz/vaultwarden-api/internal/config"
 	"github.com/Turbootzz/vaultwarden-api/internal/handlers"
 	"github.com/Turbootzz/vaultwarden-api/internal/ipwhitelist"
+	"github.com/Turbootzz/vaultwarden-api/internal/realip"
 	"github.com/Turbootzz/vaultwarden-api/internal/vaultwarden"
 	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
 	"github.com/gofiber/fiber/v2"
@@ -51,6 +52,7 @@ func main() {
 		clientID,
 		clientSecret,
 		syncInterval,
+		vaultwarden.WithStrictMatch(cfg.StrictSecretMatch),
 	)
 	if err != nil {
 		logger.Error.Fatalf("Failed to initialize Vaultwarden client: %v", err)
@@ -63,6 +65,13 @@ func main() {
 	ipWhitelist, err := ipwhitelist.New(cfg.AllowedIPs, cfg.EnableGitHubIPRanges)
 	if err != nil {
 		logger.Error.Fatalf("Failed to initialize IP whitelist: %v", err)
+	}
+
+	// Client IP resolution shares the trusted proxy set with fiber.
+	trustedProxies := getTrustedProxies()
+	ipResolver, err := realip.New(trustedProxies)
+	if err != nil {
+		logger.Error.Fatalf("Failed to initialize client IP resolver: %v", err)
 	}
 
 	// Start periodic GitHub IP range updates.
@@ -80,16 +89,24 @@ func main() {
 		ServerHeader:            "",
 		ErrorHandler:            customErrorHandler(cfg.IsProd()),
 		EnableTrustedProxyCheck: true,
-		TrustedProxies:          getTrustedProxies(),
-		ProxyHeader:             fiber.HeaderXForwardedFor,
-		// Avoid empty c.IP() when header is missing (e.g. behind a trusted proxy)
-		EnableIPValidation: true,
+		TrustedProxies:          trustedProxies,
+		// ProxyHeader stays empty on purpose: fiber reads X-Forwarded-For left to
+		// right, and the leftmost entry is whatever the client sent. c.IP() must
+		// remain the socket peer; realip resolves the real client (see #29).
+		ProxyHeader: "",
 	})
 
 	app.Use(helmet.New())
 	app.Use(recover.New())
+	// Must precede every middleware that makes a decision on the client IP.
+	app.Use(realip.Middleware(ipResolver))
 	app.Use(compress.New(compress.Config{
 		Level: compress.LevelBestSpeed,
+		// Secret responses mix a caller-supplied name with the secret itself;
+		// compressing them leaks length information about the secret (#32).
+		Next: func(c *fiber.Ctx) bool {
+			return isSecretPath(c.Path())
+		},
 	}))
 
 	app.Use(cors.New(cors.Config{
@@ -108,9 +125,12 @@ func main() {
 	api.Use(limiter.New(limiter.Config{
 		Max:        cfg.RateLimitMax,
 		Expiration: cfg.RateLimitWindow,
+		KeyGenerator: func(c *fiber.Ctx) string {
+			return realip.FromCtx(c)
+		},
 		// Whitelisted/trusted IPs bypass rate limiting entirely.
 		Next: func(c *fiber.Ctx) bool {
-			return ipWhitelist.IsAllowed(c.IP())
+			return ipWhitelist.IsAllowed(realip.FromCtx(c))
 		},
 		LimitReached: func(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
@@ -151,6 +171,14 @@ func main() {
 		logger.Error.Printf("Failed to start server: %v", err)
 		os.Exit(1)
 	}
+}
+
+// isSecretPath reports whether a request path reaches the secret endpoint, and
+// so must not be compressed. Matched case-insensitively: fiber's router is
+// case-insensitive by default, so /SECRET/x and /secret/x reach the same
+// handler and both return a secret.
+func isSecretPath(path string) bool {
+	return strings.HasPrefix(strings.ToLower(path), "/secret/")
 }
 
 // parseDurationEnv reads a duration from an env var with a fallback.

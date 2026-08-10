@@ -724,3 +724,197 @@ func TestDecryptCipher_PersonalItemStillWorks(t *testing.T) {
 		t.Errorf("got name %q, want %q", item.Name, "PERSONAL_SECRET")
 	}
 }
+
+// Regression for #31: the KDF parameters arrive in the server's prelogin
+// response, and argon2 panics on out-of-range values. They must come back as
+// errors so a hostile or broken server cannot take the process down.
+// uint32Overflow returns an iteration count that truncates to 0 when converted
+// to a uint32 on a 64-bit target, and wraps negative on a 32-bit one. Either way
+// it must be rejected.
+func uint32Overflow() int {
+	v := 1
+	for range 32 {
+		v *= 2
+	}
+	return v
+}
+
+func TestMakeMasterKey_Argon2idRejectsOutOfRangeParams(t *testing.T) {
+	t.Parallel()
+
+	ptr := func(n int) *int { return &n }
+
+	tests := []struct {
+		name        string
+		iterations  int
+		memory      *int
+		parallelism *int
+	}{
+		{"zero iterations", 0, ptr(64), ptr(4)},
+		{"negative iterations", -1, ptr(64), ptr(4)},
+		{"zero parallelism", 3, ptr(64), ptr(0)},
+		{"negative parallelism", 3, ptr(64), ptr(-1)},
+		{"parallelism above the ceiling", 3, ptr(64), ptr(argon2MaxParallelism + 1)},
+		{"zero memory", 3, ptr(0), ptr(4)},
+		{"negative memory", 3, ptr(-1), ptr(4)},
+		{"memory above the ceiling", 3, ptr(argon2MaxMemoryMiB + 1), ptr(4)},
+		{"iterations above the ceiling", argon2MaxIterations + 1, ptr(64), ptr(4)},
+		// Would truncate to 0 on the uint32 conversion and panic if unbounded.
+		// Computed at runtime: as a constant the literal would not fit in an int
+		// on the 32-bit targets this builds for.
+		{"iterations overflowing uint32", uint32Overflow(), ptr(64), ptr(4)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("MakeMasterKey panicked instead of returning an error: %v", r)
+				}
+			}()
+			if _, err := MakeMasterKey("pw", "user@example.com", KdfArgon2id, tt.iterations, tt.memory, tt.parallelism); err == nil {
+				t.Error("expected an error, got nil")
+			}
+		})
+	}
+}
+
+func TestMakeMasterKey_Argon2idAcceptsBoundaryParams(t *testing.T) {
+	t.Parallel()
+
+	ptr := func(n int) *int { return &n }
+
+	tests := []struct {
+		name        string
+		memory      *int
+		parallelism *int
+	}{
+		{"defaults when unset", nil, nil},
+		{"minimum memory and parallelism", ptr(argon2MinMemoryMiB), ptr(1)},
+		{"maximum parallelism", ptr(16), ptr(argon2MaxParallelism)},
+		{"maximum iterations is bounded", ptr(16), ptr(4)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			key, err := MakeMasterKey("pw", "user@example.com", KdfArgon2id, 1, tt.memory, tt.parallelism)
+			if err != nil {
+				t.Fatalf("MakeMasterKey: %v", err)
+			}
+			if len(key) != 32 {
+				t.Errorf("expected 32 bytes, got %d", len(key))
+			}
+		})
+	}
+}
+
+func TestMakeMasterKey_PBKDF2RejectsZeroIterations(t *testing.T) {
+	t.Parallel()
+
+	if _, err := MakeMasterKey("pw", "user@example.com", KdfPBKDF2, 0, nil, nil); err == nil {
+		t.Error("expected an error, got nil")
+	}
+}
+
+// The KDF parameters come from the server, and the password hash sent back to
+// it is derived from the master key. A server answering prelogin with a token
+// iteration count therefore receives a hash it can brute-force back to the
+// master password offline, so weak parameters must be refused, not merely
+// upper-bounded.
+func TestMakeMasterKey_RejectsDowngradedKDFParameters(t *testing.T) {
+	t.Parallel()
+
+	ptr := func(n int) *int { return &n }
+
+	tests := []struct {
+		name        string
+		kdf         int
+		iterations  int
+		memory      *int
+		parallelism *int
+	}{
+		{"PBKDF2 single iteration", KdfPBKDF2, 1, nil, nil},
+		{"PBKDF2 far below the floor", KdfPBKDF2, 100, nil, nil},
+		{"PBKDF2 just below the floor", KdfPBKDF2, pbkdf2MinIterations - 1, nil, nil},
+		{"Argon2id memory below the floor", KdfArgon2id, 3, ptr(argon2MinMemoryMiB - 1), ptr(4)},
+		{"Argon2id single MiB", KdfArgon2id, 3, ptr(1), ptr(4)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := MakeMasterKey("pw", "user@example.com", tt.kdf, tt.iterations, tt.memory, tt.parallelism); err == nil {
+				t.Error("expected an error, got nil")
+			}
+		})
+	}
+}
+
+func TestMakeMasterKey_AcceptsTheKDFFloors(t *testing.T) {
+	t.Parallel()
+
+	ptr := func(n int) *int { return &n }
+
+	key, err := MakeMasterKey("pw", "user@example.com", KdfPBKDF2, pbkdf2MinIterations, nil, nil)
+	if err != nil {
+		t.Fatalf("PBKDF2 at the floor: %v", err)
+	}
+	if len(key) != 32 {
+		t.Errorf("expected 32 bytes, got %d", len(key))
+	}
+
+	key, err = MakeMasterKey("pw", "user@example.com", KdfArgon2id, 1, ptr(argon2MinMemoryMiB), ptr(1))
+	if err != nil {
+		t.Fatalf("Argon2id at the floor: %v", err)
+	}
+	if len(key) != 32 {
+		t.Errorf("expected 32 bytes, got %d", len(key))
+	}
+}
+
+// Type 0 carries no MAC. Honouring it under a key that has a MAC key would let
+// whoever serves the payload strip integrity protection by relabelling the
+// cipher string from type 2 to type 0.
+func TestDecrypt_RejectsType0UnderMACCarryingKey(t *testing.T) {
+	t.Parallel()
+
+	key := SymmetricKey{EncKey: make([]byte, 32), MacKey: make([]byte, 32)}
+	for i := range key.EncKey {
+		key.EncKey[i] = byte(i)
+		key.MacKey[i] = byte(i + 100)
+	}
+
+	plaintext := "super-secret-value"
+	type2 := mustEncryptType2Cipher(t, plaintext, key)
+
+	// Same IV and ciphertext, relabelled as unauthenticated type 0.
+	cs, err := ParseCipherString(type2)
+	if err != nil {
+		t.Fatalf("ParseCipherString: %v", err)
+	}
+	downgraded := fmt.Sprintf("0.%s|%s",
+		base64.StdEncoding.EncodeToString(cs.IV),
+		base64.StdEncoding.EncodeToString(cs.CT))
+
+	if _, err := DecryptStr(downgraded, key); err == nil {
+		t.Error("type 0 cipher string decrypted under a MAC-carrying key; the MAC can be stripped by relabelling")
+	}
+
+	// The authentic type 2 form still works.
+	got, err := DecryptStr(type2, key)
+	if err != nil {
+		t.Fatalf("type 2 decrypt: %v", err)
+	}
+	if got != plaintext {
+		t.Errorf("decrypted %q, want %q", got, plaintext)
+	}
+
+	// A legacy key with no MAC key may still use type 0 — that is what the
+	// unstretched fallback in DecryptSymmetricKey relies on.
+	legacy := SymmetricKey{EncKey: key.EncKey}
+	if _, err := DecryptStr(downgraded, legacy); err != nil {
+		t.Errorf("type 0 must still decrypt under a legacy key with no MAC key: %v", err)
+	}
+}

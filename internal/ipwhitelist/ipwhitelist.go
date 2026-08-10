@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Turbootzz/vaultwarden-api/internal/realip"
 	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
 	"github.com/gofiber/fiber/v2"
 )
@@ -22,6 +23,11 @@ type IPWhitelist struct {
 	githubIPRanges   []*net.IPNet
 	enableGitHub     bool
 	lastGitHubUpdate time.Time
+
+	// configured records that the operator asked for access control, separately
+	// from whether any range is currently loaded. Without it, a failed GitHub
+	// fetch leaves the list empty and the middleware reads that as "unrestricted".
+	configured bool
 }
 
 // GitHubMeta represents GitHub's API response for IP ranges
@@ -34,6 +40,7 @@ func New(allowedIPs []string, enableGitHub bool) (*IPWhitelist, error) {
 	wl := &IPWhitelist{
 		allowedIPs:   make(map[string]bool),
 		enableGitHub: enableGitHub,
+		configured:   enableGitHub || len(allowedIPs) > 0,
 	}
 
 	// Parse allowed IPs and CIDRs
@@ -80,13 +87,25 @@ func (wl *IPWhitelist) Middleware() fiber.Handler {
 		// If no IPs configured and GitHub not enabled, allow all
 		wl.mu.RLock()
 		hasWhitelist := len(wl.allowedIPs) > 0 || len(wl.allowedCIDRs) > 0 || len(wl.githubIPRanges) > 0
+		configured := wl.configured
 		wl.mu.RUnlock()
 
 		if !hasWhitelist {
-			return c.Next()
+			if !configured {
+				return c.Next()
+			}
+			// Access control was asked for but nothing is loaded — a GitHub range
+			// fetch that failed, most likely. Serving every caller here would turn
+			// an outage into a silently open door, so fail closed.
+			logger.Error.Printf(
+				"IP whitelist is configured but holds no ranges (GitHub fetch failed?); denying %s on %s %s",
+				realip.FromCtx(c), c.Method(), c.Path())
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"error": "access denied: IP not whitelisted",
+			})
 		}
 
-		clientIP := c.IP()
+		clientIP := realip.FromCtx(c)
 
 		if wl.IsAllowed(clientIP) {
 			logger.Debug.Printf("IP allowed: %s", clientIP)

@@ -3,6 +3,8 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -181,4 +183,63 @@ func TestLoadRateLimitDefaultsAndOverrides(t *testing.T) {
 			t.Errorf("RateLimitWindow = %v, want 30s", cfg.RateLimitWindow)
 		}
 	})
+}
+
+// A boolean flag that silently stays off on a near-miss spelling defeats the
+// point of setting it — STRICT_SECRET_MATCH decides whether a near-miss name
+// resolves to a different secret.
+func TestParseBool(t *testing.T) {
+	tests := []struct {
+		raw      string
+		fallback bool
+		want     bool
+	}{
+		{"true", false, true},
+		{"True", false, true},
+		{"TRUE", false, true},
+		{" true ", false, true},
+		{"1", false, true},
+		{"t", false, true},
+		{"yes", false, true},
+		{"on", false, true},
+		{"false", true, false},
+		{"FALSE", true, false},
+		{"0", true, false},
+		{"no", true, false},
+		{"off", true, false},
+		{"", true, true},
+		{"", false, false},
+		{"nonsense", true, true},
+		{"nonsense", false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.raw+"/"+strconv.FormatBool(tt.fallback), func(t *testing.T) {
+			t.Setenv("TEST_PARSE_BOOL", tt.raw)
+			if got := parseBool("TEST_PARSE_BOOL", tt.fallback); got != tt.want {
+				t.Errorf("parseBool(%q, %v) = %v, want %v", tt.raw, tt.fallback, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadStrictSecretMatch(t *testing.T) {
+	for _, raw := range []string{"true", "True", "TRUE", "1"} {
+		t.Run(raw, func(t *testing.T) {
+			// API_KEYS_FILE / API_KEYS take precedence over API_KEY, so an
+			// inherited value would decide this test instead of the fixture.
+			clearKeyEnv(t)
+			t.Setenv("VAULTWARDEN_URL", "https://vault.example.com")
+			t.Setenv("API_KEY", strings.Repeat("k", 32))
+			t.Setenv("STRICT_SECRET_MATCH", raw)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if !cfg.StrictSecretMatch {
+				t.Errorf("StrictSecretMatch = false for %q, want true", raw)
+			}
+		})
+	}
 }

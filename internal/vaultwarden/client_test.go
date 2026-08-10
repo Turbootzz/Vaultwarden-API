@@ -1,10 +1,13 @@
 package vaultwarden
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"maps"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -372,4 +375,260 @@ func TestShouldEscalateSyncFailure(t *testing.T) {
 			t.Errorf("shouldEscalateSyncFailure(%d) = %v, want %v", tt.consecutive, got, tt.want)
 		}
 	}
+}
+
+func lookupTestItems() map[string]DecryptedItem {
+	return map[string]DecryptedItem{
+		"cipher-b": {ID: "cipher-b", Name: "api-key", Password: "beta"},
+		"cipher-a": {ID: "cipher-a", Name: "API-KEY", Password: "alpha"},
+		"cipher-c": {ID: "cipher-c", Name: "stripe-api-key-prod", Password: "gamma"},
+	}
+}
+
+// Regression for #30: ranging over the item map made the winner depend on Go's
+// randomized map iteration order, so the same request could return a different
+// secret each time. Candidates are now ordered by cipher id.
+func TestGetSecret_AmbiguousMatchIsDeterministic(t *testing.T) {
+	t.Parallel()
+
+	client := NewClient(nil, time.Minute, WithState(lookupTestItems(), emptySyncNameMaps()))
+
+	for _, name := range []string{"api-key", "api"} {
+		first, err := client.GetSecret(name, SecretFilter{})
+		if err != nil {
+			t.Fatalf("GetSecret(%q): %v", name, err)
+		}
+		for i := range 20 {
+			got, err := client.GetSecret(name, SecretFilter{})
+			if err != nil {
+				t.Fatalf("GetSecret(%q) attempt %d: %v", name, i, err)
+			}
+			if got != first {
+				t.Fatalf("GetSecret(%q) returned %q then %q; lookup is not deterministic", name, first, got)
+			}
+		}
+		// Lowest cipher id among the matches.
+		if first != "alpha" {
+			t.Errorf("GetSecret(%q) = %q, want %q (cipher-a sorts first)", name, first, "alpha")
+		}
+	}
+}
+
+// An exact match always beats a substring match, whatever the id ordering.
+func TestGetSecret_ExactMatchWinsOverSubstring(t *testing.T) {
+	t.Parallel()
+
+	items := map[string]DecryptedItem{
+		"cipher-a": {ID: "cipher-a", Name: "stripe-api-key-prod", Password: "substring"},
+		"cipher-z": {ID: "cipher-z", Name: "api-key", Password: "exact"},
+	}
+	client := NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps()))
+
+	got, err := client.GetSecret("api-key", SecretFilter{})
+	if err != nil {
+		t.Fatalf("GetSecret: %v", err)
+	}
+	if got != "exact" {
+		t.Errorf("GetSecret = %q, want %q", got, "exact")
+	}
+}
+
+func TestGetSecret_StrictMatchDisablesSubstringFallback(t *testing.T) {
+	t.Parallel()
+
+	items := lookupTestItems()
+
+	strict := NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps()), WithStrictMatch(true))
+	if _, err := strict.GetSecret("api", SecretFilter{}); err == nil {
+		t.Error("strict client resolved a substring match, want an error")
+	}
+	// An exact match still resolves, case-insensitively.
+	if _, err := strict.GetSecret("API-key", SecretFilter{}); err != nil {
+		t.Errorf("strict client rejected an exact match: %v", err)
+	}
+
+	lenient := NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps()))
+	if _, err := lenient.GetSecret("api", SecretFilter{}); err != nil {
+		t.Errorf("default client rejected a substring match: %v", err)
+	}
+}
+
+func TestGetSecret_ScopeStillAppliesToAmbiguousNames(t *testing.T) {
+	t.Parallel()
+
+	items := map[string]DecryptedItem{
+		"cipher-a": {ID: "cipher-a", Name: "api-key", Password: "out-of-scope", OrganizationID: "org-other"},
+		"cipher-b": {ID: "cipher-b", Name: "api-key", Password: "in-scope", OrganizationID: "org-mine"},
+	}
+	client := NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps()))
+
+	got, err := client.GetSecret("api-key", SecretFilter{OrganizationIDs: []string{"org-mine"}})
+	if err != nil {
+		t.Fatalf("GetSecret: %v", err)
+	}
+	if got != "in-scope" {
+		t.Errorf("GetSecret = %q, want %q — cipher-a sorts first but is out of scope", got, "in-scope")
+	}
+}
+
+func TestGetSecret_EmptyName(t *testing.T) {
+	t.Parallel()
+
+	client := NewClient(nil, time.Minute, WithState(lookupTestItems(), emptySyncNameMaps()))
+	if _, err := client.GetSecret("", SecretFilter{}); err == nil {
+		t.Error("expected an error for an empty name")
+	}
+}
+
+// POST /refresh calls syncVault directly while the background ticker may be
+// inside one. Both fetch, then both publish; without serialization whichever
+// fetch returns last wins regardless of which snapshot is newer, so an older
+// payload can resurrect items the newer one dropped.
+func TestSyncVault_ConcurrentCallsAreSerialized(t *testing.T) {
+	userKey := testUserKey()
+	name := mustEncryptType2Cipher(t, "api-key", userKey)
+
+	var (
+		mu      sync.Mutex
+		inside  int
+		overlap bool
+		calls   int
+	)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		inside++
+		calls++
+		if inside > 1 {
+			overlap = true
+		}
+		mu.Unlock()
+
+		time.Sleep(30 * time.Millisecond) // widen the window a racing caller would hit
+
+		mu.Lock()
+		inside--
+		mu.Unlock()
+
+		resp := SyncResponse{
+			Ciphers: []SyncCipher{{ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", Type: CipherTypeLogin, Name: name}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+
+	c := NewClient(newSyncTestClient(t, mux), time.Hour)
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := c.syncVault(); err != nil {
+				t.Errorf("syncVault: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if overlap {
+		t.Error("two syncs ran concurrently; a slower one can publish a staler snapshot last")
+	}
+	if calls != 4 {
+		t.Errorf("sync called %d times, want 4", calls)
+	}
+}
+
+// The custom-field fallback used to range over a map, so an item with several
+// fields resolved to a different one per request.
+func TestExtractSecret_FieldFallbackIsDeterministic(t *testing.T) {
+	t.Parallel()
+
+	item := DecryptedItem{
+		Fields: map[string]string{
+			"zeta":  "z",
+			"alpha": "a",
+			"mid":   "m",
+			"beta":  "b",
+		},
+	}
+
+	first := extractSecret(item)
+	for range 50 {
+		if got := extractSecret(item); got != first {
+			t.Fatalf("extractSecret returned %q then %q; field fallback is not deterministic", first, got)
+		}
+	}
+	if first != "a" {
+		t.Errorf("extractSecret = %q, want %q (lowest field name)", first, "a")
+	}
+}
+
+// The named-priority fields still outrank the alphabetical fallback.
+func TestExtractSecret_PriorityFieldsWinOverFallback(t *testing.T) {
+	t.Parallel()
+
+	item := DecryptedItem{
+		Fields: map[string]string{
+			"aaa":   "alphabetically-first",
+			"token": "priority",
+		},
+	}
+	if got := extractSecret(item); got != "priority" {
+		t.Errorf("extractSecret = %q, want %q", got, "priority")
+	}
+}
+
+// Stop must abandon a vault request that is already in flight. Without a
+// cancellable context, shutdown waits out the 30s HTTP client timeout while the
+// server sits on the connection.
+func TestStop_CancelsInFlightSync(t *testing.T) {
+	released := make(chan struct{})
+	reached := make(chan struct{})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		close(reached)
+		select {
+		case <-r.Context().Done(): // client went away
+		case <-released:
+		}
+	})
+
+	c := NewClient(newSyncTestClient(t, mux), time.Hour)
+	t.Cleanup(func() { close(released) })
+
+	done := make(chan error, 1)
+	go func() { done <- c.syncVault() }()
+
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sync never reached the server")
+	}
+
+	c.Stop()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("syncVault returned nil; want the cancellation error")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("syncVault error = %v, want it to wrap context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("syncVault did not return after Stop; the request was not cancelled")
+	}
+}
+
+func TestStop_IsIdempotent(t *testing.T) {
+	c := NewClient(nil, time.Hour)
+	c.Stop()
+	c.Stop() // must not panic on a second close
 }

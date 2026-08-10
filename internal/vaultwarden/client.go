@@ -3,8 +3,10 @@
 package vaultwarden
 
 import (
+	"context"
 	"fmt"
 	"maps"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +19,16 @@ type Client struct {
 	api       *APIClient
 	syncEvery time.Duration
 
+	// strictMatch disables the substring fallback in GetSecret, so a name that
+	// matches no vault item exactly is a 404 instead of a near miss.
+	strictMatch bool
+
+	// syncMu serializes whole sync cycles. Without it a POST /refresh and the
+	// background tick race, and whichever fetch finishes last wins regardless of
+	// which snapshot is newer — an older one can resurrect trashed or revoked
+	// items. Lock order: syncMu before mu, never the reverse.
+	syncMu sync.Mutex
+
 	mu    sync.RWMutex
 	items map[string]DecryptedItem // keyed by cipher id
 
@@ -24,6 +36,12 @@ type Client struct {
 	nameMaps SyncNameMaps
 
 	stopSync chan struct{}
+
+	// ctx is cancelled by Stop so an in-flight vault request is abandoned at
+	// shutdown instead of holding the process for the client timeout.
+	ctx      context.Context
+	cancel   context.CancelFunc
+	stopOnce sync.Once
 }
 
 // ClientOption configures NewClient.
@@ -39,14 +57,25 @@ func WithState(items map[string]DecryptedItem, nameMaps SyncNameMaps) ClientOpti
 	}
 }
 
+// WithStrictMatch requires an exact (case-insensitive) name match, disabling the
+// substring fallback.
+func WithStrictMatch(strict bool) ClientOption {
+	return func(c *Client) {
+		c.strictMatch = strict
+	}
+}
+
 // NewClient creates a vault client. Pass WithState to preload cache data without calling Initialize.
 func NewClient(api *APIClient, syncInterval time.Duration, opts ...ClientOption) *Client {
+	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{
 		api:       api,
 		syncEvery: syncInterval,
 		items:     make(map[string]DecryptedItem),
 		nameMaps:  emptySyncNameMaps(),
 		stopSync:  make(chan struct{}),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -56,7 +85,7 @@ func NewClient(api *APIClient, syncInterval time.Duration, opts ...ClientOption)
 
 // Initialize authenticates and performs the initial vault sync.
 func (c *Client) Initialize() error {
-	if err := c.api.Authenticate(); err != nil {
+	if err := c.api.Authenticate(c.ctx); err != nil {
 		return fmt.Errorf("authenticate: %w", err)
 	}
 
@@ -123,8 +152,39 @@ func matchesSecretFilter(item DecryptedItem, f SecretFilter) bool {
 	return true
 }
 
+// selectMatch returns the first item satisfying pred, scanning in the order
+// given. It warns when several items match, since the loser is a secret the
+// caller asked for and did not get.
+func selectMatch(candidates []DecryptedItem, kind string, pred func(DecryptedItem) bool) (DecryptedItem, bool) {
+	var chosen DecryptedItem
+	found := 0
+	for _, item := range candidates {
+		if !pred(item) {
+			continue
+		}
+		found++
+		if found == 1 {
+			chosen = item
+		}
+	}
+	if found == 0 {
+		return DecryptedItem{}, false
+	}
+	if found > 1 {
+		logger.Warn.Printf(
+			"Ambiguous secret lookup: %d items %s-match the request; returning cipher %s. Narrow it with an organization/collection/folder filter",
+			found, kind, chosen.ID)
+	}
+	return chosen, true
+}
+
 // GetSecret retrieves a decrypted secret by name.
-// It searches by exact name (case-insensitive), then falls back to partial match.
+// It searches by exact name (case-insensitive), then falls back to partial match
+// unless strict matching is enabled.
+//
+// Candidates are sorted by cipher id so that repeating a request returns the
+// same secret: ranging over the item map directly made the winner depend on Go's
+// randomized map iteration order (#30).
 func (c *Client) GetSecret(name string, filter SecretFilter) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("secret name cannot be empty")
@@ -141,19 +201,24 @@ func (c *Client) GetSecret(name string, filter SecretFilter) (string, error) {
 			candidates = append(candidates, item)
 		}
 	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
 
 	// Case 1: Exact match.
-	for _, item := range candidates {
-		if strings.EqualFold(item.Name, name) {
-			return extractSecret(item), nil
-		}
+	if item, ok := selectMatch(candidates, "exactly", func(item DecryptedItem) bool {
+		return strings.EqualFold(item.Name, name)
+	}); ok {
+		return extractSecret(item), nil
 	}
-	// Case 2: Partial match
-	for _, item := range candidates {
-		if strings.Contains(strings.ToLower(item.Name), key) {
-			logger.Debug.Printf("Partial match found for secret lookup")
-			return extractSecret(item), nil
-		}
+
+	// Case 2: Partial match, opt-out via strict matching.
+	if c.strictMatch {
+		return "", fmt.Errorf("secret not found")
+	}
+	if item, ok := selectMatch(candidates, "partially", func(item DecryptedItem) bool {
+		return strings.Contains(strings.ToLower(item.Name), key)
+	}); ok {
+		logger.Debug.Printf("Partial match found for secret lookup")
+		return extractSecret(item), nil
 	}
 
 	return "", fmt.Errorf("secret not found")
@@ -166,9 +231,13 @@ func (c *Client) ClearCache() {
 	}
 }
 
-// Stop stops the background sync goroutine.
+// Stop stops the background sync goroutine and cancels any in-flight request.
+// Safe to call more than once.
 func (c *Client) Stop() {
-	close(c.stopSync)
+	c.stopOnce.Do(func() {
+		close(c.stopSync)
+		c.cancel()
+	})
 }
 
 // NameMaps returns a copy of decrypted organization, folder, and collection names
@@ -203,9 +272,13 @@ func retainFailedCiphers(newItems, old map[string]DecryptedItem, failed []Failed
 	return retained
 }
 
-// syncVault fetches and decrypts all items from the vault.
+// syncVault fetches and decrypts all items from the vault. The whole cycle is
+// serialized so a slower concurrent sync cannot publish a staler snapshot last.
 func (c *Client) syncVault() error {
-	items, nameMaps, failed, err := c.api.Sync()
+	c.syncMu.Lock()
+	defer c.syncMu.Unlock()
+
+	items, nameMaps, failed, err := c.api.Sync(c.ctx)
 	if err != nil {
 		// A non-empty failure list means the payload was authentic but nothing decrypted (#25):
 		// reconcile placement and drop removed items, instead of serving stale scopes for the whole
@@ -303,9 +376,15 @@ func extractSecret(item DecryptedItem) string {
 		return item.Notes
 	}
 
-	// Return first non-empty field value.
-	for _, v := range item.Fields {
-		if v != "" {
+	// Return first non-empty field value, by field name, so that an item with
+	// several custom fields resolves to the same one on every request.
+	names := make([]string, 0, len(item.Fields))
+	for name := range item.Fields {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if v := item.Fields[name]; v != "" {
 			return v
 		}
 	}

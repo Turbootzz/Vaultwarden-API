@@ -9,11 +9,11 @@ import (
 
 // InitializeClient creates and initializes a fully authenticated vault client.
 // clientID and clientSecret are optional — if provided, API key login is used (bypasses 2FA).
-func InitializeClient(serverURL, email, password, clientID, clientSecret string, syncInterval time.Duration) (*Client, error) {
+func InitializeClient(serverURL, email, password, clientID, clientSecret string, syncInterval time.Duration, opts ...ClientOption) (*Client, error) {
 	logger.Info.Println("Initializing Vaultwarden native API client...")
 
 	api := NewAPIClient(serverURL, email, password, clientID, clientSecret)
-	client := NewClient(api, syncInterval)
+	client := NewClient(api, syncInterval, opts...)
 
 	// Authenticate and perform initial sync with retry.
 	maxRetries := 3

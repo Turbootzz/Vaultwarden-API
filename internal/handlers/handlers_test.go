@@ -447,3 +447,46 @@ func TestGetSecretScoped(t *testing.T) {
 		})
 	}
 }
+
+// Regression for #32: responses carrying a plaintext secret must never be
+// storable by an intermediary, on hits and on misses alike.
+func TestGetSecretSetsNoStoreHeaders(t *testing.T) {
+	const fullKey = "full-access-key-for-cache-header-test-000"
+	h := NewHandler(vaultwarden.NewClient(nil, 0, vaultwarden.WithState(testVaultItems(), testNameMaps())))
+	app := fiber.New()
+	app.Use(auth.Middleware(auth.NewStore([]auth.APIKey{{Name: "full", Key: fullKey}})))
+	app.Get("/secret/:name", h.GetSecret)
+
+	tests := []struct {
+		name       string
+		path       string
+		wantStatus int
+	}{
+		{"hit", "/secret/db-password", http.StatusOK},
+		{"miss", "/secret/nope-does-not-exist", http.StatusNotFound},
+		{"rejected name", "/secret/..", http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tt.path, nil)
+			req.Header.Set("Authorization", "Bearer "+fullKey)
+
+			resp, err := app.Test(req, -1)
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			if got := resp.Header.Get("Cache-Control"); !strings.Contains(got, "no-store") {
+				t.Errorf("Cache-Control = %q, want it to contain no-store", got)
+			}
+			if got := resp.Header.Get("Pragma"); got != "no-cache" {
+				t.Errorf("Pragma = %q, want no-cache", got)
+			}
+		})
+	}
+}

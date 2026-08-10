@@ -146,7 +146,7 @@ func TestSync_SkipsTrashedCiphers(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	items, _, _, err := ac.Sync()
+	items, _, _, err := ac.Sync(t.Context())
 	if err != nil {
 		t.Fatalf("Sync() error: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestSync_401RefreshFailsFallsBackToFullReauth(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	items, _, _, err := ac.Sync()
+	items, _, _, err := ac.Sync(t.Context())
 	if err != nil {
 		t.Fatalf("Sync() error: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestSync_401ReauthAlsoFailsReturnsError(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	_, _, _, err := ac.Sync()
+	_, _, _, err := ac.Sync(t.Context())
 	if err == nil {
 		t.Fatal("Sync() expected error")
 	}
@@ -319,7 +319,7 @@ func TestSync_AllCiphersFailToDecryptReturnsError(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	items, _, failed, err := ac.Sync()
+	items, _, failed, err := ac.Sync(t.Context())
 	if err == nil {
 		t.Fatalf("Sync() returned %d items and no error; want an error when every cipher fails to decrypt", len(items))
 	}
@@ -361,7 +361,7 @@ func TestSync_OrgCipherWithoutOrgKeyCountsAsFailure(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	items, _, _, err := ac.Sync()
+	items, _, _, err := ac.Sync(t.Context())
 	if err == nil {
 		t.Fatalf("Sync() returned %d items and no error; want an error when the only cipher is org-owned and no org key is available", len(items))
 	}
@@ -420,7 +420,7 @@ func TestSync_ReportsFailedCiphersWithPlacement(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	items, _, failed, err := ac.Sync()
+	items, _, failed, err := ac.Sync(t.Context())
 	if err != nil {
 		t.Fatalf("Sync() error: %v", err)
 	}
@@ -486,7 +486,7 @@ func TestSync_OnlyTrashedCiphersSyncsEmpty(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	items, _, _, err := ac.Sync()
+	items, _, _, err := ac.Sync(t.Context())
 	if err != nil {
 		t.Fatalf("Sync() error: %v (an all-trashed vault is empty, not failed)", err)
 	}
@@ -523,7 +523,7 @@ func TestSync_RetryStill401ForcesReauthOnNextAttempt(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	_, _, _, err := ac.Sync()
+	_, _, _, err := ac.Sync(t.Context())
 	if err == nil {
 		t.Fatal("Sync() expected error")
 	}
@@ -635,7 +635,7 @@ func TestSync_ConcurrentRenewalRunsOneLogin(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			items, _, _, err := ac.Sync()
+			items, _, _, err := ac.Sync(t.Context())
 			errs[i] = err
 			counts[i] = len(items)
 		}(i)
@@ -670,7 +670,7 @@ func TestRefreshAccessToken_EmptyAccessTokenIsError(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	if err := ac.RefreshAccessToken(); err == nil {
+	if err := ac.RefreshAccessToken(t.Context()); err == nil {
 		t.Fatal("RefreshAccessToken() expected error for a 200 response with an empty access_token")
 	}
 
@@ -693,7 +693,7 @@ func TestDoTokenRequest_EmptyAccessTokenIsError(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	if _, err := ac.doTokenRequest(url.Values{"grant_type": {"password"}}); err == nil {
+	if _, err := ac.doTokenRequest(t.Context(), url.Values{"grant_type": {"password"}}); err == nil {
 		t.Fatal("doTokenRequest() expected error for a 200 response with an empty access_token")
 	}
 }
@@ -735,7 +735,7 @@ func TestAuthenticate_ProfileKeyFailureLeavesPriorStateIntact(t *testing.T) {
 	ac.tokenExpiry = priorExpiry
 	ac.symKey = testUserKey()
 
-	if err := ac.Authenticate(); err == nil {
+	if err := ac.Authenticate(t.Context()); err == nil {
 		t.Fatal("Authenticate() expected error when the profile key fetch fails")
 	}
 
