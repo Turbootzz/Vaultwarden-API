@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/hkdf"
 	"golang.org/x/crypto/pbkdf2"
@@ -53,6 +54,19 @@ const (
 	argon2MaxMemoryMiB   = 1024
 	argon2MaxParallelism = 64
 	argon2MaxIterations  = 100
+)
+
+// Floors for the same parameters. Without them the server chooses how weak the
+// derivation is, and the password hash sent to it is derived from the master key
+// — so a server answering prelogin with one PBKDF2 iteration receives a hash it
+// can brute-force back to the master password offline. Official clients enforce
+// the same floors, so a legitimate account always clears them.
+const (
+	pbkdf2MinIterations = 5000
+	// Below this a PBKDF2 account is weaker than every current default and worth
+	// flagging, but it is still a valid configuration, so it is not rejected.
+	pbkdf2WarnIterations = 100000
+	argon2MinMemoryMiB   = 16
 )
 
 // SymmetricKey holds the encryption and MAC keys for AES-CBC + HMAC-SHA256.
@@ -139,6 +153,14 @@ func (cs *CipherString) Decrypt(key SymmetricKey) ([]byte, error) {
 		return nil, fmt.Errorf("invalid ciphertext length: %d", len(cs.CT))
 	}
 
+	// A key carrying a MAC key belongs to a MAC'd encryption type. Accepting an
+	// unauthenticated type 0 value under such a key would let whoever serves the
+	// payload strip integrity protection by relabelling the cipher string, so
+	// type 0 is only honoured for legacy keys that have no MAC key at all.
+	if cs.Type == EncTypeAesCbc256_B64 && len(key.MacKey) > 0 {
+		return nil, errors.New("refusing unauthenticated type 0 cipher string under a MAC-carrying key")
+	}
+
 	// Verify MAC if present (type 2).
 	if cs.Type == EncTypeAesCbc256_HmacSha256_B64 {
 		if len(key.MacKey) == 0 {
@@ -199,8 +221,15 @@ func MakeMasterKey(password, email string, kdfType, iterations int, memory, para
 
 	switch kdfType {
 	case KdfPBKDF2:
-		if iterations < 1 {
-			return nil, fmt.Errorf("PBKDF2 iterations must be >= 1, got %d", iterations)
+		if iterations < pbkdf2MinIterations {
+			return nil, fmt.Errorf(
+				"PBKDF2 iterations must be >= %d, got %d (refusing to derive a key the server can trivially reverse)",
+				pbkdf2MinIterations, iterations)
+		}
+		if iterations < pbkdf2WarnIterations {
+			logger.Warn.Printf(
+				"Vaultwarden reports only %d PBKDF2 iterations; raise the account KDF setting (current default is 600000)",
+				iterations)
 		}
 		return pbkdf2.Key([]byte(password), salt, iterations, 32, sha256.New), nil
 
@@ -214,8 +243,8 @@ func MakeMasterKey(password, email string, kdfType, iterations int, memory, para
 		mem := 64 * 1024 // default 64 MiB
 		par := 4         // default parallelism
 		if memory != nil {
-			if *memory < 1 || *memory > argon2MaxMemoryMiB {
-				return nil, fmt.Errorf("Argon2id memory must be between 1 and %d MiB, got %d", argon2MaxMemoryMiB, *memory)
+			if *memory < argon2MinMemoryMiB || *memory > argon2MaxMemoryMiB {
+				return nil, fmt.Errorf("Argon2id memory must be between %d and %d MiB, got %d", argon2MinMemoryMiB, argon2MaxMemoryMiB, *memory)
 			}
 			mem = *memory * 1024 // API returns MiB, argon2 wants KiB
 		}

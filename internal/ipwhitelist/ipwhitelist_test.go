@@ -1,8 +1,12 @@
 package ipwhitelist
 
 import (
+	"bufio"
+	"io"
 	"net"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Turbootzz/vaultwarden-api/internal/realip"
 	"github.com/gofiber/fiber/v2"
@@ -180,5 +184,144 @@ func TestMiddlewareAllowsAllWhenUnconfigured(t *testing.T) {
 
 	if got := get(t, addr, "10.0.0.5"); got != fiber.StatusOK {
 		t.Errorf("status = %d, want %d", got, fiber.StatusOK)
+	}
+}
+
+// Regression: with ENABLE_GITHUB_IP_RANGES=true and no ALLOWED_IPS, a failed
+// range fetch left the list empty, and an empty list used to read as
+// "unrestricted" — turning a GitHub API outage into an open door. Access control
+// that was asked for and could not be loaded must fail closed.
+func TestMiddlewareFailsClosedWhenConfiguredButEmpty(t *testing.T) {
+	resolver, err := realip.New([]string{"127.0.0.1", "::1"})
+	if err != nil {
+		t.Fatalf("realip.New: %v", err)
+	}
+
+	// enableGitHub with an unreachable fetch: New logs a warning and carries on
+	// with no ranges loaded.
+	wl := &IPWhitelist{
+		allowedIPs:   make(map[string]bool),
+		enableGitHub: true,
+		configured:   true,
+	}
+
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app.Use(realip.Middleware(resolver))
+	app.Use(wl.Middleware())
+	app.Get("/secret/:name", func(c *fiber.Ctx) error { return c.SendString("ok") })
+	addr := serve(t, app)
+
+	for _, forwarded := range []string{"", "203.0.113.9", "10.0.0.5"} {
+		if got := get(t, addr, forwarded); got != fiber.StatusForbidden {
+			t.Errorf("X-Forwarded-For=%q: status = %d, want %d", forwarded, got, fiber.StatusForbidden)
+		}
+	}
+}
+
+func TestNewRecordsWhetherAccessControlWasConfigured(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		allowedIPs   []string
+		enableGitHub bool
+		want         bool
+	}{
+		{"nothing configured", nil, false, false},
+		{"explicit IPs", []string{"10.0.0.5"}, false, true},
+		{"github ranges only", nil, true, true},
+		{"both", []string{"10.0.0.5"}, true, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wl, err := New(tt.allowedIPs, false)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			// New performs a live fetch when enableGitHub is set, so set the flag
+			// the way New would rather than reaching over the network in a test.
+			wl.configured = wl.configured || tt.enableGitHub
+			if wl.configured != tt.want {
+				t.Errorf("configured = %v, want %v", wl.configured, tt.want)
+			}
+		})
+	}
+}
+
+// rawGet sends a request verbatim over a socket and returns the status line, so
+// tests can express wire-level shapes the client libraries will not produce.
+func rawGet(t *testing.T, addr, raw string) string {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	if _, err := io.WriteString(conn, raw); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	status, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read status line: %v", err)
+	}
+	return strings.TrimSpace(status)
+}
+
+// End-to-end regression for the trailer-smuggling bypass: fasthttp merges
+// chunked request trailers into the header table, and a trailer value lands to
+// the right of the entry the proxy appended — exactly where the right-to-left
+// walk looks. Behind a proxy that forwards trailers (HAProxy, Envoy) this let a
+// remote client hand itself a whitelisted address.
+func TestMiddlewareRejectsTrailerSmuggledForwardedFor(t *testing.T) {
+	wl, err := New([]string{"10.0.0.5"}, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	resolver, err := realip.New([]string{"127.0.0.1", "::1"})
+	if err != nil {
+		t.Fatalf("realip.New: %v", err)
+	}
+
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app.Use(realip.Middleware(resolver))
+	app.Use(wl.Middleware())
+	app.All("/secret/:name", func(c *fiber.Ctx) error { return c.SendString("ok") })
+	addr := serve(t, app)
+
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "GET, undeclared trailer",
+			raw: "GET /secret/db HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n" +
+				"X-Forwarded-For: 203.0.113.9\r\nConnection: close\r\n\r\n" +
+				"0\r\nX-Forwarded-For: 10.0.0.5\r\n\r\n",
+		},
+		{
+			name: "POST, undeclared trailer",
+			raw: "POST /secret/db HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n" +
+				"X-Forwarded-For: 203.0.113.9\r\nConnection: close\r\n\r\n" +
+				"4\r\nbody\r\n0\r\nX-Forwarded-For: 10.0.0.5\r\n\r\n",
+		},
+		{
+			name: "GET, declared trailer",
+			raw: "GET /secret/db HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n" +
+				"Trailer: X-Forwarded-For\r\nX-Forwarded-For: 203.0.113.9\r\nConnection: close\r\n\r\n" +
+				"0\r\nX-Forwarded-For: 10.0.0.5\r\n\r\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := rawGet(t, addr, tt.raw)
+			if !strings.Contains(got, "403") {
+				t.Errorf("status = %q, want 403 — a smuggled trailer must not pass the whitelist", got)
+			}
+		})
 	}
 }

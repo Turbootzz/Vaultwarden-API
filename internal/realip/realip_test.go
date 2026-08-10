@@ -1,7 +1,9 @@
 package realip
 
 import (
+	"bufio"
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/gofiber/fiber/v2"
@@ -18,17 +20,36 @@ func testResolver(t *testing.T) *Resolver {
 	return r
 }
 
-func acquireCtx(t *testing.T, peer, forwardedFor string) (*fiber.App, *fiber.Ctx) {
+// acquireCtx builds a context from a real parsed request. Requests must go
+// through the wire parser, not Header.Set, because the resolver reads the raw
+// header block and Header.Set does not populate it.
+func acquireCtx(t *testing.T, peer string, forwardedFor ...string) (*fiber.App, *fiber.Ctx) {
+	t.Helper()
+
+	var b strings.Builder
+	b.WriteString("GET /secret/db HTTP/1.1\r\nHost: target\r\n")
+	for _, line := range forwardedFor {
+		if line == "" {
+			continue
+		}
+		b.WriteString("X-Forwarded-For: " + line + "\r\n")
+	}
+	b.WriteString("\r\n")
+
+	return acquireRawCtx(t, peer, b.String())
+}
+
+// acquireRawCtx parses a complete raw request, so tests can exercise wire-level
+// shapes such as chunked bodies with trailers.
+func acquireRawCtx(t *testing.T, peer, raw string) (*fiber.App, *fiber.Ctx) {
 	t.Helper()
 	app := fiber.New()
 	fctx := &fasthttp.RequestCtx{}
 	fctx.SetRemoteAddr(&net.TCPAddr{IP: net.ParseIP(peer), Port: 54321})
-	ctx := app.AcquireCtx(fctx)
-	ctx.Request().Header.SetMethod("GET")
-	ctx.Request().URI().SetPath("/secret/db")
-	if forwardedFor != "" {
-		ctx.Request().Header.Set(fiber.HeaderXForwardedFor, forwardedFor)
+	if err := fctx.Request.Read(bufio.NewReader(strings.NewReader(raw))); err != nil {
+		t.Fatalf("parse request: %v", err)
 	}
+	ctx := app.AcquireCtx(fctx)
 	t.Cleanup(func() { app.ReleaseCtx(ctx) })
 	return app, ctx
 }
@@ -247,21 +268,120 @@ func TestClientIPReadsEveryForwardedForLine(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			app := fiber.New()
-			fctx := &fasthttp.RequestCtx{}
-			fctx.SetRemoteAddr(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 54321})
-			ctx := app.AcquireCtx(fctx)
-			t.Cleanup(func() { app.ReleaseCtx(ctx) })
-
-			ctx.Request().Header.SetMethod("GET")
-			ctx.Request().URI().SetPath("/secret/db")
-			for _, line := range tt.lines {
-				ctx.Request().Header.Add(fiber.HeaderXForwardedFor, line)
-			}
-
+			_, ctx := acquireCtx(t, "127.0.0.1", tt.lines...)
 			if got := resolver.ClientIP(ctx); got != tt.want {
 				t.Errorf("ClientIP() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// fasthttp merges chunked request trailers into the same header table that
+// Header.PeekAll reads, and X-Forwarded-For is not on its forbidden-trailer
+// list. Trailer values land after every genuine header — precisely where the
+// right-to-left walk looks — so sourcing the chain from PeekAll would let a
+// client smuggle its chosen address past any proxy that forwards trailers
+// (HAProxy and Envoy do; nginx does not). The chain comes from the raw header
+// block instead, which the trailer reader never touches.
+func TestClientIPIgnoresSmuggledTrailers(t *testing.T) {
+	resolver := testResolver(t)
+
+	const attack = "X-Forwarded-For: 10.0.0.5\r\n"
+
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "GET with an undeclared trailer",
+			raw: "GET /secret/db HTTP/1.1\r\nHost: target\r\nTransfer-Encoding: chunked\r\n" +
+				"X-Forwarded-For: 203.0.113.9\r\n\r\n0\r\n" + attack + "\r\n",
+			want: "203.0.113.9",
+		},
+		{
+			name: "POST with an undeclared trailer",
+			raw: "POST /secret/db HTTP/1.1\r\nHost: target\r\nTransfer-Encoding: chunked\r\n" +
+				"X-Forwarded-For: 203.0.113.9\r\n\r\n0\r\n" + attack + "\r\n",
+			want: "203.0.113.9",
+		},
+		{
+			name: "declared trailer",
+			raw: "GET /secret/db HTTP/1.1\r\nHost: target\r\nTransfer-Encoding: chunked\r\n" +
+				"Trailer: X-Forwarded-For\r\nX-Forwarded-For: 203.0.113.9\r\n\r\n0\r\n" + attack + "\r\n",
+			want: "203.0.113.9",
+		},
+		{
+			name: "trailer with a non-empty body chunk",
+			raw: "POST /secret/db HTTP/1.1\r\nHost: target\r\nTransfer-Encoding: chunked\r\n" +
+				"X-Forwarded-For: 203.0.113.9\r\n\r\n4\r\nbody\r\n0\r\n" + attack + "\r\n",
+			want: "203.0.113.9",
+		},
+		{
+			name: "trailer is the only X-Forwarded-For",
+			raw: "GET /secret/db HTTP/1.1\r\nHost: target\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n" +
+				attack + "\r\n",
+			want: "127.0.0.1", // no genuine header, so the peer stands
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ctx := acquireRawCtx(t, "127.0.0.1", tt.raw)
+			if got := resolver.ClientIP(ctx); got != tt.want {
+				t.Errorf("ClientIP() = %q, want %q (smuggled trailer must not win)", got, tt.want)
+			}
+		})
+	}
+}
+
+// A continuation line belongs to the header above it. Dropping one could remove
+// an entry a proxy appended and promote a client-written entry to the right.
+func TestClientIPHonoursLineFolding(t *testing.T) {
+	resolver := testResolver(t)
+
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "folded continuation carries the proxy entry",
+			raw: "GET /secret/db HTTP/1.1\r\nHost: target\r\n" +
+				"X-Forwarded-For: 10.0.0.5,\r\n 203.0.113.9\r\n\r\n",
+			want: "203.0.113.9",
+		},
+		{
+			name: "folded continuation on a client-written line stays left",
+			raw: "GET /secret/db HTTP/1.1\r\nHost: target\r\n" +
+				"X-Forwarded-For: 10.0.0.5,\r\n\t10.0.0.6\r\n" +
+				"X-Forwarded-For: 203.0.113.9\r\n\r\n",
+			want: "203.0.113.9",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ctx := acquireRawCtx(t, "127.0.0.1", tt.raw)
+			if got := resolver.ClientIP(ctx); got != tt.want {
+				t.Errorf("ClientIP() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// A continuation line that itself looks like a header is rejected by fasthttp
+// before any handler runs, so smuggling one under an unrelated header never
+// reaches the resolver. Pinned because the raw-header parse would otherwise have
+// to decide what such a line means.
+func TestFoldedHeaderMasqueradingAsForwardedForIsRejected(t *testing.T) {
+	raw := "GET /secret/db HTTP/1.1\r\nHost: target\r\n" +
+		"User-Agent: curl\r\n X-Forwarded-For: 10.0.0.5\r\n" +
+		"X-Forwarded-For: 203.0.113.9\r\n\r\n"
+
+	var fctx fasthttp.RequestCtx
+	fctx.SetRemoteAddr(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 54321})
+	if err := fctx.Request.Read(bufio.NewReader(strings.NewReader(raw))); err == nil {
+		t.Fatal("expected fasthttp to reject the folded header-shaped continuation line")
 	}
 }

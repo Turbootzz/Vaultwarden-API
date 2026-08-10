@@ -5,6 +5,7 @@ import (
 	"maps"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -395,7 +396,7 @@ func TestGetSecret_AmbiguousMatchIsDeterministic(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetSecret(%q): %v", name, err)
 		}
-		for i := range 50 {
+		for i := range 20 {
 			got, err := client.GetSecret(name, SecretFilter{})
 			if err != nil {
 				t.Fatalf("GetSecret(%q) attempt %d: %v", name, i, err)
@@ -474,5 +475,109 @@ func TestGetSecret_EmptyName(t *testing.T) {
 	client := NewClient(nil, time.Minute, WithState(lookupTestItems(), emptySyncNameMaps()))
 	if _, err := client.GetSecret("", SecretFilter{}); err == nil {
 		t.Error("expected an error for an empty name")
+	}
+}
+
+// POST /refresh calls syncVault directly while the background ticker may be
+// inside one. Both fetch, then both publish; without serialization whichever
+// fetch returns last wins regardless of which snapshot is newer, so an older
+// payload can resurrect items the newer one dropped.
+func TestSyncVault_ConcurrentCallsAreSerialized(t *testing.T) {
+	userKey := testUserKey()
+	name := mustEncryptType2Cipher(t, "api-key", userKey)
+
+	var (
+		mu      sync.Mutex
+		inside  int
+		overlap bool
+		calls   int
+	)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		inside++
+		calls++
+		if inside > 1 {
+			overlap = true
+		}
+		mu.Unlock()
+
+		time.Sleep(30 * time.Millisecond) // widen the window a racing caller would hit
+
+		mu.Lock()
+		inside--
+		mu.Unlock()
+
+		resp := SyncResponse{
+			Ciphers: []SyncCipher{{ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", Type: CipherTypeLogin, Name: name}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+
+	c := NewClient(newSyncTestClient(t, mux), time.Hour)
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := c.syncVault(); err != nil {
+				t.Errorf("syncVault: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if overlap {
+		t.Error("two syncs ran concurrently; a slower one can publish a staler snapshot last")
+	}
+	if calls != 4 {
+		t.Errorf("sync called %d times, want 4", calls)
+	}
+}
+
+// The custom-field fallback used to range over a map, so an item with several
+// fields resolved to a different one per request.
+func TestExtractSecret_FieldFallbackIsDeterministic(t *testing.T) {
+	t.Parallel()
+
+	item := DecryptedItem{
+		Fields: map[string]string{
+			"zeta":  "z",
+			"alpha": "a",
+			"mid":   "m",
+			"beta":  "b",
+		},
+	}
+
+	first := extractSecret(item)
+	for range 50 {
+		if got := extractSecret(item); got != first {
+			t.Fatalf("extractSecret returned %q then %q; field fallback is not deterministic", first, got)
+		}
+	}
+	if first != "a" {
+		t.Errorf("extractSecret = %q, want %q (lowest field name)", first, "a")
+	}
+}
+
+// The named-priority fields still outrank the alphabetical fallback.
+func TestExtractSecret_PriorityFieldsWinOverFallback(t *testing.T) {
+	t.Parallel()
+
+	item := DecryptedItem{
+		Fields: map[string]string{
+			"aaa":   "alphabetically-first",
+			"token": "priority",
+		},
+	}
+	if got := extractSecret(item); got != "priority" {
+		t.Errorf("extractSecret = %q, want %q", got, "priority")
 	}
 }

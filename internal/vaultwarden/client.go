@@ -22,6 +22,12 @@ type Client struct {
 	// matches no vault item exactly is a 404 instead of a near miss.
 	strictMatch bool
 
+	// syncMu serializes whole sync cycles. Without it a POST /refresh and the
+	// background tick race, and whichever fetch finishes last wins regardless of
+	// which snapshot is newer — an older one can resurrect trashed or revoked
+	// items. Lock order: syncMu before mu, never the reverse.
+	syncMu sync.Mutex
+
 	mu    sync.RWMutex
 	items map[string]DecryptedItem // keyed by cipher id
 
@@ -252,8 +258,12 @@ func retainFailedCiphers(newItems, old map[string]DecryptedItem, failed []Failed
 	return retained
 }
 
-// syncVault fetches and decrypts all items from the vault.
+// syncVault fetches and decrypts all items from the vault. The whole cycle is
+// serialized so a slower concurrent sync cannot publish a staler snapshot last.
 func (c *Client) syncVault() error {
+	c.syncMu.Lock()
+	defer c.syncMu.Unlock()
+
 	items, nameMaps, failed, err := c.api.Sync()
 	if err != nil {
 		// A non-empty failure list means the payload was authentic but nothing decrypted (#25):
@@ -352,9 +362,15 @@ func extractSecret(item DecryptedItem) string {
 		return item.Notes
 	}
 
-	// Return first non-empty field value.
-	for _, v := range item.Fields {
-		if v != "" {
+	// Return first non-empty field value, by field name, so that an item with
+	// several custom fields resolves to the same one on every request.
+	names := make([]string, 0, len(item.Fields))
+	for name := range item.Fields {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if v := item.Fields[name]; v != "" {
 			return v
 		}
 	}

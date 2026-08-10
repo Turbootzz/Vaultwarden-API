@@ -96,16 +96,65 @@ func (r *Resolver) ClientIP(c *fiber.Ctx) string {
 // Every line is read, not just the first: a proxy is free to add its own header
 // line rather than extend the client's (HAProxy's forwardfor does), and reading
 // only the first would hand back the line the client wrote.
+//
+// The lines come from the raw header block rather than Header.PeekAll, because
+// fasthttp merges HTTP/1.1 chunked *request trailers* into the same lookup table
+// and X-Forwarded-For is not on its forbidden-trailer list. Trailer values land
+// after every genuine header, which is exactly the position the right-to-left
+// walk trusts, so a client could smuggle its chosen address past a proxy that
+// forwards trailers. Header.RawHeaders() is filled during header parsing only
+// and never by the trailer reader, so it holds what the proxy actually sent.
 func forwardedFor(c *fiber.Ctx) []net.IP {
 	var ips []net.IP
-	for _, line := range c.Request().Header.PeekAll(fiber.HeaderXForwardedFor) {
-		for _, part := range strings.Split(string(line), ",") {
+	for _, value := range rawForwardedForValues(c.Request().Header.RawHeaders()) {
+		for _, part := range strings.Split(value, ",") {
 			if ip := parseHeaderIP(part); ip != nil {
 				ips = append(ips, ip)
 			}
 		}
 	}
 	return ips
+}
+
+// rawForwardedForValues returns the value of every X-Forwarded-For line in a raw
+// HTTP/1.1 header block, in order.
+//
+// Obsolete line folding is honoured rather than discarded: a continuation line
+// belongs to the header above it, and dropping one could remove the entry a
+// proxy appended and promote a client-written entry to the right-hand end.
+func rawForwardedForValues(raw []byte) []string {
+	var out []string
+	inTarget := false
+
+	for _, line := range strings.Split(string(raw), "\r\n") {
+		if line == "" {
+			inTarget = false
+			continue
+		}
+
+		if line[0] == ' ' || line[0] == '\t' {
+			if inTarget && len(out) > 0 {
+				out[len(out)-1] += " " + strings.TrimSpace(line)
+			}
+			continue
+		}
+
+		colon := strings.IndexByte(line, ':')
+		if colon < 0 {
+			inTarget = false
+			continue
+		}
+		// No TrimSpace on the name: whitespace before the colon is not a valid
+		// header, and accepting it would honour a line the server itself did not.
+		if strings.EqualFold(line[:colon], fiber.HeaderXForwardedFor) {
+			inTarget = true
+			out = append(out, line[colon+1:])
+			continue
+		}
+		inTarget = false
+	}
+
+	return out
 }
 
 // parseHeaderIP parses one X-Forwarded-For element, tolerating the host:port and

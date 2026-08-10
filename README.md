@@ -296,7 +296,9 @@ resp, _ := http.DefaultClient.Do(req)
 
 - **API key authentication** with constant-time comparison (timing-attack resistant)
 - **Per-key scoping** — multiple revocable keys, each restricted server-side to specific organizations/collections ([Scoped API keys](#scoped-api-keys))
-- **IP whitelisting** with CIDR support + optional GitHub Actions IP auto-import
+- **IP whitelisting** with CIDR support + optional GitHub Actions IP auto-import. Whitelisting **fails closed**: once `ALLOWED_IPS` or `ENABLE_GITHUB_IP_RANGES` is set, a whitelist that ends up empty (a failed GitHub range fetch, say) denies every request rather than reverting to allow-all
+- **KDF parameters from the server are bounded both ways** — the prelogin response chooses how the master key is derived, and the password hash sent back to the server is derived from it, so a server answering with a token iteration count would receive a hash it could brute-force offline. Values below the floors official clients enforce are rejected, and absurd ones are refused rather than allowed to exhaust the process
+- **No unauthenticated cipher downgrade** — a type 0 (no-MAC) cipher string is refused under a key that carries a MAC key, so integrity protection cannot be stripped by relabelling the cipher string
 - **Rate limiting** (configurable via `RATE_LIMIT_MAX` / `RATE_LIMIT_WINDOW`, default 30/min per IP; whitelisted IPs are exempt)
 - **Read-only filesystem** in Docker (only `/tmp` writable)
 - **Non-root user** in container
@@ -322,6 +324,13 @@ $proxy_add_x_forwarded_for;` *appends* the address it saw, so everything to the
 left of that entry is client-written and ignored. Prepending
 `X-Forwarded-For: <whitelisted-ip>` to a request does not get it past the
 whitelist.
+
+The chain is read from the raw header block rather than the parsed header table,
+because fasthttp merges HTTP/1.1 chunked *request trailers* into that table and
+a trailer value lands after every genuine header — the one position the
+right-to-left walk trusts. Without that, a client behind a proxy that forwards
+trailers (HAProxy and Envoy do; nginx does not) could smuggle its chosen address
+past the whitelist in the trailer section of a chunked request.
 
 Two consequences worth knowing:
 
