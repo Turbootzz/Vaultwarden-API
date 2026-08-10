@@ -78,6 +78,7 @@ type SyncCipher struct {
 	CollectionIDs  []string    `json:"collectionIds"`
 	FolderID       *string     `json:"folderId"`
 	Name           string      `json:"name"`
+	DeletedDate    *string     `json:"deletedDate"`
 	Notes          *string     `json:"notes"`
 	Login          *SyncLogin  `json:"login"`
 	Card           *SyncCard   `json:"card"`
@@ -481,6 +482,13 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 	// Decrypt all ciphers.
 	items := make([]DecryptedItem, 0, len(syncResp.Ciphers))
 	for _, c := range syncResp.Ciphers {
+		// Soft-deleted (trashed) ciphers stay in the sync payload with a
+		// deletedDate; they must not be resolvable through the API (#20).
+		if c.DeletedDate != nil && strings.TrimSpace(*c.DeletedDate) != "" {
+			logger.Debug.Printf("Skipping trashed cipher %s", c.ID)
+			continue
+		}
+
 		// Select the correct decryption key.
 		decryptKey := key
 		if c.OrganizationID != nil && *c.OrganizationID != "" {

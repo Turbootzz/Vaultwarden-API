@@ -6,8 +6,12 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 const (
@@ -85,6 +89,61 @@ func mustEncryptType2Cipher(t *testing.T, plaintext string, key SymmetricKey) st
 		t.Fatalf("encryptType2Cipher: %v", err)
 	}
 	return s
+}
+
+// newSyncTestClient returns an APIClient in authenticated state pointed at a test server.
+func newSyncTestClient(t *testing.T, handler http.Handler) *APIClient {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	ac := NewAPIClient(srv.URL, "user@example.com", "password", "", "")
+	ac.accessToken = "test-token"
+	ac.refreshToken = "test-refresh-token"
+	ac.tokenExpiry = time.Now().Add(time.Hour)
+	ac.symKey = testUserKey()
+	return ac
+}
+
+func TestSync_SkipsTrashedCiphers(t *testing.T) {
+	userKey := testUserKey()
+	deleted := "2026-08-01T12:00:00.000000Z"
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		resp := SyncResponse{
+			Ciphers: []SyncCipher{
+				{
+					ID:   "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+					Type: CipherTypeLogin,
+					Name: mustEncryptType2Cipher(t, "active-item", userKey),
+				},
+				{
+					ID:          "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+					Type:        CipherTypeLogin,
+					Name:        mustEncryptType2Cipher(t, "trashed-item", userKey),
+					DeletedDate: &deleted,
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	items, _, err := ac.Sync()
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("Sync() returned %d items, want 1 (trashed cipher must be skipped)", len(items))
+	}
+	if items[0].Name != "active-item" {
+		t.Errorf("surviving item = %q, want active-item", items[0].Name)
+	}
 }
 
 func TestEmptySyncNameMaps(t *testing.T) {
