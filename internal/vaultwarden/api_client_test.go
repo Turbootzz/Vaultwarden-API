@@ -319,12 +319,15 @@ func TestSync_AllCiphersFailToDecryptReturnsError(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	items, _, _, err := ac.Sync()
+	items, _, failed, err := ac.Sync()
 	if err == nil {
 		t.Fatalf("Sync() returned %d items and no error; want an error when every cipher fails to decrypt", len(items))
 	}
 	if !strings.Contains(err.Error(), "decrypted 0 of 2") {
 		t.Errorf("error %q should report how many of the ciphers decrypted", err)
+	}
+	if len(failed) != 2 {
+		t.Errorf("failed ciphers = %v, want both reported alongside the error", failed)
 	}
 }
 
@@ -370,10 +373,11 @@ func TestSync_OrgCipherWithoutOrgKeyCountsAsFailure(t *testing.T) {
 	}
 }
 
-func TestSync_ReportsFailedCipherIDs(t *testing.T) {
+func TestSync_ReportsFailedCiphersWithPlacement(t *testing.T) {
 	userKey := testUserKey()
 	wrongKey := testOrgKey()
 	orgID := testOrgID
+	folderID := "  " + testFolderID + "  " // padded: placement must be normalized like decryptCipher does
 	deleted := "2026-08-01T12:00:00.000000Z"
 
 	const (
@@ -387,6 +391,7 @@ func TestSync_ReportsFailedCipherIDs(t *testing.T) {
 	badMACName := mustEncryptType2Cipher(t, "bad-mac-item", wrongKey)
 	orgName := mustEncryptType2Cipher(t, "org-item", userKey)
 	trashedName := mustEncryptType2Cipher(t, "trashed-item", userKey)
+	noIDName := mustEncryptType2Cipher(t, "no-id-item", wrongKey)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
@@ -395,9 +400,16 @@ func TestSync_ReportsFailedCipherIDs(t *testing.T) {
 			Profile: SyncProfile{Organizations: []SyncOrganization{{ID: orgID, Name: "Org"}}},
 			Ciphers: []SyncCipher{
 				{ID: okID, Type: CipherTypeLogin, Name: okName},
-				{ID: badMACID, Type: CipherTypeLogin, Name: badMACName},
-				{ID: orgItemID, Type: CipherTypeLogin, OrganizationID: &orgID, Name: orgName},
+				{ID: badMACID, Type: CipherTypeLogin, Name: badMACName, FolderID: &folderID},
+				{
+					ID:             orgItemID,
+					Type:           CipherTypeLogin,
+					OrganizationID: &orgID,
+					CollectionIDs:  []string{testCollectionID},
+					Name:           orgName,
+				},
 				{ID: trashedID, Type: CipherTypeLogin, Name: trashedName, DeletedDate: &deleted},
+				{ID: "", Type: CipherTypeLogin, Name: noIDName},
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -408,7 +420,7 @@ func TestSync_ReportsFailedCipherIDs(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	items, _, failedIDs, err := ac.Sync()
+	items, _, failed, err := ac.Sync()
 	if err != nil {
 		t.Fatalf("Sync() error: %v", err)
 	}
@@ -416,21 +428,35 @@ func TestSync_ReportsFailedCipherIDs(t *testing.T) {
 		t.Fatalf("Sync() returned %d items, want only %s", len(items), okID)
 	}
 
-	failed := make(map[string]bool, len(failedIDs))
-	for _, id := range failedIDs {
-		failed[id] = true
+	byID := make(map[string]FailedCipher, len(failed))
+	for _, f := range failed {
+		byID[f.ID] = f
 	}
-	if !failed[badMACID] {
-		t.Errorf("failed IDs %v should include the bad-MAC cipher %s", failedIDs, badMACID)
+	if _, ok := byID[badMACID]; !ok {
+		t.Errorf("failed ciphers %v should include the bad-MAC cipher %s", failed, badMACID)
 	}
-	if !failed[orgItemID] {
-		t.Errorf("failed IDs %v should include the org cipher with no usable org key %s", failedIDs, orgItemID)
+	if _, ok := byID[orgItemID]; !ok {
+		t.Errorf("failed ciphers %v should include the org cipher with no usable org key %s", failed, orgItemID)
 	}
-	if failed[trashedID] {
-		t.Errorf("failed IDs %v must not include the trashed cipher %s", failedIDs, trashedID)
+	if _, ok := byID[trashedID]; ok {
+		t.Errorf("failed ciphers %v must not include the trashed cipher %s", failed, trashedID)
 	}
-	if len(failedIDs) != 2 {
-		t.Errorf("failed IDs = %v, want exactly 2", failedIDs)
+	if _, ok := byID[""]; ok {
+		t.Errorf("failed ciphers %v must not include the cipher with an empty ID", failed)
+	}
+	if len(failed) != 2 {
+		t.Errorf("failed ciphers = %v, want exactly 2", failed)
+	}
+
+	if got := byID[badMACID].FolderID; got != testFolderID {
+		t.Errorf("bad-MAC cipher folder = %q, want the trimmed payload folder %q", got, testFolderID)
+	}
+	if got := byID[orgItemID].OrganizationID; got != orgID {
+		t.Errorf("org cipher organization = %q, want %q", got, orgID)
+	}
+	cols := byID[orgItemID].CollectionIDs
+	if len(cols) != 1 || cols[0] != testCollectionID {
+		t.Errorf("org cipher collections = %v, want [%s]", cols, testCollectionID)
 	}
 }
 

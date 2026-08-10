@@ -424,10 +424,35 @@ func LookupIDByName(idToName map[string]string, target string) (id string, ok bo
 	return matches[0], true
 }
 
+// FailedCipher identifies a cipher that failed to decrypt, carrying the placement the sync
+// payload reports for it in plaintext.
+type FailedCipher struct {
+	ID             string
+	OrganizationID string
+	FolderID       string
+	CollectionIDs  []string
+}
+
+// newFailedCipher records a decrypt failure with its current placement, normalized as decryptCipher does.
+func newFailedCipher(c SyncCipher) FailedCipher {
+	f := FailedCipher{ID: c.ID}
+	if c.OrganizationID != nil {
+		f.OrganizationID = strings.TrimSpace(*c.OrganizationID)
+	}
+	if c.FolderID != nil {
+		f.FolderID = strings.TrimSpace(*c.FolderID)
+	}
+	if len(c.CollectionIDs) > 0 {
+		f.CollectionIDs = append([]string(nil), c.CollectionIDs...)
+	}
+	return f
+}
+
 // Sync fetches and decrypts all vault items and returns them along with maps of decrypted
-// organization, folder, and collection names, plus the IDs of ciphers that failed to decrypt
-// (trashed ciphers are skipped, not failures).
-func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, []string, error) {
+// organization, folder, and collection names, plus the ciphers that failed to decrypt and
+// their current placement (trashed ciphers are skipped, not failures). The failure list is
+// also returned with the error raised when nothing decrypted.
+func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, []FailedCipher, error) {
 	if err := ac.EnsureValidToken(); err != nil {
 		return nil, emptySyncNameMaps(), nil, fmt.Errorf("ensure valid token: %w", err)
 	}
@@ -519,7 +544,7 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, []string, error) {
 
 	// Decrypt all ciphers.
 	items := make([]DecryptedItem, 0, len(syncResp.Ciphers))
-	var failedIDs []string
+	var failed []FailedCipher
 	for _, c := range syncResp.Ciphers {
 		// Trashed ciphers stay in the sync payload; they must not resolve (#20).
 		if c.DeletedDate != nil && strings.TrimSpace(*c.DeletedDate) != "" {
@@ -534,7 +559,9 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, []string, error) {
 				decryptKey = orgKey
 			} else {
 				logger.Debug.Printf("No org key for cipher %s (org %s), skipping", c.ID, *c.OrganizationID)
-				failedIDs = append(failedIDs, c.ID)
+				if c.ID != "" {
+					failed = append(failed, newFailedCipher(c))
+				}
 				continue
 			}
 		}
@@ -542,7 +569,9 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, []string, error) {
 		item, err := decryptCipher(c, decryptKey)
 		if err != nil {
 			logger.Debug.Printf("Failed to decrypt cipher %s: %v", c.ID, err)
-			failedIDs = append(failedIDs, c.ID)
+			if c.ID != "" {
+				failed = append(failed, newFailedCipher(c))
+			}
 			continue
 		}
 		items = append(items, item)
@@ -550,10 +579,10 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, []string, error) {
 
 	// Nothing decrypted while ciphers failed means a broken key, not an empty vault:
 	// succeeding here would let syncVault replace a healthy cache with an empty one.
-	if len(items) == 0 && len(failedIDs) > 0 {
-		return nil, emptySyncNameMaps(), nil, fmt.Errorf(
+	if len(items) == 0 && len(failed) > 0 {
+		return nil, emptySyncNameMaps(), failed, fmt.Errorf(
 			"sync decrypted 0 of %d ciphers (%d failures), refusing to replace cache",
-			len(syncResp.Ciphers), len(failedIDs))
+			len(syncResp.Ciphers), len(failed))
 	}
 
 	logger.Info.Printf("Synced and decrypted %d vault items", len(items))
@@ -567,7 +596,7 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, []string, error) {
 		len(syncResp.Collections),
 	)
 
-	return items, nameMaps, failedIDs, nil
+	return items, nameMaps, failed, nil
 }
 
 // DecryptedItem is a decrypted vault item ready for cache lookup.
