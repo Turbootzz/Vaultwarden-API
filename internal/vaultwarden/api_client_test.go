@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -299,6 +300,228 @@ func TestSync_401ReauthAlsoFailsReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "re-authentication failed") {
 		t.Errorf("error %q should mention re-authentication failure", err)
+	}
+}
+
+func TestSync_AllCiphersFailToDecryptReturnsError(t *testing.T) {
+	// The payload is encrypted under a key the client does not hold (stand-in for a
+	// rotated/wrong account key). Every cipher fails its MAC check, so Sync must
+	// report failure instead of handing syncVault an empty item set that would
+	// wholesale-replace a healthy cache — a silent vault outage.
+	wrongKey := testOrgKey()
+	nameA := mustEncryptType2Cipher(t, "item-a", wrongKey)
+	nameB := mustEncryptType2Cipher(t, "item-b", wrongKey)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		resp := SyncResponse{
+			Ciphers: []SyncCipher{
+				{ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", Type: CipherTypeLogin, Name: nameA},
+				{ID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Type: CipherTypeLogin, Name: nameB},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	items, _, err := ac.Sync()
+	if err == nil {
+		t.Fatalf("Sync() returned %d items and no error; want an error when every cipher fails to decrypt", len(items))
+	}
+	if !strings.Contains(err.Error(), "decrypted 0 of 2") {
+		t.Errorf("error %q should report how many of the ciphers decrypted", err)
+	}
+}
+
+func TestSync_OnlyTrashedCiphersSyncsEmpty(t *testing.T) {
+	// A vault whose every item is in the trash is genuinely empty, not broken:
+	// trashed skips are not decrypt failures, so Sync must still succeed.
+	userKey := testUserKey()
+	deleted := "2026-08-01T12:00:00.000000Z"
+	trashedName := mustEncryptType2Cipher(t, "trashed-item", userKey)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		resp := SyncResponse{
+			Ciphers: []SyncCipher{
+				{
+					ID:          "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+					Type:        CipherTypeLogin,
+					Name:        trashedName,
+					DeletedDate: &deleted,
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	items, _, err := ac.Sync()
+	if err != nil {
+		t.Fatalf("Sync() error: %v (an all-trashed vault is empty, not failed)", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("Sync() returned %d items, want 0", len(items))
+	}
+}
+
+func TestSync_RetryStill401ForcesReauthOnNextAttempt(t *testing.T) {
+	// The refresh grant happily mints a token the API still rejects (e.g. the
+	// session was revoked server-side). Without forcing the issue, tokenExpiry
+	// stays an hour out, EnsureValidToken no-ops every tick, and the cache goes
+	// stale forever.
+	var syncCalls, refreshCalls, preloginCalls int
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		syncCalls++
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	mux.HandleFunc("/identity/accounts/prelogin", func(w http.ResponseWriter, r *http.Request) {
+		preloginCalls++
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/identity/connect/token", func(w http.ResponseWriter, r *http.Request) {
+		refreshCalls++
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken:  "refreshed-but-rejected-token",
+			ExpiresIn:    3600,
+			TokenType:    "Bearer",
+			RefreshToken: "another-refresh-token",
+		}); err != nil {
+			t.Errorf("encode token response: %v", err)
+		}
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	_, _, err := ac.Sync()
+	if err == nil {
+		t.Fatal("Sync() expected error")
+	}
+	if !strings.Contains(err.Error(), "forcing re-auth on next attempt") {
+		t.Errorf("error %q should say the next attempt is forced to re-authenticate", err)
+	}
+	ac.mu.RLock()
+	expiry := ac.tokenExpiry
+	ac.mu.RUnlock()
+	if !expiry.IsZero() {
+		t.Errorf("tokenExpiry = %v, want zero so EnsureValidToken re-runs the recovery ladder", expiry)
+	}
+	if syncCalls != 2 {
+		t.Errorf("sync calls = %d, want 2 (one 401, one retry — no extra retry loops)", syncCalls)
+	}
+	if refreshCalls != 1 {
+		t.Errorf("token endpoint calls = %d, want 1 (refresh succeeded, so no in-flight re-auth)", refreshCalls)
+	}
+	if preloginCalls != 0 {
+		t.Errorf("prelogin calls = %d, want 0 (recovery is deferred to the next attempt)", preloginCalls)
+	}
+}
+
+func TestRefreshAccessToken_EmptyAccessTokenIsError(t *testing.T) {
+	// HTTP 200 with no access_token must not be reported as success: that stores an
+	// empty bearer token and hides the failure from the 401 re-auth fallback.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/identity/connect/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write([]byte(`{}`)); err != nil {
+			t.Errorf("write token response: %v", err)
+		}
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	if err := ac.RefreshAccessToken(); err == nil {
+		t.Fatal("RefreshAccessToken() expected error for a 200 response with an empty access_token")
+	}
+
+	ac.mu.RLock()
+	token := ac.accessToken
+	ac.mu.RUnlock()
+	if token != "test-token" {
+		t.Errorf("accessToken = %q, want the prior token left untouched", token)
+	}
+}
+
+func TestDoTokenRequest_EmptyAccessTokenIsError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/identity/connect/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write([]byte(`{"expires_in":3600,"token_type":"Bearer"}`)); err != nil {
+			t.Errorf("write token response: %v", err)
+		}
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	if _, err := ac.doTokenRequest(url.Values{"grant_type": {"password"}}); err == nil {
+		t.Fatal("doTokenRequest() expected error for a 200 response with an empty access_token")
+	}
+}
+
+func TestAuthenticate_ProfileKeyFailureLeavesPriorStateIntact(t *testing.T) {
+	const testKDFIterations = 10000 // low on purpose: keeps the test fast
+
+	// API key login: the token response carries no Key, so the symmetric key comes
+	// from the profile. If that fetch fails, Authenticate must publish nothing —
+	// a half-applied login (new token, old symKey) decrypts nothing after a key
+	// rotation and looks like an empty vault.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/identity/accounts/prelogin", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(PreloginResponse{KDF: KdfPBKDF2, KDFIterations: testKDFIterations}); err != nil {
+			t.Errorf("encode prelogin response: %v", err)
+		}
+	})
+	mux.HandleFunc("/identity/connect/token", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(TokenResponse{
+			AccessToken:  "half-applied-token",
+			ExpiresIn:    3600,
+			TokenType:    "Bearer",
+			RefreshToken: "half-applied-refresh-token",
+		}); err != nil {
+			t.Errorf("encode token response: %v", err)
+		}
+	})
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	ac := NewAPIClient(srv.URL, "user@example.com", "password", "client-id", "client-secret")
+	priorExpiry := time.Now().Add(time.Hour)
+	ac.accessToken = "old-token"
+	ac.refreshToken = "old-refresh-token"
+	ac.tokenExpiry = priorExpiry
+	ac.symKey = testUserKey()
+
+	if err := ac.Authenticate(); err == nil {
+		t.Fatal("Authenticate() expected error when the profile key fetch fails")
+	}
+
+	ac.mu.RLock()
+	defer ac.mu.RUnlock()
+	if ac.accessToken != "old-token" {
+		t.Errorf("accessToken = %q, want old-token (failed login must not publish)", ac.accessToken)
+	}
+	if ac.refreshToken != "old-refresh-token" {
+		t.Errorf("refreshToken = %q, want old-refresh-token (failed login must not publish)", ac.refreshToken)
+	}
+	if !ac.tokenExpiry.Equal(priorExpiry) {
+		t.Errorf("tokenExpiry = %v, want %v (failed login must not publish)", ac.tokenExpiry, priorExpiry)
 	}
 }
 
