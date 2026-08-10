@@ -115,6 +115,11 @@ func TestSync_SkipsTrashedCiphers(t *testing.T) {
 	userKey := testUserKey()
 	deleted := "2026-08-01T12:00:00.000000Z"
 
+	// Encrypt on the test goroutine: mustEncryptType2Cipher can call t.Fatalf, and
+	// FailNow from a handler goroutine is undefined behaviour.
+	activeName := mustEncryptType2Cipher(t, "active-item", userKey)
+	trashedName := mustEncryptType2Cipher(t, "trashed-item", userKey)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
 		resp := SyncResponse{
@@ -122,12 +127,12 @@ func TestSync_SkipsTrashedCiphers(t *testing.T) {
 				{
 					ID:   "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
 					Type: CipherTypeLogin,
-					Name: mustEncryptType2Cipher(t, "active-item", userKey),
+					Name: activeName,
 				},
 				{
 					ID:          "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
 					Type:        CipherTypeLogin,
-					Name:        mustEncryptType2Cipher(t, "trashed-item", userKey),
+					Name:        trashedName,
 					DeletedDate: &deleted,
 				},
 			},

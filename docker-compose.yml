@@ -19,7 +19,6 @@ services:
       - TRUSTED_PROXY_IP=${TRUSTED_PROXY_IP}
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
       - SYNC_INTERVAL=${SYNC_INTERVAL:-5m}
-      - CACHE_TTL=5m
       - READ_TIMEOUT=10s
       - WRITE_TIMEOUT=10s
     read_only: true
