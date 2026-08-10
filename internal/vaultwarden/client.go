@@ -35,6 +35,10 @@ type Client struct {
 	// nameMaps from the last successful sync (for resolving filter names to UUIDs).
 	nameMaps SyncNameMaps
 
+	// retained counts entries the last sync kept from the previous cache because
+	// their cipher would not decrypt.
+	retained int
+
 	stopSync chan struct{}
 
 	// ctx is cancelled by Stop so an in-flight vault request is abandoned at
@@ -290,6 +294,7 @@ func (c *Client) syncVault() error {
 		c.mu.Lock()
 		retained := retainFailedCiphers(newItems, c.items, failed)
 		c.items = newItems
+		c.retained = retained
 		c.mu.Unlock()
 
 		logger.Warn.Printf(
@@ -312,6 +317,7 @@ func (c *Client) syncVault() error {
 	retained := retainFailedCiphers(newItems, c.items, failed)
 	c.items = newItems
 	c.nameMaps = nameMaps
+	c.retained = retained
 	c.mu.Unlock()
 
 	if len(failed) > 0 {
@@ -321,6 +327,14 @@ func (c *Client) syncVault() error {
 	}
 
 	return nil
+}
+
+// retainedCount reports how many entries the last sync served from the previous
+// cache because their cipher would not decrypt.
+func (c *Client) retainedCount() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.retained
 }
 
 // syncFailureEscalationThreshold is the consecutive background-sync failure count at which the log escalates to error.
@@ -337,6 +351,7 @@ func (c *Client) backgroundSync() {
 	defer ticker.Stop()
 
 	consecutiveFailures := 0
+	consecutivePartial := 0
 	for {
 		select {
 		case <-ticker.C:
@@ -349,6 +364,21 @@ func (c *Client) backgroundSync() {
 				}
 			} else {
 				consecutiveFailures = 0
+				// A sync that decrypted something still succeeds even when some
+				// ciphers failed, so the counter above never sees a vault that is
+				// permanently half-readable — say after this account lost access to
+				// a collection. Those are tracked separately so the condition still
+				// escalates out of Warn instead of repeating forever (#28).
+				if n := c.retainedCount(); n > 0 {
+					consecutivePartial++
+					if shouldEscalateSyncFailure(consecutivePartial) {
+						logger.Error.Printf(
+							"Background sync has served %d cipher(s) from a stale cache for %d syncs in a row; they may no longer be readable by this account",
+							n, consecutivePartial)
+					}
+				} else {
+					consecutivePartial = 0
+				}
 				logger.Debug.Println("Background vault sync completed")
 			}
 		case <-c.stopSync:

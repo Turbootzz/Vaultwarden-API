@@ -632,3 +632,131 @@ func TestStop_IsIdempotent(t *testing.T) {
 	c.Stop()
 	c.Stop() // must not panic on a second close
 }
+
+// Regression for #28: a cipher whose name decrypted but whose password did not
+// used to replace a good cache entry, and the caller got HTTP 200 with an empty
+// value. It must count as a failed cipher so the retain path keeps the last
+// known good plaintext.
+func TestSyncVault_FieldDecryptFailureRetainsLastKnownGood(t *testing.T) {
+	userKey := testUserKey()
+	wrongKey := testOrgKey()
+	const id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+	name := mustEncryptType2Cipher(t, "DB_PASSWORD", userKey)
+	password := mustEncryptType2Cipher(t, "rotated-password", wrongKey)
+
+	// A healthy cipher alongside it, so the sync partially succeeds — the case
+	// #28 describes. A vault where nothing decrypts is already refused outright.
+	const healthyID = "99999999-9999-4999-8999-999999999999"
+	healthyName := mustEncryptType2Cipher(t, "OTHER_SECRET", userKey)
+	healthyPassword := mustEncryptType2Cipher(t, "fine", userKey)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		resp := SyncResponse{Ciphers: []SyncCipher{
+			{ID: id, Type: CipherTypeLogin, Name: name, Login: &SyncLogin{Password: &password}},
+			{ID: healthyID, Type: CipherTypeLogin, Name: healthyName, Login: &SyncLogin{Password: &healthyPassword}},
+		}}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode: %v", err)
+		}
+	})
+
+	old := map[string]DecryptedItem{id: {ID: id, Name: "DB_PASSWORD", Password: "good-cached-value"}}
+	c := NewClient(newSyncTestClient(t, mux), time.Hour, WithState(old, emptySyncNameMaps()))
+
+	if err := c.syncVault(); err != nil {
+		t.Fatalf("syncVault: %v", err)
+	}
+
+	got, err := c.GetSecret("DB_PASSWORD", SecretFilter{})
+	if err != nil {
+		t.Fatalf("GetSecret: %v", err)
+	}
+	if got == "" {
+		t.Fatal("served an empty secret; the undecryptable cipher overwrote the cached value")
+	}
+	if got != "good-cached-value" {
+		t.Errorf("GetSecret = %q, want the retained %q", got, "good-cached-value")
+	}
+	if n := c.retainedCount(); n != 1 {
+		t.Errorf("retainedCount = %d, want 1", n)
+	}
+	// The healthy cipher is unaffected.
+	if got, err := c.GetSecret("OTHER_SECRET", SecretFilter{}); err != nil || got != "fine" {
+		t.Errorf("healthy cipher = %q, %v; want %q, nil", got, err, "fine")
+	}
+}
+
+// A linked field carries a plaintext field reference, not a cipher string, so it
+// must not be mistaken for a decrypt failure and condemn the whole cipher.
+func TestSyncVault_LinkedFieldIsNotADecryptFailure(t *testing.T) {
+	userKey := testUserKey()
+	const id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+	name := mustEncryptType2Cipher(t, "APP_SECRET", userKey)
+	password := mustEncryptType2Cipher(t, "still-readable", userKey)
+	linkedName := mustEncryptType2Cipher(t, "linked", userKey)
+	linkedValue := "100" // plaintext field reference
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		resp := SyncResponse{Ciphers: []SyncCipher{{
+			ID: id, Type: CipherTypeLogin, Name: name,
+			Login:  &SyncLogin{Password: &password},
+			Fields: []SyncField{{Name: &linkedName, Value: &linkedValue, Type: FieldTypeLinked}},
+		}}}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode: %v", err)
+		}
+	})
+
+	c := NewClient(newSyncTestClient(t, mux), time.Hour)
+	if err := c.syncVault(); err != nil {
+		t.Fatalf("syncVault: %v", err)
+	}
+	got, err := c.GetSecret("APP_SECRET", SecretFilter{})
+	if err != nil {
+		t.Fatalf("GetSecret: %v", err)
+	}
+	if got != "still-readable" {
+		t.Errorf("GetSecret = %q, want %q", got, "still-readable")
+	}
+	if n := c.retainedCount(); n != 0 {
+		t.Errorf("retainedCount = %d, want 0 — a linked field is not a decrypt failure", n)
+	}
+}
+
+// A username that will not decrypt is not served as a secret, so it must not
+// condemn a cipher whose password is fine.
+func TestSyncVault_UsernameFailureIsNotFatal(t *testing.T) {
+	userKey := testUserKey()
+	wrongKey := testOrgKey()
+	const id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+
+	name := mustEncryptType2Cipher(t, "APP_SECRET", userKey)
+	password := mustEncryptType2Cipher(t, "readable", userKey)
+	username := mustEncryptType2Cipher(t, "who", wrongKey)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		resp := SyncResponse{Ciphers: []SyncCipher{{
+			ID: id, Type: CipherTypeLogin, Name: name,
+			Login: &SyncLogin{Password: &password, Username: &username},
+		}}}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode: %v", err)
+		}
+	})
+
+	c := NewClient(newSyncTestClient(t, mux), time.Hour)
+	if err := c.syncVault(); err != nil {
+		t.Fatalf("syncVault: %v", err)
+	}
+	if got, err := c.GetSecret("APP_SECRET", SecretFilter{}); err != nil || got != "readable" {
+		t.Errorf("GetSecret = %q, %v; want %q, nil", got, err, "readable")
+	}
+}
