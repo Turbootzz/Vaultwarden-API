@@ -29,8 +29,7 @@ type Config struct {
 	EnableGitHubIPRanges bool
 
 	// Vaultwarden
-	VaultwardenURL   string
-	VaultwardenToken string
+	VaultwardenURL string
 
 	// Performance
 	CORSAllowedOrigins string
@@ -46,8 +45,7 @@ func Load() (*Config, error) {
 		Port:        getEnv("API_PORT", "8080"),
 		Environment: getEnv("ENVIRONMENT", "development"),
 
-		VaultwardenURL:   os.Getenv("VAULTWARDEN_URL"),
-		VaultwardenToken: os.Getenv("VAULTWARDEN_ACCESS_TOKEN"),
+		VaultwardenURL: os.Getenv("VAULTWARDEN_URL"),
 
 		ReadTimeout:        parseDuration(os.Getenv("READ_TIMEOUT"), "10s"),
 		WriteTimeout:       parseDuration(os.Getenv("WRITE_TIMEOUT"), "10s"),
