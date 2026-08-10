@@ -206,13 +206,10 @@ func (c *Client) syncVault() error {
 	return nil
 }
 
-// syncFailureEscalationThreshold is the number of consecutive background-sync
-// failures after which the warning escalates to an error, so a dead sync loop
-// (stale cache) is visible in default log levels.
+// syncFailureEscalationThreshold is the consecutive background-sync failure count at which the log escalates to error.
 const syncFailureEscalationThreshold = 3
 
-// shouldEscalateSyncFailure reports whether a run of consecutive background-sync
-// failures has reached the threshold where the log level escalates to error.
+// shouldEscalateSyncFailure reports whether consecutive sync failures have reached the escalation threshold.
 func shouldEscalateSyncFailure(consecutiveFailures int) bool {
 	return consecutiveFailures >= syncFailureEscalationThreshold
 }

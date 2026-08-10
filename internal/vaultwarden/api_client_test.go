@@ -57,7 +57,6 @@ func encryptType2Cipher(plaintext string, key SymmetricKey) (string, error) {
 }
 
 // encryptType2CipherBytes builds a Bitwarden type-2 cipher string over raw bytes.
-// Used for payloads that are not text, such as the 64-byte enc||mac symmetric key blob.
 func encryptType2CipherBytes(data []byte, key SymmetricKey) (string, error) {
 	padLen := aes.BlockSize - (len(data) % aes.BlockSize)
 	padded := make([]byte, len(data)+padLen)
@@ -118,8 +117,7 @@ func TestSync_SkipsTrashedCiphers(t *testing.T) {
 	userKey := testUserKey()
 	deleted := "2026-08-01T12:00:00.000000Z"
 
-	// Encrypt on the test goroutine: mustEncryptType2Cipher can call t.Fatalf, and
-	// FailNow from a handler goroutine is undefined behaviour.
+	// Encrypt here, not in the handler: t.Fatalf from a handler goroutine is undefined.
 	activeName := mustEncryptType2Cipher(t, "active-item", userKey)
 	trashedName := mustEncryptType2Cipher(t, "trashed-item", userKey)
 
@@ -163,17 +161,11 @@ func TestSync_SkipsTrashedCiphers(t *testing.T) {
 func TestSync_401RefreshFailsFallsBackToFullReauth(t *testing.T) {
 	const testKDFIterations = 10000 // low on purpose: keeps the test fast
 
-	// The re-authentication hands back a symmetric key that differs from the one
-	// newSyncTestClient seeded (testUserKey), standing in for an account key rotation.
-	// Sync() must decrypt the retried payload with this fresh key, not with the
-	// snapshot it took before the 401 — otherwise every cipher fails its HMAC and
-	// Sync silently returns an empty vault.
+	// Stands in for a key rotation: Sync must retry with this key, not the pre-401 snapshot.
 	rotatedKey := testOrgKey()
 	cipherName := mustEncryptType2Cipher(t, "after-reauth", rotatedKey)
 
-	// Build the encrypted symmetric key the password grant hands back: the raw
-	// enc||mac blob (64 bytes) as a type-2 cipher under the stretched master key,
-	// which is exactly what DecryptSymmetricKey unwraps.
+	// The enc||mac blob under the stretched master key is what DecryptSymmetricKey unwraps.
 	masterKey, err := MakeMasterKey("password", "user@example.com", KdfPBKDF2, testKDFIterations, nil, nil)
 	if err != nil {
 		t.Fatalf("MakeMasterKey: %v", err)
@@ -306,10 +298,7 @@ func TestSync_401ReauthAlsoFailsReturnsError(t *testing.T) {
 }
 
 func TestSync_AllCiphersFailToDecryptReturnsError(t *testing.T) {
-	// The payload is encrypted under a key the client does not hold (stand-in for a
-	// rotated/wrong account key). Every cipher fails its MAC check, so Sync must
-	// report failure instead of handing syncVault an empty item set that would
-	// wholesale-replace a healthy cache — a silent vault outage.
+	// Encrypted under a key the client does not hold, so every cipher fails its MAC check.
 	wrongKey := testOrgKey()
 	nameA := mustEncryptType2Cipher(t, "item-a", wrongKey)
 	nameB := mustEncryptType2Cipher(t, "item-b", wrongKey)
@@ -340,15 +329,8 @@ func TestSync_AllCiphersFailToDecryptReturnsError(t *testing.T) {
 }
 
 func TestSync_OrgCipherWithoutOrgKeyCountsAsFailure(t *testing.T) {
-	// The account belongs to an organization but the profile carries no private key,
-	// so no org key can be derived and every org-owned cipher is skipped. Those skips
-	// are failures, not deliberate omissions like trashed items: a vault whose items
-	// are all org-owned must report an error rather than hand syncVault an empty item
-	// set that would replace a healthy cache.
-	//
-	// The name is encrypted under the *user* key on purpose. It would decrypt fine if
-	// the cipher were ever attempted with it, so this test only stays green while the
-	// org-key-missing path both skips the cipher and counts it as a failure.
+	// No profile private key, so no org key can be derived. The name is encrypted under
+	// the *user* key on purpose: it would decrypt fine if the cipher were ever attempted.
 	userKey := testUserKey()
 	orgID := testOrgID
 	orgName := mustEncryptType2Cipher(t, "org-item", userKey)
@@ -389,8 +371,7 @@ func TestSync_OrgCipherWithoutOrgKeyCountsAsFailure(t *testing.T) {
 }
 
 func TestSync_OnlyTrashedCiphersSyncsEmpty(t *testing.T) {
-	// A vault whose every item is in the trash is genuinely empty, not broken:
-	// trashed skips are not decrypt failures, so Sync must still succeed.
+	// An all-trashed vault is empty, not broken: trashed skips are not decrypt failures.
 	userKey := testUserKey()
 	deleted := "2026-08-01T12:00:00.000000Z"
 	trashedName := mustEncryptType2Cipher(t, "trashed-item", userKey)
@@ -425,10 +406,7 @@ func TestSync_OnlyTrashedCiphersSyncsEmpty(t *testing.T) {
 }
 
 func TestSync_RetryStill401ForcesReauthOnNextAttempt(t *testing.T) {
-	// The refresh grant happily mints a token the API still rejects (e.g. the
-	// session was revoked server-side). Without forcing the issue, tokenExpiry
-	// stays an hour out, EnsureValidToken no-ops every tick, and the cache goes
-	// stale forever.
+	// The refresh grant mints a token the API still rejects (revoked session).
 	var syncCalls, refreshCalls, preloginCalls int
 
 	mux := http.NewServeMux()
@@ -480,10 +458,6 @@ func TestSync_RetryStill401ForcesReauthOnNextAttempt(t *testing.T) {
 }
 
 func TestSync_ConcurrentRenewalRunsOneLogin(t *testing.T) {
-	// The background sync ticker and a manual POST /refresh (ClearCache ->
-	// syncVault -> Sync) can meet the same dead token at the same moment. Both
-	// then walk the renewal ladder, and unserialized that is two logins against
-	// the identity endpoint for one dead token.
 	const staleToken = "test-token" // what newSyncTestClient seeds
 	const renewedToken = "renewed-token"
 	const callers = 2
@@ -494,10 +468,8 @@ func TestSync_ConcurrentRenewalRunsOneLogin(t *testing.T) {
 	var mu sync.Mutex
 	var tokenCalls, syncCalls, staleSyncCalls int
 
-	// Hold every caller at the 401 until all of them have seen it. That is the
-	// interleaving this test is about: two callers observing the same dead token.
-	// Without the barrier the first could finish renewing before the second even
-	// sends its request, and the test would pass while proving nothing.
+	// Barrier: hold every caller at the 401 until all have seen it, so they really do
+	// observe the same dead token concurrently.
 	release := make(chan struct{})
 
 	mux := http.NewServeMux()
@@ -597,8 +569,7 @@ func TestSync_ConcurrentRenewalRunsOneLogin(t *testing.T) {
 }
 
 func TestRefreshAccessToken_EmptyAccessTokenIsError(t *testing.T) {
-	// HTTP 200 with no access_token must not be reported as success: that stores an
-	// empty bearer token and hides the failure from the 401 re-auth fallback.
+	// A 200 with no access_token must not be success: it would store an empty bearer token.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/identity/connect/token", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -640,10 +611,8 @@ func TestDoTokenRequest_EmptyAccessTokenIsError(t *testing.T) {
 func TestAuthenticate_ProfileKeyFailureLeavesPriorStateIntact(t *testing.T) {
 	const testKDFIterations = 10000 // low on purpose: keeps the test fast
 
-	// API key login: the token response carries no Key, so the symmetric key comes
-	// from the profile. If that fetch fails, Authenticate must publish nothing —
-	// a half-applied login (new token, old symKey) decrypts nothing after a key
-	// rotation and looks like an empty vault.
+	// API key login carries no Key, so the profile fetch supplies it; when that fails,
+	// a half-applied login (new token, old symKey) would decrypt nothing.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/identity/accounts/prelogin", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -691,8 +660,7 @@ func TestAuthenticate_ProfileKeyFailureLeavesPriorStateIntact(t *testing.T) {
 	if !ac.tokenExpiry.Equal(priorExpiry) {
 		t.Errorf("tokenExpiry = %v, want %v (failed login must not publish)", ac.tokenExpiry, priorExpiry)
 	}
-	// The symmetric key is the other half of "new token, old symKey": the token
-	// fields staying put is only meaningful if the key did too.
+	// The token fields staying put is only meaningful if the key did too.
 	priorKey := testUserKey()
 	if !bytes.Equal(ac.symKey.EncKey, priorKey.EncKey) {
 		t.Error("symKey.EncKey changed, want the prior key left untouched (failed login must not publish)")
