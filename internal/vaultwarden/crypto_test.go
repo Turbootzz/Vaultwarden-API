@@ -544,7 +544,7 @@ func TestDecryptOrgKey_RoundTrip(t *testing.T) {
 	// Create a 64-byte org key (32 enc + 32 mac).
 	orgKeyPlain := make([]byte, 64)
 	for i := 0; i < 32; i++ {
-		orgKeyPlain[i] = byte(i)      // encKey
+		orgKeyPlain[i] = byte(i)         // encKey
 		orgKeyPlain[32+i] = byte(i + 64) // macKey
 	}
 

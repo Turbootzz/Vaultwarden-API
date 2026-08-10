@@ -1,8 +1,12 @@
 package vaultwarden
 
 import (
+	"encoding/json"
+	"maps"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewClient_withState(t *testing.T) {
@@ -116,6 +120,237 @@ func TestMatchesSecretFilter_PersonalItemExcludedByOrgScope(t *testing.T) {
 	}
 	if !matchesSecretFilter(personal, SecretFilter{}) {
 		t.Error("personal item should match an empty (full-access) scope")
+	}
+}
+
+func TestSyncVault_RetainsCachedEntriesForFailedCiphers(t *testing.T) {
+	userKey := testUserKey()
+	wrongKey := testOrgKey()
+
+	const (
+		updatedID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" // decrypts: cache entry replaced
+		failedID  = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" // fails to decrypt: old entry retained
+		removedID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc" // absent from the payload: dropped
+		trashedID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd" // trashed in the payload: dropped (#20)
+	)
+
+	freshName := mustEncryptType2Cipher(t, "api-key-v2", userKey)
+	unreadableName := mustEncryptType2Cipher(t, "org-secret", wrongKey)
+	trashedName := mustEncryptType2Cipher(t, "trashed-item", userKey)
+	deleted := "2026-08-01T12:00:00.000000Z"
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		resp := SyncResponse{
+			Ciphers: []SyncCipher{
+				{ID: updatedID, Type: CipherTypeLogin, Name: freshName},
+				{ID: failedID, Type: CipherTypeLogin, Name: unreadableName},
+				{ID: trashedID, Type: CipherTypeLogin, Name: trashedName, DeletedDate: &deleted},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+
+	old := map[string]DecryptedItem{
+		updatedID: {ID: updatedID, Name: "api-key-v1", Password: "old"},
+		failedID:  {ID: failedID, Name: "org-secret", Password: "stale-but-present"},
+		removedID: {ID: removedID, Name: "removed-item", Password: "gone"},
+		trashedID: {ID: trashedID, Name: "trashed-item", Password: "trashed"},
+	}
+	c := NewClient(newSyncTestClient(t, mux), time.Hour, WithState(old, emptySyncNameMaps()))
+
+	if err := c.syncVault(); err != nil {
+		t.Fatalf("syncVault() error: %v", err)
+	}
+
+	c.mu.RLock()
+	got := maps.Clone(c.items)
+	c.mu.RUnlock()
+
+	if len(got) != 2 {
+		t.Fatalf("cache holds %d items, want 2: %+v", len(got), got)
+	}
+	if got[failedID].Password != "stale-but-present" {
+		t.Errorf("failed cipher %s = %+v, want the old cached entry retained", failedID, got[failedID])
+	}
+	if got[updatedID].Name != "api-key-v2" {
+		t.Errorf("decrypted cipher %s name = %q, want api-key-v2", updatedID, got[updatedID].Name)
+	}
+	if _, ok := got[removedID]; ok {
+		t.Errorf("cipher %s is absent from the payload and must be dropped", removedID)
+	}
+	if _, ok := got[trashedID]; ok {
+		t.Errorf("cipher %s is trashed in the payload and must be dropped, not retained (#20)", trashedID)
+	}
+}
+
+func TestSyncVault_RefreshesPlacementOnRetainedEntry(t *testing.T) {
+	userKey := testUserKey()
+	wrongKey := testOrgKey()
+
+	const (
+		okID            = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+		movedID         = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+		newFolderID     = "99999999-9999-4999-8999-999999999999"
+		newCollectionID = "55555555-5555-4555-8555-555555555555"
+	)
+
+	okName := mustEncryptType2Cipher(t, "ok-item", userKey)
+	unreadableName := mustEncryptType2Cipher(t, "moved-secret", wrongKey)
+
+	// Placement is plaintext in the payload even when the cipher body cannot be decrypted.
+	newOrgID := testOrgID2
+	newFolder := newFolderID
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		resp := SyncResponse{
+			Ciphers: []SyncCipher{
+				{ID: okID, Type: CipherTypeLogin, Name: okName},
+				{
+					ID:             movedID,
+					Type:           CipherTypeLogin,
+					Name:           unreadableName,
+					OrganizationID: &newOrgID,
+					CollectionIDs:  []string{newCollectionID},
+					FolderID:       &newFolder,
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+
+	old := map[string]DecryptedItem{
+		movedID: {
+			ID:             movedID,
+			Name:           "moved-secret",
+			Password:       "stale-but-present",
+			OrganizationID: testOrgID,
+			CollectionIDs:  []string{testCollectionID},
+			FolderID:       testFolderID,
+		},
+	}
+	c := NewClient(newSyncTestClient(t, mux), time.Hour, WithState(old, emptySyncNameMaps()))
+
+	if err := c.syncVault(); err != nil {
+		t.Fatalf("syncVault() error: %v", err)
+	}
+
+	c.mu.RLock()
+	got := maps.Clone(c.items)
+	c.mu.RUnlock()
+
+	retained, ok := got[movedID]
+	if !ok {
+		t.Fatalf("cipher %s should be retained from the previous cache", movedID)
+	}
+	if retained.Password != "stale-but-present" {
+		t.Errorf("retained entry password = %q, want the stale cached value", retained.Password)
+	}
+	if retained.OrganizationID != testOrgID2 {
+		t.Errorf("retained entry org = %q, want the payload org %q", retained.OrganizationID, testOrgID2)
+	}
+	if retained.FolderID != newFolderID {
+		t.Errorf("retained entry folder = %q, want the payload folder %q", retained.FolderID, newFolderID)
+	}
+	if len(retained.CollectionIDs) != 1 || retained.CollectionIDs[0] != newCollectionID {
+		t.Errorf("retained entry collections = %v, want [%s]", retained.CollectionIDs, newCollectionID)
+	}
+	if matchesSecretFilter(retained, SecretFilter{OrganizationIDs: []string{testOrgID}}) {
+		t.Error("retained entry must not be reachable through its stale organization scope")
+	}
+	if !matchesSecretFilter(retained, SecretFilter{OrganizationIDs: []string{testOrgID2}}) {
+		t.Error("retained entry must be reachable through its current organization scope")
+	}
+	if matchesSecretFilter(retained, SecretFilter{CollectionIDs: []string{testCollectionID}}) {
+		t.Error("retained entry must not be reachable through its stale collection scope")
+	}
+}
+
+func TestSyncVault_RefreshesPlacementWhenEveryCipherFailsToDecrypt(t *testing.T) {
+	wrongKey := testOrgKey()
+
+	const (
+		movedID         = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+		removedID       = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+		newFolderID     = "99999999-9999-4999-8999-999999999999"
+		newCollectionID = "55555555-5555-4555-8555-555555555555"
+	)
+
+	unreadableName := mustEncryptType2Cipher(t, "moved-secret", wrongKey)
+	newOrgID := testOrgID2
+	newFolder := newFolderID
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		resp := SyncResponse{
+			Ciphers: []SyncCipher{
+				{
+					ID:             movedID,
+					Type:           CipherTypeLogin,
+					Name:           unreadableName,
+					OrganizationID: &newOrgID,
+					CollectionIDs:  []string{newCollectionID},
+					FolderID:       &newFolder,
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+
+	old := map[string]DecryptedItem{
+		movedID: {
+			ID:             movedID,
+			Name:           "moved-secret",
+			Password:       "stale-but-present",
+			OrganizationID: testOrgID,
+			CollectionIDs:  []string{testCollectionID},
+			FolderID:       testFolderID,
+		},
+		removedID: {ID: removedID, Name: "removed-item", Password: "gone"},
+	}
+	nameMaps := SyncNameMaps{
+		Organizations: map[string]string{testOrgID: "Acme"},
+		Folders:       map[string]string{testFolderID: "Prod"},
+		Collections:   map[string]string{testCollectionID: "Keys"},
+	}
+	c := NewClient(newSyncTestClient(t, mux), time.Hour, WithState(old, nameMaps))
+
+	if err := c.syncVault(); err == nil {
+		t.Fatal("syncVault() error = nil, want the zero-decrypted sync error")
+	}
+
+	if _, err := c.GetSecret("moved-secret", SecretFilter{OrganizationIDs: []string{testOrgID}}); err == nil {
+		t.Error("retained entry must not be reachable through its stale organization scope")
+	}
+	if _, err := c.GetSecret("moved-secret", SecretFilter{FolderID: testFolderID}); err == nil {
+		t.Error("retained entry must not be reachable through its stale folder")
+	}
+	val, err := c.GetSecret("moved-secret", SecretFilter{
+		OrganizationIDs: []string{testOrgID2},
+		CollectionIDs:   []string{newCollectionID},
+		FolderID:        newFolderID,
+	})
+	if err != nil || val != "stale-but-present" {
+		t.Errorf("GetSecret() under the current scope = (%q, %v), want (stale-but-present, nil)", val, err)
+	}
+
+	if _, err := c.GetSecret("removed-item", SecretFilter{}); err == nil {
+		t.Error("cipher absent from the payload must be dropped, not served from cache")
+	}
+
+	got := c.NameMaps()
+	if got.Organizations[testOrgID] != "Acme" || got.Folders[testFolderID] != "Prod" || got.Collections[testCollectionID] != "Keys" {
+		t.Errorf("nameMaps = %+v, want the maps from the last successful sync preserved", got)
 	}
 }
 

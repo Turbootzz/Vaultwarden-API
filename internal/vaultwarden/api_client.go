@@ -424,11 +424,37 @@ func LookupIDByName(idToName map[string]string, target string) (id string, ok bo
 	return matches[0], true
 }
 
+// FailedCipher identifies a cipher that failed to decrypt, carrying the placement the sync
+// payload reports for it in plaintext.
+type FailedCipher struct {
+	ID             string
+	OrganizationID string
+	FolderID       string
+	CollectionIDs  []string
+}
+
+// newFailedCipher records a decrypt failure with its current placement, normalized as decryptCipher does.
+func newFailedCipher(c SyncCipher) FailedCipher {
+	f := FailedCipher{ID: c.ID}
+	if c.OrganizationID != nil {
+		f.OrganizationID = strings.TrimSpace(*c.OrganizationID)
+	}
+	if c.FolderID != nil {
+		f.FolderID = strings.TrimSpace(*c.FolderID)
+	}
+	if len(c.CollectionIDs) > 0 {
+		f.CollectionIDs = append([]string(nil), c.CollectionIDs...)
+	}
+	return f
+}
+
 // Sync fetches and decrypts all vault items and returns them along with maps of decrypted
-// organization, folder, and collection names.
-func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
+// organization, folder, and collection names, plus the ciphers that failed to decrypt and
+// their current placement (trashed ciphers are skipped, not failures). The failure list is
+// also returned with the error raised when nothing decrypted.
+func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, []FailedCipher, error) {
 	if err := ac.EnsureValidToken(); err != nil {
-		return nil, emptySyncNameMaps(), fmt.Errorf("ensure valid token: %w", err)
+		return nil, emptySyncNameMaps(), nil, fmt.Errorf("ensure valid token: %w", err)
 	}
 
 	ac.mu.RLock()
@@ -438,13 +464,13 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 
 	req, err := http.NewRequest("GET", ac.baseURL+"/api/sync", nil)
 	if err != nil {
-		return nil, emptySyncNameMaps(), fmt.Errorf("create sync request: %w", err)
+		return nil, emptySyncNameMaps(), nil, fmt.Errorf("create sync request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	resp, err := ac.httpClient.Do(req)
 	if err != nil {
-		return nil, emptySyncNameMaps(), fmt.Errorf("sync request: %w", err)
+		return nil, emptySyncNameMaps(), nil, fmt.Errorf("sync request: %w", err)
 	}
 
 	retriedAfterRenewal := false
@@ -456,7 +482,7 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 
 		// Renew and retry once; pass the token that drew the 401 so a concurrent renewal isn't repeated.
 		if err := ac.refreshOrReauthenticate(token); err != nil {
-			return nil, emptySyncNameMaps(), fmt.Errorf("sync auth failed: %w", err)
+			return nil, emptySyncNameMaps(), nil, fmt.Errorf("sync auth failed: %w", err)
 		}
 		ac.mu.RLock()
 		token = ac.accessToken
@@ -467,7 +493,7 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp, err = ac.httpClient.Do(req)
 		if err != nil {
-			return nil, emptySyncNameMaps(), fmt.Errorf("sync retry: %w", err)
+			return nil, emptySyncNameMaps(), nil, fmt.Errorf("sync retry: %w", err)
 		}
 	}
 	defer func() {
@@ -484,16 +510,16 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 			ac.mu.Lock()
 			ac.tokenExpiry = time.Time{}
 			ac.mu.Unlock()
-			return nil, emptySyncNameMaps(), fmt.Errorf(
+			return nil, emptySyncNameMaps(), nil, fmt.Errorf(
 				"sync failed (HTTP %d) after token refresh/re-auth; forcing re-auth on next attempt: %s",
 				resp.StatusCode, string(body))
 		}
-		return nil, emptySyncNameMaps(), fmt.Errorf("sync failed (HTTP %d): %s", resp.StatusCode, string(body))
+		return nil, emptySyncNameMaps(), nil, fmt.Errorf("sync failed (HTTP %d): %s", resp.StatusCode, string(body))
 	}
 
 	var syncResp SyncResponse
 	if err := json.NewDecoder(resp.Body).Decode(&syncResp); err != nil {
-		return nil, emptySyncNameMaps(), fmt.Errorf("decode sync response: %w", err)
+		return nil, emptySyncNameMaps(), nil, fmt.Errorf("decode sync response: %w", err)
 	}
 
 	// Decrypt org keys if organizations are present.
@@ -518,7 +544,7 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 
 	// Decrypt all ciphers.
 	items := make([]DecryptedItem, 0, len(syncResp.Ciphers))
-	decryptFailures := 0
+	var failed []FailedCipher
 	for _, c := range syncResp.Ciphers {
 		// Trashed ciphers stay in the sync payload; they must not resolve (#20).
 		if c.DeletedDate != nil && strings.TrimSpace(*c.DeletedDate) != "" {
@@ -533,7 +559,9 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 				decryptKey = orgKey
 			} else {
 				logger.Debug.Printf("No org key for cipher %s (org %s), skipping", c.ID, *c.OrganizationID)
-				decryptFailures++
+				if c.ID != "" {
+					failed = append(failed, newFailedCipher(c))
+				}
 				continue
 			}
 		}
@@ -541,7 +569,9 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 		item, err := decryptCipher(c, decryptKey)
 		if err != nil {
 			logger.Debug.Printf("Failed to decrypt cipher %s: %v", c.ID, err)
-			decryptFailures++
+			if c.ID != "" {
+				failed = append(failed, newFailedCipher(c))
+			}
 			continue
 		}
 		items = append(items, item)
@@ -549,10 +579,10 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 
 	// Nothing decrypted while ciphers failed means a broken key, not an empty vault:
 	// succeeding here would let syncVault replace a healthy cache with an empty one.
-	if len(items) == 0 && decryptFailures > 0 {
-		return nil, emptySyncNameMaps(), fmt.Errorf(
+	if len(items) == 0 && len(failed) > 0 {
+		return nil, emptySyncNameMaps(), failed, fmt.Errorf(
 			"sync decrypted 0 of %d ciphers (%d failures), refusing to replace cache",
-			len(syncResp.Ciphers), decryptFailures)
+			len(syncResp.Ciphers), len(failed))
 	}
 
 	logger.Info.Printf("Synced and decrypted %d vault items", len(items))
@@ -566,7 +596,7 @@ func (ac *APIClient) Sync() ([]DecryptedItem, SyncNameMaps, error) {
 		len(syncResp.Collections),
 	)
 
-	return items, nameMaps, nil
+	return items, nameMaps, failed, nil
 }
 
 // DecryptedItem is a decrypted vault item ready for cache lookup.

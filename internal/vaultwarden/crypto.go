@@ -24,11 +24,11 @@ import (
 
 // Encryption types as defined by the Bitwarden protocol.
 const (
-	EncTypeAesCbc256_B64              = 0
-	EncTypeAesCbc128_HmacSha256_B64   = 1
-	EncTypeAesCbc256_HmacSha256_B64   = 2
-	EncTypeRsa2048_OaepSha256_B64     = 3
-	EncTypeRsa2048_OaepSha1_B64       = 4
+	EncTypeAesCbc256_B64            = 0
+	EncTypeAesCbc128_HmacSha256_B64 = 1
+	EncTypeAesCbc256_HmacSha256_B64 = 2
+	EncTypeRsa2048_OaepSha256_B64   = 3
+	EncTypeRsa2048_OaepSha1_B64     = 4
 )
 
 // KDF types.

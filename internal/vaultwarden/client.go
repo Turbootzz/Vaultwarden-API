@@ -183,10 +183,45 @@ func (c *Client) NameMaps() SyncNameMaps {
 	}
 }
 
+// retainFailedCiphers carries cached entries for ciphers that failed to decrypt into newItems and
+// returns how many were retained. Callers must hold c.mu; old is the cache being replaced.
+func retainFailedCiphers(newItems, old map[string]DecryptedItem, failed []FailedCipher) int {
+	retained := 0
+	for _, f := range failed {
+		if _, ok := newItems[f.ID]; ok {
+			continue
+		}
+		if item, ok := old[f.ID]; ok {
+			// Placement is plaintext in the payload, so scope checks use current values, not the cached ones.
+			item.OrganizationID = f.OrganizationID
+			item.CollectionIDs = f.CollectionIDs
+			item.FolderID = f.FolderID
+			newItems[f.ID] = item
+			retained++
+		}
+	}
+	return retained
+}
+
 // syncVault fetches and decrypts all items from the vault.
 func (c *Client) syncVault() error {
-	items, nameMaps, err := c.api.Sync()
+	items, nameMaps, failed, err := c.api.Sync()
 	if err != nil {
+		// A non-empty failure list means the payload was authentic but nothing decrypted (#25):
+		// reconcile placement and drop removed items, instead of serving stale scopes for the whole
+		// outage. Transport and auth errors report no failures and must leave the cache alone.
+		if len(failed) == 0 {
+			return err
+		}
+		newItems := make(map[string]DecryptedItem, len(failed))
+		c.mu.Lock()
+		retained := retainFailedCiphers(newItems, c.items, failed)
+		c.items = newItems
+		c.mu.Unlock()
+
+		logger.Warn.Printf(
+			"Sync decrypted no ciphers; %d of %d cached entries kept with refreshed placement, name maps unchanged",
+			retained, len(failed))
 		return err
 	}
 
@@ -198,10 +233,19 @@ func (c *Client) syncVault() error {
 		newItems[item.ID] = item
 	}
 
+	// Only ciphers the sync reported as decrypt failures are carried over (#25): a stale entry
+	// beats a 404, while genuinely deleted and trashed items leave the payload and are dropped.
 	c.mu.Lock()
+	retained := retainFailedCiphers(newItems, c.items, failed)
 	c.items = newItems
 	c.nameMaps = nameMaps
 	c.mu.Unlock()
+
+	if len(failed) > 0 {
+		logger.Warn.Printf(
+			"Sync completed with %d cipher(s) that failed to decrypt; %d served stale from the previous cache",
+			len(failed), retained)
+	}
 
 	return nil
 }
