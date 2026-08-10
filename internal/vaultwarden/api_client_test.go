@@ -146,7 +146,7 @@ func TestSync_SkipsTrashedCiphers(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	items, _, err := ac.Sync()
+	items, _, _, err := ac.Sync()
 	if err != nil {
 		t.Fatalf("Sync() error: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestSync_401RefreshFailsFallsBackToFullReauth(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	items, _, err := ac.Sync()
+	items, _, _, err := ac.Sync()
 	if err != nil {
 		t.Fatalf("Sync() error: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestSync_401ReauthAlsoFailsReturnsError(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	_, _, err := ac.Sync()
+	_, _, _, err := ac.Sync()
 	if err == nil {
 		t.Fatal("Sync() expected error")
 	}
@@ -319,7 +319,7 @@ func TestSync_AllCiphersFailToDecryptReturnsError(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	items, _, err := ac.Sync()
+	items, _, _, err := ac.Sync()
 	if err == nil {
 		t.Fatalf("Sync() returned %d items and no error; want an error when every cipher fails to decrypt", len(items))
 	}
@@ -358,7 +358,7 @@ func TestSync_OrgCipherWithoutOrgKeyCountsAsFailure(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	items, _, err := ac.Sync()
+	items, _, _, err := ac.Sync()
 	if err == nil {
 		t.Fatalf("Sync() returned %d items and no error; want an error when the only cipher is org-owned and no org key is available", len(items))
 	}
@@ -367,6 +367,70 @@ func TestSync_OrgCipherWithoutOrgKeyCountsAsFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "decrypted 0 of 1") {
 		t.Errorf("error %q should count the skipped org cipher as a failure", err)
+	}
+}
+
+func TestSync_ReportsFailedCipherIDs(t *testing.T) {
+	userKey := testUserKey()
+	wrongKey := testOrgKey()
+	orgID := testOrgID
+	deleted := "2026-08-01T12:00:00.000000Z"
+
+	const (
+		okID      = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+		badMACID  = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+		orgItemID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+		trashedID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+	)
+
+	okName := mustEncryptType2Cipher(t, "ok-item", userKey)
+	badMACName := mustEncryptType2Cipher(t, "bad-mac-item", wrongKey)
+	orgName := mustEncryptType2Cipher(t, "org-item", userKey)
+	trashedName := mustEncryptType2Cipher(t, "trashed-item", userKey)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		resp := SyncResponse{
+			// No profile private key, so the org key is never derived.
+			Profile: SyncProfile{Organizations: []SyncOrganization{{ID: orgID, Name: "Org"}}},
+			Ciphers: []SyncCipher{
+				{ID: okID, Type: CipherTypeLogin, Name: okName},
+				{ID: badMACID, Type: CipherTypeLogin, Name: badMACName},
+				{ID: orgItemID, Type: CipherTypeLogin, OrganizationID: &orgID, Name: orgName},
+				{ID: trashedID, Type: CipherTypeLogin, Name: trashedName, DeletedDate: &deleted},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+
+	ac := newSyncTestClient(t, mux)
+
+	items, _, failedIDs, err := ac.Sync()
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if len(items) != 1 || items[0].ID != okID {
+		t.Fatalf("Sync() returned %d items, want only %s", len(items), okID)
+	}
+
+	failed := make(map[string]bool, len(failedIDs))
+	for _, id := range failedIDs {
+		failed[id] = true
+	}
+	if !failed[badMACID] {
+		t.Errorf("failed IDs %v should include the bad-MAC cipher %s", failedIDs, badMACID)
+	}
+	if !failed[orgItemID] {
+		t.Errorf("failed IDs %v should include the org cipher with no usable org key %s", failedIDs, orgItemID)
+	}
+	if failed[trashedID] {
+		t.Errorf("failed IDs %v must not include the trashed cipher %s", failedIDs, trashedID)
+	}
+	if len(failedIDs) != 2 {
+		t.Errorf("failed IDs = %v, want exactly 2", failedIDs)
 	}
 }
 
@@ -396,7 +460,7 @@ func TestSync_OnlyTrashedCiphersSyncsEmpty(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	items, _, err := ac.Sync()
+	items, _, _, err := ac.Sync()
 	if err != nil {
 		t.Fatalf("Sync() error: %v (an all-trashed vault is empty, not failed)", err)
 	}
@@ -433,7 +497,7 @@ func TestSync_RetryStill401ForcesReauthOnNextAttempt(t *testing.T) {
 
 	ac := newSyncTestClient(t, mux)
 
-	_, _, err := ac.Sync()
+	_, _, _, err := ac.Sync()
 	if err == nil {
 		t.Fatal("Sync() expected error")
 	}
@@ -545,7 +609,7 @@ func TestSync_ConcurrentRenewalRunsOneLogin(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			items, _, err := ac.Sync()
+			items, _, _, err := ac.Sync()
 			errs[i] = err
 			counts[i] = len(items)
 		}(i)

@@ -1,8 +1,12 @@
 package vaultwarden
 
 import (
+	"encoding/json"
+	"maps"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewClient_withState(t *testing.T) {
@@ -116,6 +120,62 @@ func TestMatchesSecretFilter_PersonalItemExcludedByOrgScope(t *testing.T) {
 	}
 	if !matchesSecretFilter(personal, SecretFilter{}) {
 		t.Error("personal item should match an empty (full-access) scope")
+	}
+}
+
+func TestSyncVault_RetainsCachedEntriesForFailedCiphers(t *testing.T) {
+	userKey := testUserKey()
+	wrongKey := testOrgKey()
+
+	const (
+		updatedID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" // decrypts: cache entry replaced
+		failedID  = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" // fails to decrypt: old entry retained
+		removedID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc" // absent from the payload: dropped
+	)
+
+	freshName := mustEncryptType2Cipher(t, "api-key-v2", userKey)
+	unreadableName := mustEncryptType2Cipher(t, "org-secret", wrongKey)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		resp := SyncResponse{
+			Ciphers: []SyncCipher{
+				{ID: updatedID, Type: CipherTypeLogin, Name: freshName},
+				{ID: failedID, Type: CipherTypeLogin, Name: unreadableName},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			t.Errorf("encode sync response: %v", err)
+		}
+	})
+
+	old := map[string]DecryptedItem{
+		updatedID: {ID: updatedID, Name: "api-key-v1", Password: "old"},
+		failedID:  {ID: failedID, Name: "org-secret", Password: "stale-but-present"},
+		removedID: {ID: removedID, Name: "removed-item", Password: "gone"},
+	}
+	c := NewClient(newSyncTestClient(t, mux), time.Hour, WithState(old, emptySyncNameMaps()))
+
+	if err := c.syncVault(); err != nil {
+		t.Fatalf("syncVault() error: %v", err)
+	}
+
+	c.mu.RLock()
+	got := maps.Clone(c.items)
+	c.mu.RUnlock()
+
+	if len(got) != 2 {
+		t.Fatalf("cache holds %d items, want 2: %+v", len(got), got)
+	}
+	if got[failedID].Password != "stale-but-present" {
+		t.Errorf("failed cipher %s = %+v, want the old cached entry retained", failedID, got[failedID])
+	}
+	if got[updatedID].Name != "api-key-v2" {
+		t.Errorf("decrypted cipher %s name = %q, want api-key-v2", updatedID, got[updatedID].Name)
+	}
+	if _, ok := got[removedID]; ok {
+		t.Errorf("cipher %s is absent from the payload and must be dropped", removedID)
 	}
 }
 

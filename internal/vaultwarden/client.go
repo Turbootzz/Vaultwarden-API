@@ -185,7 +185,7 @@ func (c *Client) NameMaps() SyncNameMaps {
 
 // syncVault fetches and decrypts all items from the vault.
 func (c *Client) syncVault() error {
-	items, nameMaps, err := c.api.Sync()
+	items, nameMaps, failedIDs, err := c.api.Sync()
 	if err != nil {
 		return err
 	}
@@ -198,10 +198,28 @@ func (c *Client) syncVault() error {
 		newItems[item.ID] = item
 	}
 
+	// Only ciphers the sync reported as decrypt failures are carried over (#25): a stale entry
+	// beats a 404, while genuinely deleted and trashed items leave the payload and are dropped.
+	retained := 0
 	c.mu.Lock()
+	for _, id := range failedIDs {
+		if _, ok := newItems[id]; ok {
+			continue
+		}
+		if old, ok := c.items[id]; ok {
+			newItems[id] = old
+			retained++
+		}
+	}
 	c.items = newItems
 	c.nameMaps = nameMaps
 	c.mu.Unlock()
+
+	if len(failedIDs) > 0 {
+		logger.Warn.Printf(
+			"Sync completed with %d cipher(s) that failed to decrypt; %d served stale from the previous cache",
+			len(failedIDs), retained)
+	}
 
 	return nil
 }
