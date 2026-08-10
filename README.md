@@ -119,7 +119,6 @@ You can also use **custom fields** or **notes** — the API returns the most rel
 | `ALLOWED_IPS` | No | (all) | Comma-separated IPs/CIDRs to whitelist |
 | `ENABLE_GITHUB_IP_RANGES` | No | `false` | Auto-whitelist GitHub Actions IPs |
 | `SYNC_INTERVAL` | No | `5m` | How often to re-sync the vault |
-| `CACHE_TTL` | No | `5m` | Secret cache duration |
 | `RATE_LIMIT_MAX` | No | `30` | Max requests per window, per IP |
 | `RATE_LIMIT_WINDOW` | No | `1m` | Rate-limit window duration |
 | `READ_TIMEOUT` | No | `10s` | HTTP server read timeout |
