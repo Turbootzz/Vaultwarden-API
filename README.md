@@ -372,19 +372,33 @@ TRUSTED_PROXY_IP=172.18.0.5        # your reverse proxy, as before
 ```
 
 The preset expands to Cloudflare's [published ranges](https://www.cloudflare.com/ips/),
-embedded in the binary so startup never depends on fetching them. Refresh them
-with `make update-cloudflare-ips` when Cloudflare publishes changes. For a provider
-without a preset, list its ranges in `TRUSTED_PROXY_IP` by hand.
+embedded in the binary so startup never depends on fetching them. A weekly CI job
+flags drift; refresh with `make update-cloudflare-ips`.
 
-**The trade-off:** anything connecting from a trusted range can assert a client
-address. Trusting a CDN's ranges is only safe while the CDN is the sole way to
-reach the origin — otherwise an attacker who can reach your origin directly, or
-who can route through the same CDN, can present themselves as any address. Bound
-it with [authenticated origin pulls](https://developers.cloudflare.com/ssl/origin-configuration/authenticated-origin-pull/)
+**Why a preset rather than pasting the ranges into `TRUSTED_PROXY_IP`.** Trusting
+a whole CDN's ranges by hand quietly re-opens the spoofing hole the right-to-left
+walk closes. The walk *skips* trusted entries, so a visitor whose own address is
+inside those ranges — one Cloudflare zone proxying to another — has its prepended
+entries reached and believed. A preset therefore also carries the provider's
+client-IP header (`CF-Connecting-IP` for Cloudflare), which the edge sets itself
+and overwrites if the visitor supplied one. Reaching a Cloudflare hop in the chain
+ends the walk and takes the answer from that header instead — the one value a
+visitor behind the edge cannot choose. The header is read only for requests that
+actually arrived through a trusted edge range; anywhere else it is just another
+client-written header and is ignored. If the header is missing or arrives twice,
+resolution falls back to the plain chain walk and the denial log says so, so a
+proxy that strips it degrades rather than taking the deployment down.
+
+For a provider without a preset, list its ranges in `TRUSTED_PROXY_IP` by hand and
+be aware of the caveat above.
+
+**The residual trade-off:** anything connecting from a trusted range can still
+assert a client address. Trusting a CDN's ranges is only safe while the CDN is the
+sole way to reach the origin — an attacker who can reach your origin directly
+bypasses the edge and its header entirely. Bound it with
+[authenticated origin pulls](https://developers.cloudflare.com/ssl/origin-configuration/authenticated-origin-pull/)
 or a [tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/),
-plus a firewall that drops anything else. Note that traffic *through* the CDN is
-still safe: the edge appends the visitor address it observed, so anything the
-visitor prepended stays to the left of it and is still ignored.
+plus a firewall that drops everything else.
 
 Alternatives, if you would rather not trust the edge ranges: grey-cloud the
 hostname so Cloudflare stops proxying it, or give LAN clients a split-horizon DNS
@@ -401,8 +415,15 @@ WARN: IP blocked (not whitelisted) on GET /secret/db: resolved 172.70.1.1, peer 
 `resolved` is the address judged against `ALLOWED_IPS`, `peer` is the socket
 address, and `xff` is the forwarded chain. If `resolved` is an address you never
 configured and it appears in `xff`, an untrusted hop terminated the walk — add
-that hop to `TRUSTED_PROXY_IP` (or the matching preset). The chain is truncated
-after eight entries, since the client controls how many it prepends.
+that hop to `TRUSTED_PROXY_IP` (or the matching preset). Only the last eight chain
+entries are shown, since the client controls how many it prepends.
+
+Two more markers appear when a preset is in play. `resolved 192.168.1.81 via
+cloudflare` means the answer came from the provider's client-IP header rather than
+the chain. `(cloudflare edge in the chain but no usable client-IP header)` means
+the request came through the edge but `CF-Connecting-IP` was absent or duplicated,
+so the weaker chain walk was used — check that nothing between the edge and this
+service strips the header.
 
 ## Project Structure
 

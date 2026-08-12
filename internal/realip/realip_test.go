@@ -398,15 +398,7 @@ func TestResolveReportsPeerAndChain(t *testing.T) {
 	if got.Peer != "127.0.0.1" {
 		t.Errorf("Peer = %q, want 127.0.0.1", got.Peer)
 	}
-	want := []string{"203.0.113.9", "172.18.0.4"}
-	if len(got.Chain) != len(want) {
-		t.Fatalf("Chain = %v, want %v", got.Chain, want)
-	}
-	for i := range want {
-		if got.Chain[i] != want[i] {
-			t.Errorf("Chain[%d] = %q, want %q", i, got.Chain[i], want[i])
-		}
-	}
+	assertChain(t, got.Chain, "203.0.113.9", "172.18.0.4")
 }
 
 // The chain records what the resolver actually walked, so an unparseable entry
@@ -416,16 +408,28 @@ func TestResolveChainHoldsOnlyParsedEntries(t *testing.T) {
 	resolver := testResolver(t)
 	_, ctx := acquireCtx(t, "127.0.0.1", "not-an-ip, 203.0.113.9:443")
 
+	assertChain(t, resolver.Resolve(ctx).Chain, "203.0.113.9")
+}
+
+// The commonest #40-shaped misconfiguration is the reverse proxy itself missing
+// from TRUSTED_PROXY_IP. The header is ignored in that case — correctly — but it
+// still has to be reported, or the log cannot distinguish "no header was sent"
+// from "a header was sent and not believed".
+func TestResolveReportsTheChainEvenWhenThePeerIsUntrusted(t *testing.T) {
+	resolver := testResolver(t)
+	_, ctx := acquireCtx(t, "203.0.113.9", "192.168.1.81, 172.70.1.1")
+
 	got := resolver.Resolve(ctx)
-	if len(got.Chain) != 1 || got.Chain[0] != "203.0.113.9" {
-		t.Errorf("Chain = %v, want [203.0.113.9]", got.Chain)
+	if got.Client != "203.0.113.9" {
+		t.Errorf("Client = %q, want the untrusted peer 203.0.113.9", got.Client)
 	}
+	assertChain(t, got.Chain, "192.168.1.81", "172.70.1.1")
 }
 
 func TestResolutionStringExplainsTheWalk(t *testing.T) {
 	t.Parallel()
 
-	res := Resolution{Client: "172.70.1.1", Peer: "172.18.0.5", Chain: []string{"192.168.1.81", "172.70.1.1"}}
+	res := Resolution{Client: "172.70.1.1", Peer: "172.18.0.5", Chain: ips("192.168.1.81", "172.70.1.1")}
 	want := "resolved 172.70.1.1, peer 172.18.0.5, xff=[192.168.1.81 172.70.1.1]"
 	if got := res.String(); got != want {
 		t.Errorf("String() = %q, want %q", got, want)
@@ -435,23 +439,41 @@ func TestResolutionStringExplainsTheWalk(t *testing.T) {
 	if got := empty.String(); got != "resolved 203.0.113.9, peer 203.0.113.9, xff=[]" {
 		t.Errorf("String() with no chain = %q", got)
 	}
+
+	via := Resolution{Client: "192.168.1.81", Peer: "127.0.0.1", Via: "cloudflare", Chain: ips("172.70.1.1")}
+	if got := via.String(); !strings.Contains(got, "via cloudflare") {
+		t.Errorf("String() = %q, want it to name the provider", got)
+	}
+
+	missing := Resolution{Client: "172.70.1.1", Peer: "127.0.0.1", EdgeHeaderMissing: "cloudflare"}
+	if got := missing.String(); !strings.Contains(got, "no usable client-IP header") {
+		t.Errorf("String() = %q, want it to flag the missing edge header", got)
+	}
 }
 
-// A client controls how many entries it prepends, so the log line must not.
-func TestResolutionStringTruncatesALongChain(t *testing.T) {
+// A client controls how many entries it prepends, so the log line must not. The
+// entries kept must be the rightmost ones: those are the proxy-appended half,
+// which is both the trustworthy half and the half that shows where the walk
+// stopped. Truncating the other end would let a client blind the diagnostic by
+// prepending junk.
+func TestResolutionStringKeepsTheRightmostChainEntries(t *testing.T) {
 	t.Parallel()
 
-	chain := make([]string, 0, maxLoggedChain+3)
-	for i := 0; i < maxLoggedChain+3; i++ {
-		chain = append(chain, "203.0.113.9")
+	chain := make([]net.IP, 0, maxLoggedChain+3)
+	for i := 0; i < maxLoggedChain+1; i++ {
+		chain = append(chain, net.ParseIP("10.9.9.9"))
 	}
-	got := Resolution{Client: "203.0.113.9", Peer: "127.0.0.1", Chain: chain}.String()
+	chain = append(chain, net.ParseIP("192.168.1.81"), net.ParseIP("172.70.1.1"))
 
-	if strings.Count(got, "203.0.113.9") != maxLoggedChain+1 { // +1 for the resolved address
-		t.Errorf("String() = %q, want only %d chain entries", got, maxLoggedChain)
+	got := Resolution{Client: "172.70.1.1", Peer: "127.0.0.1", Chain: chain}.String()
+
+	for _, want := range []string{"192.168.1.81", "172.70.1.1", "+3 more"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("String() = %q, want it to contain %q", got, want)
+		}
 	}
-	if !strings.Contains(got, "+3 more") {
-		t.Errorf("String() = %q, want a truncation marker", got)
+	if n := strings.Count(got, "10.9.9.9"); n != maxLoggedChain-2 {
+		t.Errorf("String() = %q, kept %d prepended entries, want %d", got, n, maxLoggedChain-2)
 	}
 }
 
@@ -477,38 +499,161 @@ func TestClientIPBehindACDN(t *testing.T) {
 		t.Errorf("ClientIP() with an untrusted edge = %q, want the edge address %q", got, edge)
 	}
 
-	// With the edge ranges trusted the walk reaches the real client.
-	cf, err := Preset("cloudflare")
-	if err != nil {
-		t.Fatalf("Preset: %v", err)
+	// With the edge trusted, CF-Connecting-IP supplies the visitor.
+	withEdge := cloudflareResolver(t)
+	_, ctx = acquireRawCtx(t, "127.0.0.1", request(chain, client))
+	got := withEdge.Resolve(ctx)
+	if got.Client != client {
+		t.Errorf("Client = %q, want %q", got.Client, client)
 	}
-	withEdge, err := New(append([]string{"127.0.0.1", "::1"}, cf...))
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	_, ctx = acquireCtx(t, "127.0.0.1", chain)
-	if got := withEdge.ClientIP(ctx); got != client {
-		t.Errorf("ClientIP() with the edge trusted = %q, want %q", got, client)
+	if got.Via != "cloudflare" {
+		t.Errorf("Via = %q, want cloudflare", got.Via)
 	}
 }
 
-// Trusting the CDN's ranges must not make the CDN able to assert an address:
-// it appends the visitor address it saw, and everything the visitor prepended
-// stays to the left of that entry and is still ignored.
-func TestTrustedCDNDoesNotMakeTheChainSpoofable(t *testing.T) {
-	cf, err := Preset("cloudflare")
+// Trusting a CDN's ranges re-opens the hole the right-to-left walk closes: the
+// walk *skips* trusted entries, so a visitor whose own address is inside those
+// ranges — one CDN zone proxying to another — gets its prepended entries reached
+// and believed. CF-Connecting-IP is set by the edge and overwrites anything the
+// visitor sent, so it is the one value such a visitor cannot choose.
+func TestTrustedCDNTenantCannotSpoofTheClientAddress(t *testing.T) {
+	resolver := cloudflareResolver(t)
+
+	// The attacker's address as seen by the edge is itself a Cloudflare address,
+	// and it prepends a whitelisted address hoping the walk reaches it.
+	chain := "192.168.1.81, 162.158.0.1, 172.70.1.1"
+	_, ctx := acquireRawCtx(t, "127.0.0.1", request(chain, "162.158.0.1"))
+
+	if got := resolver.ClientIP(ctx); got != "162.158.0.1" {
+		t.Errorf("ClientIP() = %q, want the edge-reported visitor 162.158.0.1", got)
+	}
+}
+
+// A visitor sending its own CF-Connecting-IP is not a special case: the edge
+// overwrites the line, so only one ever arrives. Two lines mean something other
+// than the edge wrote one of them and neither can be attributed.
+func TestAmbiguousEdgeHeaderIsNotBelieved(t *testing.T) {
+	resolver := cloudflareResolver(t)
+
+	raw := "GET /secret/db HTTP/1.1\r\nHost: target\r\n" +
+		"X-Forwarded-For: 203.0.113.9, 172.70.1.1\r\n" +
+		"CF-Connecting-IP: 192.168.1.81\r\n" +
+		"CF-Connecting-IP: 203.0.113.9\r\n\r\n"
+	_, ctx := acquireRawCtx(t, "127.0.0.1", raw)
+
+	got := resolver.Resolve(ctx)
+	if got.Client == "192.168.1.81" {
+		t.Errorf("Client = %q, an ambiguous edge header must not be believed", got.Client)
+	}
+	if got.EdgeHeaderMissing != "cloudflare" {
+		t.Errorf("EdgeHeaderMissing = %q, want cloudflare so the denial says why", got.EdgeHeaderMissing)
+	}
+}
+
+// A proxy that strips the edge header must not take the deployment down; the
+// walk degrades to X-Forwarded-For alone and records that it did.
+func TestMissingEdgeHeaderDegradesToTheChainWalk(t *testing.T) {
+	resolver := cloudflareResolver(t)
+
+	_, ctx := acquireCtx(t, "127.0.0.1", "192.168.1.81, 172.70.1.1")
+	got := resolver.Resolve(ctx)
+
+	if got.Client != "192.168.1.81" {
+		t.Errorf("Client = %q, want the chain-walk answer 192.168.1.81", got.Client)
+	}
+	if got.EdgeHeaderMissing != "cloudflare" {
+		t.Errorf("EdgeHeaderMissing = %q, want cloudflare", got.EdgeHeaderMissing)
+	}
+}
+
+// The header is only consulted for requests that actually arrived through the
+// edge. Without a Cloudflare hop in the chain it is just another client-written
+// header and must be ignored entirely.
+func TestEdgeHeaderIsIgnoredWithoutAnEdgeHop(t *testing.T) {
+	resolver := cloudflareResolver(t)
+
+	_, ctx := acquireRawCtx(t, "127.0.0.1", request("203.0.113.9", "192.168.1.81"))
+	if got := resolver.ClientIP(ctx); got != "203.0.113.9" {
+		t.Errorf("ClientIP() = %q, want 203.0.113.9; CF-Connecting-IP must not be read off a non-CDN path", got)
+	}
+}
+
+// The edge may also be the socket peer, when the provider reaches this service
+// without a reverse proxy in between.
+func TestEdgeHeaderIsUsedWhenTheEdgeIsThePeer(t *testing.T) {
+	resolver := cloudflareResolver(t)
+
+	_, ctx := acquireRawCtx(t, "172.70.1.1", request("", "192.168.1.81"))
+	got := resolver.Resolve(ctx)
+	if got.Client != "192.168.1.81" {
+		t.Errorf("Client = %q, want 192.168.1.81", got.Client)
+	}
+	if got.Via != "cloudflare" {
+		t.Errorf("Via = %q, want cloudflare", got.Via)
+	}
+}
+
+// Same trailer-smuggling discipline as X-Forwarded-For: the edge header is read
+// from the raw header block, so a trailer cannot supply it.
+func TestEdgeHeaderIgnoresSmuggledTrailers(t *testing.T) {
+	resolver := cloudflareResolver(t)
+
+	raw := "POST /secret/db HTTP/1.1\r\nHost: target\r\n" +
+		"X-Forwarded-For: 203.0.113.9, 172.70.1.1\r\n" +
+		"Transfer-Encoding: chunked\r\nTrailer: CF-Connecting-IP\r\n\r\n" +
+		"0\r\nCF-Connecting-IP: 192.168.1.81\r\n\r\n"
+	_, ctx := acquireRawCtx(t, "127.0.0.1", raw)
+
+	if got := resolver.ClientIP(ctx); got == "192.168.1.81" {
+		t.Error("a trailer-supplied CF-Connecting-IP was believed")
+	}
+}
+
+// cloudflareResolver trusts loopback plus the Cloudflare preset.
+func cloudflareResolver(t *testing.T) *Resolver {
+	t.Helper()
+	provider, err := Preset("cloudflare")
 	if err != nil {
 		t.Fatalf("Preset: %v", err)
 	}
-	resolver, err := New(append([]string{"127.0.0.1", "::1"}, cf...))
+	r, err := New([]string{"127.0.0.1", "::1"}, provider)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	return r
+}
 
-	// The attacker sent "X-Forwarded-For: 192.168.1.81"; the CDN appended the
-	// address it saw (203.0.113.9) and the local proxy appended the edge.
-	_, ctx := acquireCtx(t, "127.0.0.1", "192.168.1.81, 203.0.113.9, 172.70.1.1")
-	if got := resolver.ClientIP(ctx); got != "203.0.113.9" {
-		t.Errorf("ClientIP() = %q, want the CDN-observed address 203.0.113.9", got)
+// request builds a raw request carrying an X-Forwarded-For chain and the
+// Cloudflare edge header. Either may be empty to omit the line.
+func request(forwardedFor, connectingIP string) string {
+	var b strings.Builder
+	b.WriteString("GET /secret/db HTTP/1.1\r\nHost: target\r\n")
+	if forwardedFor != "" {
+		b.WriteString("X-Forwarded-For: " + forwardedFor + "\r\n")
+	}
+	if connectingIP != "" {
+		b.WriteString("CF-Connecting-IP: " + connectingIP + "\r\n")
+	}
+	b.WriteString("\r\n")
+	return b.String()
+}
+
+func ips(addrs ...string) []net.IP {
+	out := make([]net.IP, len(addrs))
+	for i, a := range addrs {
+		out[i] = net.ParseIP(a)
+	}
+	return out
+}
+
+func assertChain(t *testing.T, got []net.IP, want ...string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("Chain = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i].String() != want[i] {
+			t.Errorf("Chain[%d] = %q, want %q", i, got[i], want[i])
+		}
 	}
 }

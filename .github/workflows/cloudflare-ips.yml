@@ -1,0 +1,25 @@
+name: Cloudflare IP drift
+
+# The Cloudflare ranges behind TRUSTED_PROXY_PRESET=cloudflare are embedded in
+# the binary, so they go stale silently. When they do, requests arriving through
+# a newly published edge range resolve to the edge address instead of the
+# visitor and the IP whitelist denies them — the failure in #40, reappearing in
+# a deployment nobody changed. Catch the drift here rather than in production.
+
+on:
+  schedule:
+    # Weekly; Cloudflare changes these rarely.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check embedded Cloudflare ranges against the published list
+        run: ./scripts/update-cloudflare-ips.sh --check

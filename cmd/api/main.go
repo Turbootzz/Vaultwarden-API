@@ -68,11 +68,11 @@ func main() {
 	}
 
 	// Client IP resolution shares the trusted proxy set with fiber.
-	trustedProxies, err := getTrustedProxies()
+	trustedProxies, providers, err := getTrustedProxies()
 	if err != nil {
 		logger.Error.Fatalf("Failed to resolve trusted proxies: %v", err)
 	}
-	ipResolver, err := realip.New(trustedProxies)
+	ipResolver, err := realip.New(trustedProxies, providers...)
 	if err != nil {
 		logger.Error.Fatalf("Failed to initialize client IP resolver: %v", err)
 	}
@@ -204,7 +204,7 @@ func parseDurationEnv(key, fallback string) time.Duration {
 // included — because the client IP walk stops at the first untrusted hop and
 // returns it. An unnamed CDN edge is therefore what the IP whitelist ends up
 // judging, and edge addresses rotate per request (#40).
-func getTrustedProxies() ([]string, error) {
+func getTrustedProxies() ([]string, []realip.Provider, error) {
 	seen := make(map[string]bool)
 	result := []string{}
 
@@ -222,7 +222,7 @@ func getTrustedProxies() ([]string, error) {
 
 	for _, proxy := range strings.Split(os.Getenv("TRUSTED_PROXY_IP"), ",") {
 		trimmed := strings.TrimSpace(proxy)
-		if trimmed == "" || seen[trimmed] {
+		if trimmed == "" {
 			continue
 		}
 		if err := validateIPOrCIDR(trimmed); err != nil {
@@ -235,22 +235,25 @@ func getTrustedProxies() ([]string, error) {
 	// A misspelled preset is fatal rather than skipped: it is reached for when
 	// requests are already being denied, so ignoring it would leave that failure
 	// in place and add no signal about why.
+	var providers []realip.Provider
 	for _, name := range strings.Split(os.Getenv("TRUSTED_PROXY_PRESET"), ",") {
 		trimmed := strings.TrimSpace(name)
 		if trimmed == "" {
 			continue
 		}
-		ranges, err := realip.Preset(trimmed)
+		provider, err := realip.Preset(trimmed)
 		if err != nil {
-			return nil, fmt.Errorf("TRUSTED_PROXY_PRESET: %w", err)
+			return nil, nil, fmt.Errorf("TRUSTED_PROXY_PRESET: %w", err)
 		}
-		logger.Info.Printf("Trusting %d proxy ranges from preset %q", len(ranges), trimmed)
-		for _, entry := range ranges {
+		logger.Info.Printf("Trusting %d %s edge ranges; client address taken from %s",
+			len(provider.Ranges), provider.Name, provider.ClientIPHeader)
+		for _, entry := range provider.Ranges {
 			add(entry)
 		}
+		providers = append(providers, provider)
 	}
 
-	return result, nil
+	return result, providers, nil
 }
 
 // validateIPOrCIDR validates an IP or CIDR string.

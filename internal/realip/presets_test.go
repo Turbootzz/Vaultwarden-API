@@ -9,17 +9,25 @@ import (
 func TestPresetCloudflareCoversTheEdgeRanges(t *testing.T) {
 	t.Parallel()
 
-	ranges, err := Preset("cloudflare")
+	provider, err := Preset("cloudflare")
 	if err != nil {
 		t.Fatalf("Preset(cloudflare): %v", err)
 	}
-	if len(ranges) == 0 {
-		t.Fatal("Preset(cloudflare) is empty")
+	if len(provider.Ranges) == 0 {
+		t.Fatal("Preset(cloudflare) carries no ranges")
+	}
+	// Without the header the broad edge ranges are trusted with nothing to keep
+	// the result unspoofable — see Resolve.
+	if provider.ClientIPHeader != "CF-Connecting-IP" {
+		t.Errorf("ClientIPHeader = %q, want CF-Connecting-IP", provider.ClientIPHeader)
+	}
+	if provider.Name != "cloudflare" {
+		t.Errorf("Name = %q, want cloudflare", provider.Name)
 	}
 
-	r, err := New(ranges)
+	r, err := New(nil, provider)
 	if err != nil {
-		t.Fatalf("New(preset ranges): %v", err)
+		t.Fatalf("New(preset provider): %v", err)
 	}
 
 	// Addresses drawn from Cloudflare's published v4 and v6 blocks. If a refresh
@@ -78,15 +86,15 @@ func TestPresetReturnsAnIndependentCopy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Preset: %v", err)
 	}
-	original := first[0]
-	first[0] = "0.0.0.0/0"
+	original := first.Ranges[0]
+	first.Ranges[0] = "0.0.0.0/0"
 
 	second, err := Preset("cloudflare")
 	if err != nil {
 		t.Fatalf("Preset: %v", err)
 	}
-	if second[0] != original {
-		t.Errorf("Preset returned mutated data: got %q, want %q", second[0], original)
+	if second.Ranges[0] != original {
+		t.Errorf("Preset returned mutated data: got %q, want %q", second.Ranges[0], original)
 	}
 }
 
@@ -104,5 +112,30 @@ func TestPresetNamesAreSortedAndResolvable(t *testing.T) {
 		if _, err := Preset(name); err != nil {
 			t.Errorf("Preset(%q) from PresetNames(): %v", name, err)
 		}
+	}
+}
+
+// A botched refresh must fail where the preset can be named, not later as an
+// unattributed "invalid trusted proxy" that sends the operator to audit their
+// own TRUSTED_PROXY_IP.
+func TestParseRangeListRejectsCorruptData(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{"html error page", "# header\n<html>\n104.16.0.0/13\n"},
+		{"impossible prefix", "104.16.0.0/99\n"},
+		{"bare junk", "not-an-ip\n"},
+		{"comments only", "# nothing here\n\n"},
+		{"empty", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := parseRangeList(tt.raw); err == nil {
+				t.Errorf("parseRangeList(%q) = nil error, want an error", tt.raw)
+			}
+		})
 	}
 }
