@@ -386,3 +386,129 @@ func TestFoldedHeaderMasqueradingAsForwardedForIsRejected(t *testing.T) {
 		t.Fatal("expected fasthttp to reject the folded header-shaped continuation line")
 	}
 }
+
+func TestResolveReportsPeerAndChain(t *testing.T) {
+	resolver := testResolver(t)
+	_, ctx := acquireCtx(t, "127.0.0.1", "203.0.113.9, 172.18.0.4")
+
+	got := resolver.Resolve(ctx)
+	if got.Client != "203.0.113.9" {
+		t.Errorf("Client = %q, want 203.0.113.9", got.Client)
+	}
+	if got.Peer != "127.0.0.1" {
+		t.Errorf("Peer = %q, want 127.0.0.1", got.Peer)
+	}
+	want := []string{"203.0.113.9", "172.18.0.4"}
+	if len(got.Chain) != len(want) {
+		t.Fatalf("Chain = %v, want %v", got.Chain, want)
+	}
+	for i := range want {
+		if got.Chain[i] != want[i] {
+			t.Errorf("Chain[%d] = %q, want %q", i, got.Chain[i], want[i])
+		}
+	}
+}
+
+// The chain records what the resolver actually walked, so an unparseable entry
+// is absent from it too — that is the point, it explains why the walk landed
+// where it did rather than echoing the raw header back.
+func TestResolveChainHoldsOnlyParsedEntries(t *testing.T) {
+	resolver := testResolver(t)
+	_, ctx := acquireCtx(t, "127.0.0.1", "not-an-ip, 203.0.113.9:443")
+
+	got := resolver.Resolve(ctx)
+	if len(got.Chain) != 1 || got.Chain[0] != "203.0.113.9" {
+		t.Errorf("Chain = %v, want [203.0.113.9]", got.Chain)
+	}
+}
+
+func TestResolutionStringExplainsTheWalk(t *testing.T) {
+	t.Parallel()
+
+	res := Resolution{Client: "172.70.1.1", Peer: "172.18.0.5", Chain: []string{"192.168.1.81", "172.70.1.1"}}
+	want := "resolved 172.70.1.1, peer 172.18.0.5, xff=[192.168.1.81 172.70.1.1]"
+	if got := res.String(); got != want {
+		t.Errorf("String() = %q, want %q", got, want)
+	}
+
+	empty := Resolution{Client: "203.0.113.9", Peer: "203.0.113.9"}
+	if got := empty.String(); got != "resolved 203.0.113.9, peer 203.0.113.9, xff=[]" {
+		t.Errorf("String() with no chain = %q", got)
+	}
+}
+
+// A client controls how many entries it prepends, so the log line must not.
+func TestResolutionStringTruncatesALongChain(t *testing.T) {
+	t.Parallel()
+
+	chain := make([]string, 0, maxLoggedChain+3)
+	for i := 0; i < maxLoggedChain+3; i++ {
+		chain = append(chain, "203.0.113.9")
+	}
+	got := Resolution{Client: "203.0.113.9", Peer: "127.0.0.1", Chain: chain}.String()
+
+	if strings.Count(got, "203.0.113.9") != maxLoggedChain+1 { // +1 for the resolved address
+		t.Errorf("String() = %q, want only %d chain entries", got, maxLoggedChain)
+	}
+	if !strings.Contains(got, "+3 more") {
+		t.Errorf("String() = %q, want a truncation marker", got)
+	}
+}
+
+// Issue #40: behind a CDN the chain reaching the service is
+// "<real client>, <edge IP>". The edge is a hop like any other, so it has to be
+// trusted or the right-to-left walk stops there and the whitelist is evaluated
+// against an address that rotates per request.
+func TestClientIPBehindACDN(t *testing.T) {
+	const (
+		client = "192.168.1.81"
+		edge   = "172.70.1.1" // Cloudflare, inside 172.64.0.0/13
+	)
+	chain := client + ", " + edge
+
+	// Only the local proxy trusted: the walk stops at the edge. This is the
+	// reported bug, pinned so the behaviour cannot be changed by accident.
+	localOnly, err := New([]string{"127.0.0.1", "::1"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, ctx := acquireCtx(t, "127.0.0.1", chain)
+	if got := localOnly.ClientIP(ctx); got != edge {
+		t.Errorf("ClientIP() with an untrusted edge = %q, want the edge address %q", got, edge)
+	}
+
+	// With the edge ranges trusted the walk reaches the real client.
+	cf, err := Preset("cloudflare")
+	if err != nil {
+		t.Fatalf("Preset: %v", err)
+	}
+	withEdge, err := New(append([]string{"127.0.0.1", "::1"}, cf...))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	_, ctx = acquireCtx(t, "127.0.0.1", chain)
+	if got := withEdge.ClientIP(ctx); got != client {
+		t.Errorf("ClientIP() with the edge trusted = %q, want %q", got, client)
+	}
+}
+
+// Trusting the CDN's ranges must not make the CDN able to assert an address:
+// it appends the visitor address it saw, and everything the visitor prepended
+// stays to the left of that entry and is still ignored.
+func TestTrustedCDNDoesNotMakeTheChainSpoofable(t *testing.T) {
+	cf, err := Preset("cloudflare")
+	if err != nil {
+		t.Fatalf("Preset: %v", err)
+	}
+	resolver, err := New(append([]string{"127.0.0.1", "::1"}, cf...))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// The attacker sent "X-Forwarded-For: 192.168.1.81"; the CDN appended the
+	// address it saw (203.0.113.9) and the local proxy appended the edge.
+	_, ctx := acquireCtx(t, "127.0.0.1", "192.168.1.81, 203.0.113.9, 172.70.1.1")
+	if got := resolver.ClientIP(ctx); got != "203.0.113.9" {
+		t.Errorf("ClientIP() = %q, want the CDN-observed address 203.0.113.9", got)
+	}
+}

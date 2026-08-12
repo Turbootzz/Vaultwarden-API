@@ -64,7 +64,44 @@ func (r *Resolver) IsTrustedProxy(ip net.IP) bool {
 	return false
 }
 
+// maxLoggedChain caps how many forwarded entries String reports. The client
+// controls how many entries it prepends, so an uncapped log line is a client-
+// controlled amount of output.
+const maxLoggedChain = 8
+
+// Resolution is the outcome of resolving one request's client address, together
+// with the inputs it was derived from.
+//
+// The inputs are what makes a denied request diagnosable: "blocked 172.70.1.1"
+// reads like a whitelist typo, while the same line carrying the socket peer and
+// the forwarded chain shows an untrusted hop terminating the walk (#40).
+type Resolution struct {
+	// Client is the resolved originating address.
+	Client string
+	// Peer is the socket address the request arrived from.
+	Peer string
+	// Chain holds the parseable X-Forwarded-For entries, in header order.
+	Chain []string
+}
+
+// String renders the resolution for a log line, truncating a long chain.
+func (r Resolution) String() string {
+	chain := r.Chain
+	suffix := ""
+	if len(chain) > maxLoggedChain {
+		suffix = fmt.Sprintf(" +%d more", len(chain)-maxLoggedChain)
+		chain = chain[:maxLoggedChain]
+	}
+	return fmt.Sprintf("resolved %s, peer %s, xff=[%s%s]", r.Client, r.Peer, strings.Join(chain, " "), suffix)
+}
+
 // ClientIP returns the originating client address for c.
+func (r *Resolver) ClientIP(c *fiber.Ctx) string {
+	return r.Resolve(c).Client
+}
+
+// Resolve determines the originating client address for c and reports the
+// inputs it used.
 //
 // The socket peer wins unless it is itself a trusted proxy. For a trusted peer
 // the X-Forwarded-For chain is walked right to left and the first entry that is
@@ -73,20 +110,32 @@ func (r *Resolver) IsTrustedProxy(ip net.IP) bool {
 // cannot forge the entries the trusted proxies appended after it. Reading the
 // header left to right — as fiber's c.IP() does — hands an attacker the answer.
 //
-// A chain of nothing but trusted proxies falls back to the peer.
-func (r *Resolver) ClientIP(c *fiber.Ctx) string {
+// Every hop between the client and this service must therefore be trusted, CDN
+// edges included; an untrusted hop is where the walk stops and becomes the
+// answer. A chain of nothing but trusted proxies falls back to the peer.
+func (r *Resolver) Resolve(c *fiber.Ctx) Resolution {
 	peer := c.Context().RemoteIP()
+	res := Resolution{Peer: peer.String()}
+
 	if !r.IsTrustedProxy(peer) {
-		return peer.String()
+		res.Client = res.Peer
+		return res
 	}
 
 	forwarded := forwardedFor(c)
+	res.Chain = make([]string, len(forwarded))
+	for i, ip := range forwarded {
+		res.Chain[i] = ip.String()
+	}
+
+	res.Client = res.Peer
 	for i := len(forwarded) - 1; i >= 0; i-- {
 		if !r.IsTrustedProxy(forwarded[i]) {
-			return forwarded[i].String()
+			res.Client = res.Chain[i]
+			break
 		}
 	}
-	return peer.String()
+	return res
 }
 
 // forwardedFor extracts the valid addresses from the request's X-Forwarded-For
@@ -173,7 +222,7 @@ func parseHeaderIP(s string) net.IP {
 	return nil
 }
 
-// ctxKey is the unexported type for the resolved address in the request context.
+// ctxKey is the unexported type for the resolution in the request context.
 type ctxKey struct{}
 
 var clientIPKey ctxKey
@@ -182,7 +231,7 @@ var clientIPKey ctxKey
 // FromCtx. It must run before any middleware that makes decisions on client IP.
 func Middleware(r *Resolver) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		c.Locals(clientIPKey, r.ClientIP(c))
+		c.Locals(clientIPKey, r.Resolve(c))
 		return c.Next()
 	}
 }
@@ -190,8 +239,16 @@ func Middleware(r *Resolver) fiber.Handler {
 // FromCtx returns the address resolved by Middleware, falling back to fiber's
 // own c.IP() when the middleware is not installed.
 func FromCtx(c *fiber.Ctx) string {
-	if ip, ok := c.Locals(clientIPKey).(string); ok && ip != "" {
-		return ip
+	return ResolutionFromCtx(c).Client
+}
+
+// ResolutionFromCtx returns the resolution stored by Middleware. Without the
+// middleware installed it falls back to fiber's own c.IP(), reporting no chain
+// rather than one this package did not verify.
+func ResolutionFromCtx(c *fiber.Ctx) Resolution {
+	if res, ok := c.Locals(clientIPKey).(Resolution); ok && res.Client != "" {
+		return res
 	}
-	return c.IP()
+	ip := c.IP()
+	return Resolution{Client: ip, Peer: ip}
 }

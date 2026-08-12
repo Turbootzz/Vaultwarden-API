@@ -86,16 +86,12 @@ func TestSecretResponsesAreNotCompressed(t *testing.T) {
 }
 
 func TestGetTrustedProxiesAlwaysIncludesLoopback(t *testing.T) {
-	got := getTrustedProxies()
+	got, err := getTrustedProxies()
+	if err != nil {
+		t.Fatalf("getTrustedProxies: %v", err)
+	}
 	for _, want := range []string{"127.0.0.1", "::1"} {
-		found := false
-		for _, entry := range got {
-			if entry == want {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !contains(got, want) {
 			t.Errorf("getTrustedProxies() = %v, missing %s", got, want)
 		}
 	}
@@ -104,7 +100,10 @@ func TestGetTrustedProxiesAlwaysIncludesLoopback(t *testing.T) {
 func TestGetTrustedProxiesRejectsInvalidEntries(t *testing.T) {
 	t.Setenv("TRUSTED_PROXY_IP", "172.18.0.2, bogus, 10.0.0.0/8, , 127.0.0.1, 10.0.0.0/99")
 
-	got := getTrustedProxies()
+	got, err := getTrustedProxies()
+	if err != nil {
+		t.Fatalf("getTrustedProxies: %v", err)
+	}
 	want := []string{"127.0.0.1", "::1", "172.18.0.2", "10.0.0.0/8"}
 	if len(got) != len(want) {
 		t.Fatalf("getTrustedProxies() = %v, want %v", got, want)
@@ -114,4 +113,62 @@ func TestGetTrustedProxiesRejectsInvalidEntries(t *testing.T) {
 			t.Errorf("getTrustedProxies()[%d] = %q, want %q", i, got[i], want[i])
 		}
 	}
+}
+
+// Issue #40: a CDN edge is a hop that must be trusted, and hand-maintaining a
+// provider's range list is what operators get wrong. The preset expands to it.
+func TestGetTrustedProxiesExpandsPresets(t *testing.T) {
+	t.Setenv("TRUSTED_PROXY_PRESET", " CloudFlare , ")
+	t.Setenv("TRUSTED_PROXY_IP", "172.18.0.2")
+
+	got, err := getTrustedProxies()
+	if err != nil {
+		t.Fatalf("getTrustedProxies: %v", err)
+	}
+	for _, want := range []string{"127.0.0.1", "::1", "172.18.0.2", "172.64.0.0/13", "2606:4700::/32"} {
+		if !contains(got, want) {
+			t.Errorf("getTrustedProxies() = %v, missing %s", got, want)
+		}
+	}
+}
+
+// A misspelled preset must not start the server: the operator reached for it
+// because requests were already being denied, and silently ignoring it leaves
+// exactly that failure in place with no new signal.
+func TestGetTrustedProxiesRejectsUnknownPreset(t *testing.T) {
+	t.Setenv("TRUSTED_PROXY_PRESET", "cloudfare")
+
+	if _, err := getTrustedProxies(); err == nil {
+		t.Fatal("getTrustedProxies() = nil error for an unknown preset, want an error")
+	}
+}
+
+// The preset overlaps nothing here, but an operator listing the same range in
+// both places must not end up with it twice in fiber's trusted set.
+func TestGetTrustedProxiesDeduplicatesPresetEntries(t *testing.T) {
+	t.Setenv("TRUSTED_PROXY_PRESET", "cloudflare,cloudflare")
+	t.Setenv("TRUSTED_PROXY_IP", "172.64.0.0/13")
+
+	got, err := getTrustedProxies()
+	if err != nil {
+		t.Fatalf("getTrustedProxies: %v", err)
+	}
+	seen := 0
+	for _, entry := range got {
+		if entry == "172.64.0.0/13" {
+			seen++
+		}
+	}
+	if seen != 1 {
+		t.Errorf("getTrustedProxies() lists 172.64.0.0/13 %d times, want 1", seen)
+	}
+}
+
+func contains(haystack []string, needle string) bool {
+	for _, entry := range haystack {
+		if entry == needle {
+			return true
+		}
+	}
+	return false
 }

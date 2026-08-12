@@ -1,4 +1,4 @@
-.PHONY: help build run clean test docker-build docker-run docker-push docker-buildx-setup dev tidy
+.PHONY: help build run clean test docker-build docker-run docker-push docker-buildx-setup dev tidy update-cloudflare-ips
 
 # Variables
 APP_NAME=vaultwarden-api
@@ -114,3 +114,6 @@ docker-compose-logs: ## View docker-compose logs
 generate-api-key: ## Generate a random API key
 	@echo "Generated API key:"
 	@openssl rand -base64 32
+
+update-cloudflare-ips: ## Refresh the embedded Cloudflare ranges used by TRUSTED_PROXY_PRESET=cloudflare
+	@./scripts/update-cloudflare-ips.sh
