@@ -15,17 +15,48 @@
 set -euo pipefail
 
 check_only=false
-if [[ "${1:-}" == "--check" ]]; then
-	check_only=true
-fi
+allow_shrink=false
+for arg in "$@"; do
+	case "$arg" in
+	--check) check_only=true ;;
+	--allow-shrink) allow_shrink=true ;;
+	*)
+		echo "usage: ${BASH_SOURCE[0]##*/} [--check] [--allow-shrink]" >&2
+		exit 2
+		;;
+	esac
+done
 
 target="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/internal/realip/cloudflare_ips.txt"
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 
-# Cloudflare has published far more than these for years. The floors only need
-# to be high enough that a truncated response cannot pass; they are not a
-# prediction of the real count.
+# embedded_count reports how many ranges of a family the current list holds. The
+# floor is derived from it rather than hardcoded: a fixed number is either too
+# low to catch a partial truncation (dropping 5 of 15 ranges is still #40) or
+# too high to survive Cloudflare legitimately retiring one. ':' picks the family.
+embedded_count() {
+	local family="$1"
+	if [[ ! -f "$target" ]]; then
+		echo 0
+		return
+	fi
+	local ranges
+	ranges="$(grep -vE '^[[:space:]]*(#|$)' "$target" || true)"
+	# A here-string on an empty variable still feeds one empty line, which would
+	# count as a range.
+	if [[ -z "$ranges" ]]; then
+		echo 0
+		return
+	fi
+	if [[ "$family" == "v6" ]]; then
+		grep -c ':' <<<"$ranges" || true
+	else
+		grep -cv ':' <<<"$ranges" || true
+	fi
+}
+
+# Absolute backstops, in case the embedded list is itself missing or truncated.
 readonly MIN_V4=10
 readonly MIN_V6=5
 
@@ -60,15 +91,31 @@ fetch() {
 
 	count="$(grep -c . <<<"$body")"
 	if ((count < minimum)); then
-		echo "error: $url returned only $count ranges, expected at least $minimum (truncated?)" >&2
+		echo "error: $url returned $count ranges, fewer than the $minimum already embedded." >&2
+		echo "       A truncated response that drops ranges reintroduces #40 for traffic" >&2
+		echo "       arriving through them. If Cloudflare really retired a range, rerun" >&2
+		echo "       with --allow-shrink." >&2
 		return 1
 	fi
 
 	printf '%s\n' "$body"
 }
 
-v4="$(fetch https://www.cloudflare.com/ips-v4/ v4 "$MIN_V4")"
-v6="$(fetch https://www.cloudflare.com/ips-v6/ v6 "$MIN_V6")"
+# Never accept fewer ranges than are already trusted: every dropped range is one
+# whose traffic starts resolving to the edge address and failing the whitelist.
+floor_v4=$MIN_V4
+floor_v6=$MIN_V6
+if [[ "$allow_shrink" == false ]]; then
+	have_v4="$(embedded_count v4)"
+	have_v6="$(embedded_count v6)"
+	# if, not `((...)) && assign`: a false arithmetic test returns non-zero, which
+	# under set -e would abort the script rather than skip the assignment.
+	if ((have_v4 > floor_v4)); then floor_v4=$have_v4; fi
+	if ((have_v6 > floor_v6)); then floor_v6=$have_v6; fi
+fi
+
+v4="$(fetch https://www.cloudflare.com/ips-v4/ v4 "$floor_v4")"
+v6="$(fetch https://www.cloudflare.com/ips-v6/ v6 "$floor_v6")"
 
 cat >"$tmp" <<EOF
 # Cloudflare edge IP ranges.
