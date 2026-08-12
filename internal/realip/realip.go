@@ -45,6 +45,13 @@ func New(trustedProxies []string, providers ...Provider) (*Resolver, error) {
 
 	for _, p := range providers {
 		e := edge{name: p.Name, header: p.ClientIPHeader}
+		// Ranges without a header would widen the trusted set with nothing to
+		// verify against: the walk skips trusted entries, so a visitor inside
+		// those ranges gets its own prepended entries believed. No preset does
+		// this today; refusing keeps the invariant true for the next one.
+		if e.header == "" && len(p.Ranges) > 0 {
+			return nil, fmt.Errorf("provider %q: ranges without a client-IP header cannot be trusted unverifiably", p.Name)
+		}
 		for _, entry := range p.Ranges {
 			network, err := parseNetwork(strings.TrimSpace(entry))
 			if err != nil {
@@ -185,9 +192,14 @@ func (r *Resolver) Resolve(c *fiber.Ctx) Resolution {
 		return res
 	}
 
+	// Reading an edge header re-scans the raw header block, and the walk can
+	// reach an edge range once per chain entry — a count the client chooses. One
+	// lookup per header name per request keeps that work off the client's hands.
+	headers := headerCache{ctx: c}
+
 	for i := len(forwarded) - 1; i >= 0; i-- {
 		if e := r.edgeFor(forwarded[i]); e != nil {
-			if ip, ok := e.clientIP(c); ok {
+			if ip, ok := headers.clientIP(e); ok {
 				res.Client, res.Via = ip, e.name
 				return res
 			}
@@ -205,7 +217,7 @@ func (r *Resolver) Resolve(c *fiber.Ctx) Resolution {
 	// Nothing untrusted in the chain. The edge may still be the peer itself, when
 	// the provider connects to this service directly.
 	if e := r.edgeFor(peer); e != nil {
-		if ip, ok := e.clientIP(c); ok {
+		if ip, ok := headers.clientIP(e); ok {
 			res.Client, res.Via = ip, e.name
 			return res
 		}
@@ -213,6 +225,30 @@ func (r *Resolver) Resolve(c *fiber.Ctx) Resolution {
 	}
 	res.Client = res.Peer
 	return res
+}
+
+// headerCache resolves each provider's client-IP header at most once per
+// request. Deployments have one or two providers, so a slice beats a map.
+type headerCache struct {
+	ctx     *fiber.Ctx
+	entries []headerCacheEntry
+}
+
+type headerCacheEntry struct {
+	header string
+	value  string
+	ok     bool
+}
+
+func (h *headerCache) clientIP(e *edge) (string, bool) {
+	for _, entry := range h.entries {
+		if entry.header == e.header {
+			return entry.value, entry.ok
+		}
+	}
+	value, ok := e.clientIP(h.ctx)
+	h.entries = append(h.entries, headerCacheEntry{header: e.header, value: value, ok: ok})
+	return value, ok
 }
 
 // edgeFor returns the provider whose ranges contain ip, if any.

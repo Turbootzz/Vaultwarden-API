@@ -542,8 +542,8 @@ func TestAmbiguousEdgeHeaderIsNotBelieved(t *testing.T) {
 	_, ctx := acquireRawCtx(t, "127.0.0.1", raw)
 
 	got := resolver.Resolve(ctx)
-	if got.Client == "192.168.1.81" {
-		t.Errorf("Client = %q, an ambiguous edge header must not be believed", got.Client)
+	if got.Client != "203.0.113.9" {
+		t.Errorf("Client = %q, want the chain-walk answer 203.0.113.9; an ambiguous edge header must not be believed", got.Client)
 	}
 	if got.EdgeHeaderMissing != "cloudflare" {
 		t.Errorf("EdgeHeaderMissing = %q, want cloudflare so the denial says why", got.EdgeHeaderMissing)
@@ -655,5 +655,55 @@ func assertChain(t *testing.T, got []net.IP, want ...string) {
 		if got[i].String() != want[i] {
 			t.Errorf("Chain[%d] = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+// A provider whose ranges are trusted with no header to verify against is the
+// spoofing case Resolve documents, so it is refused rather than accepted.
+func TestNewRejectsProviderRangesWithoutAClientIPHeader(t *testing.T) {
+	t.Parallel()
+
+	_, err := New(nil, Provider{Name: "headerless", Ranges: []string{"172.64.0.0/13"}})
+	if err == nil {
+		t.Fatal("New = nil error for ranges without a client-IP header, want an error")
+	}
+	if !strings.Contains(err.Error(), "headerless") {
+		t.Errorf("error %q does not name the provider", err)
+	}
+}
+
+// The header lookup rescans the raw header block, and the walk can reach an edge
+// range once per chain entry — a count the client chooses. It must be read once.
+func TestEdgeHeaderIsReadOncePerRequest(t *testing.T) {
+	t.Parallel()
+
+	provider, err := Preset("cloudflare")
+	if err != nil {
+		t.Fatalf("Preset: %v", err)
+	}
+	resolver, err := New([]string{"127.0.0.1"}, provider)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Every entry but the last is inside a Cloudflare range, so an uncached
+	// lookup would rescan the header block once per entry.
+	chain := strings.TrimSuffix(strings.Repeat("172.70.1.1, ", 32), ", ") + ", 203.0.113.9"
+	_, ctx := acquireCtx(t, "127.0.0.1", chain)
+
+	cache := headerCache{ctx: ctx}
+	e := &edge{name: "cloudflare", header: "CF-Connecting-IP"}
+	for i := 0; i < 5; i++ {
+		if _, ok := cache.clientIP(e); ok {
+			t.Fatal("no CF-Connecting-IP was sent, yet one was reported")
+		}
+	}
+	if len(cache.entries) != 1 {
+		t.Errorf("cache holds %d entries after 5 lookups, want 1", len(cache.entries))
+	}
+
+	// The walk itself still lands on the untrusted tail entry.
+	if got := resolver.ClientIP(ctx); got != "203.0.113.9" {
+		t.Errorf("ClientIP() = %q, want 203.0.113.9", got)
 	}
 }

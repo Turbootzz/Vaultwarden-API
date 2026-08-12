@@ -354,7 +354,7 @@ Three consequences worth knowing:
 With Cloudflare in front (orange-cloud DNS → your reverse proxy → this service),
 the chain arriving here is:
 
-```
+```text
 X-Forwarded-For: <real client>, <cloudflare edge>
 ```
 
@@ -408,7 +408,7 @@ record that reaches the reverse proxy directly (that proxy must still be trusted
 
 A blocked request logs the whole resolution, not just the verdict:
 
-```
+```text
 WARN: IP blocked (not whitelisted) on GET /secret/db: resolved 172.70.1.1, peer 172.18.0.5, xff=[192.168.1.81 172.70.1.1]
 ```
 
