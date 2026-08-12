@@ -16,8 +16,9 @@ type Resolver struct {
 	edges   []edge
 }
 
-// edge is a fronting network whose ranges are trusted and which publishes the
-// visitor address in a header its own infrastructure sets.
+// edge is a fronting network that publishes the visitor address in a header its
+// own infrastructure sets. Its ranges are trusted as proxies only when the
+// operator named the provider; otherwise it is used for recognition alone.
 type edge struct {
 	name     string
 	networks []*net.IPNet
@@ -27,8 +28,11 @@ type edge struct {
 // New builds a resolver from IP addresses and CIDR ranges. A bare address is
 // treated as a single-host range.
 //
-// Each provider's ranges are trusted as proxies too, and its client-IP header
-// is consulted for requests that arrived through it — see Resolve.
+// Every known provider is recognised whether or not it is named here: a CDN
+// address that terminates the walk is a broken resolution, and the provider's
+// own client-IP header is the fix (see Resolve). Naming a provider additionally
+// trusts its ranges as proxies, which is only needed when the header cannot
+// reach this service.
 func New(trustedProxies []string, providers ...Provider) (*Resolver, error) {
 	r := &Resolver{}
 	for _, entry := range trustedProxies {
@@ -43,28 +47,53 @@ func New(trustedProxies []string, providers ...Provider) (*Resolver, error) {
 		r.trusted = append(r.trusted, network)
 	}
 
+	named := make(map[string]bool, len(providers))
 	for _, p := range providers {
-		e := edge{name: p.Name, header: p.ClientIPHeader}
 		// Ranges without a header would widen the trusted set with nothing to
 		// verify against: the walk skips trusted entries, so a visitor inside
 		// those ranges gets its own prepended entries believed. No preset does
 		// this today; refusing keeps the invariant true for the next one.
-		if e.header == "" && len(p.Ranges) > 0 {
+		if p.ClientIPHeader == "" && len(p.Ranges) > 0 {
 			return nil, fmt.Errorf("provider %q: ranges without a client-IP header cannot be trusted unverifiably", p.Name)
 		}
-		for _, entry := range p.Ranges {
-			network, err := parseNetwork(strings.TrimSpace(entry))
-			if err != nil {
-				return nil, fmt.Errorf("provider %q: invalid range %q: %w", p.Name, entry, err)
-			}
-			e.networks = append(e.networks, network)
-			r.trusted = append(r.trusted, network)
+		e, err := newEdge(p)
+		if err != nil {
+			return nil, err
 		}
-		if e.header != "" && len(e.networks) > 0 {
-			r.edges = append(r.edges, e)
-		}
+		r.trusted = append(r.trusted, e.networks...)
+		r.edges = append(r.edges, e)
+		named[strings.ToLower(p.Name)] = true
 	}
+
+	// Recognise the remaining known providers without trusting their ranges.
+	for _, name := range PresetNames() {
+		if named[name] {
+			continue
+		}
+		p, err := Preset(name)
+		if err != nil {
+			return nil, err
+		}
+		e, err := newEdge(p)
+		if err != nil {
+			return nil, err
+		}
+		r.edges = append(r.edges, e)
+	}
+
 	return r, nil
+}
+
+func newEdge(p Provider) (edge, error) {
+	e := edge{name: p.Name, header: p.ClientIPHeader}
+	for _, entry := range p.Ranges {
+		network, err := parseNetwork(strings.TrimSpace(entry))
+		if err != nil {
+			return edge{}, fmt.Errorf("provider %q: invalid range %q: %w", p.Name, entry, err)
+		}
+		e.networks = append(e.networks, network)
+	}
+	return e, nil
 }
 
 func parseNetwork(s string) (*net.IPNet, error) {
@@ -187,44 +216,64 @@ func (r *Resolver) Resolve(c *fiber.Ctx) Resolution {
 	forwarded := forwardedFor(c)
 	res := Resolution{Peer: peer.String(), Chain: forwarded}
 
-	if !r.IsTrustedProxy(peer) {
-		res.Client = res.Peer
-		return res
-	}
-
 	// Reading an edge header re-scans the raw header block, and the walk can
 	// reach an edge range once per chain entry — a count the client chooses. One
 	// lookup per header name per request keeps that work off the client's hands.
 	headers := headerCache{ctx: c}
 
+	if !r.IsTrustedProxy(peer) {
+		// A peer inside a provider's ranges is that provider's edge connecting
+		// directly. The address came off the socket rather than out of a header,
+		// so it is not something a client can assert.
+		r.applyEdge(&res, &headers, peer)
+		if res.Client == "" {
+			res.Client = res.Peer
+		}
+		return res
+	}
+
 	for i := len(forwarded) - 1; i >= 0; i-- {
-		if e := r.edgeFor(forwarded[i]); e != nil {
-			if ip, ok := headers.clientIP(e); ok {
-				res.Client, res.Via = ip, e.name
+		trusted := r.IsTrustedProxy(forwarded[i])
+
+		// An entry is consulted as an edge either because its provider was named
+		// (so the walk would skip past it) or because the walk is about to stop
+		// here and hand back a CDN address, which is never a real client.
+		if !trusted || r.edgeFor(forwarded[i]) != nil {
+			r.applyEdge(&res, &headers, forwarded[i])
+			if res.Client != "" {
 				return res
 			}
-			// Degrade to the plain walk rather than deny: a proxy that strips the
-			// header would otherwise take the deployment down. The note travels
-			// with the resolution so a denial says which of the two happened.
-			res.EdgeHeaderMissing = e.name
 		}
-		if !r.IsTrustedProxy(forwarded[i]) {
+
+		if !trusted {
 			res.Client = forwarded[i].String()
 			return res
 		}
 	}
 
-	// Nothing untrusted in the chain. The edge may still be the peer itself, when
-	// the provider connects to this service directly.
-	if e := r.edgeFor(peer); e != nil {
-		if ip, ok := headers.clientIP(e); ok {
-			res.Client, res.Via = ip, e.name
-			return res
-		}
-		res.EdgeHeaderMissing = e.name
+	// Nothing untrusted in the chain: the peer is the last candidate.
+	r.applyEdge(&res, &headers, peer)
+	if res.Client == "" {
+		res.Client = res.Peer
 	}
-	res.Client = res.Peer
 	return res
+}
+
+// applyEdge sets res.Client from the provider header of the edge containing ip,
+// if ip belongs to one and the header is usable. A provider recognised without a
+// usable header is recorded instead, so a denial says which of the two happened.
+// Resolution then degrades to the plain walk rather than denying outright — a
+// proxy that strips the header must not take the deployment down.
+func (r *Resolver) applyEdge(res *Resolution, headers *headerCache, ip net.IP) {
+	e := r.edgeFor(ip)
+	if e == nil {
+		return
+	}
+	if value, ok := headers.clientIP(e); ok {
+		res.Client, res.Via = value, e.name
+		return
+	}
+	res.EdgeHeaderMissing = e.name
 }
 
 // headerCache resolves each provider's client-IP header at most once per

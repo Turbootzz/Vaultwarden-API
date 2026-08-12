@@ -126,7 +126,7 @@ You can also use **custom fields** or **notes** — the API returns the most rel
 | `WRITE_TIMEOUT` | No | `10s` | HTTP server write timeout |
 | `CORS_ALLOWED_ORIGINS` | No | `http://localhost:3000` | Comma-separated origins allowed by CORS |
 | `TRUSTED_PROXY_IP` | No | `127.0.0.1,::1` | Extra trusted reverse proxy IPs/CIDRs (comma-separated); loopback is always trusted. See [Client IP behind a proxy](#client-ip-behind-a-proxy) |
-| `TRUSTED_PROXY_PRESET` | No | — | Comma-separated provider presets whose ranges are added to the trusted set. Only `cloudflare` today. **Required if you front this service with Cloudflare** — see [Behind a CDN](#behind-a-cdn-cloudflare). An unknown name aborts startup |
+| `TRUSTED_PROXY_PRESET` | No | — | Comma-separated provider presets whose ranges are added to the trusted set. Only `cloudflare` today. **Not needed for a normal Cloudflare deployment** — that works out of the box; see [Behind a CDN](#behind-a-cdn-cloudflare). An unknown name aborts startup |
 | `ENVIRONMENT` | No | `development` | Set to `production` to hide errors |
 | `DEBUG` | No | `false` | Enable debug logging |
 
@@ -336,9 +336,10 @@ past the whitelist in the trailer section of a chunked request.
 Three consequences worth knowing:
 
 - **Every hop between the client and this service must be trusted.** The walk stops
-  at the first untrusted entry and *returns* it, so one unlisted hop — a CDN edge,
-  a second reverse proxy, a sidecar — becomes the address `ALLOWED_IPS` is judged
-  against, and no whitelist entry will ever match it. See
+  at the first untrusted entry and *returns* it, so one unlisted hop — a second
+  reverse proxy, a sidecar — becomes the address `ALLOWED_IPS` is judged against,
+  and no whitelist entry will ever match it. Known CDN edges are the exception:
+  they are recognised and resolved automatically, see
   [Behind a CDN](#behind-a-cdn-cloudflare).
 - **Set `TRUSTED_PROXY_IP` to your proxies, and only your proxies.** Anything that can
   connect from a trusted address *is* a proxy as far as this service can tell,
@@ -359,38 +360,48 @@ X-Forwarded-For: <real client>, <cloudflare edge>
 ```
 
 Cloudflare sets the header to the visitor address, and your own proxy appends the
-address *it* saw — the edge. Edge addresses are not trusted by default, so the
-walk stops there and the whitelist is evaluated against a Cloudflare address that
-rotates per request: **every request is denied**, whatever `ALLOWED_IPS` says.
-That is the failure reported in [#40](https://github.com/Turbootzz/vaultwarden-api/issues/40).
+address *it* saw — the edge. Edge addresses rotate per request and can never be
+whitelisted, so a walk that stops there denies every request whatever
+`ALLOWED_IPS` says. That was the failure reported in
+[#40](https://github.com/Turbootzz/vaultwarden-api/issues/40).
 
-Fix it by trusting the edge ranges:
+**This is handled automatically — no configuration needed.** Cloudflare's
+[published ranges](https://www.cloudflare.com/ips/) are embedded in the binary, and
+when the walk lands on an address inside them the answer is taken from
+`CF-Connecting-IP` instead. A CDN edge address is never a real client, so treating
+it as the answer is always wrong; the edge sets that header itself and overwrites
+any the visitor sent, which makes it the one value a visitor behind the edge cannot
+choose. A weekly CI job flags drift in the embedded ranges; refresh with
+`make update-cloudflare-ips`.
+
+Recognising a provider is **not** the same as trusting it. The ranges are not added
+to the trusted-proxy set, so a request coming *from* one is still just a client. The
+header is read only when a trusted hop put the CDN address there — a client that
+prepends a Cloudflare address to `X-Forwarded-For` never has it reached, because the
+walk stops at the address your own proxy appended.
+
+##### When you still need `TRUSTED_PROXY_PRESET`
+
+Only when `CF-Connecting-IP` cannot reach this service — a proxy in between strips
+it, or sends it twice. The denial log says so explicitly:
+
+```text
+resolved 172.71.99.34, peer 172.27.0.1, xff=[31.201.224.107 172.71.99.34] (cloudflare edge in the chain but no usable client-IP header)
+```
 
 ```env
 TRUSTED_PROXY_PRESET=cloudflare
 TRUSTED_PROXY_IP=172.18.0.5        # your reverse proxy, as before
 ```
 
-The preset expands to Cloudflare's [published ranges](https://www.cloudflare.com/ips/),
-embedded in the binary so startup never depends on fetching them. A weekly CI job
-flags drift; refresh with `make update-cloudflare-ips`.
+That additionally trusts the edge ranges as proxies, so the walk skips past them to
+the entry Cloudflare appended. It is the weaker mechanism of the two: the walk
+*skips* trusted entries, so a visitor whose own address is inside those ranges — one
+Cloudflare zone proxying to another — has its prepended entries reached and
+believed. Prefer fixing the stripped header.
 
-**Why a preset rather than pasting the ranges into `TRUSTED_PROXY_IP`.** Trusting
-a whole CDN's ranges by hand quietly re-opens the spoofing hole the right-to-left
-walk closes. The walk *skips* trusted entries, so a visitor whose own address is
-inside those ranges — one Cloudflare zone proxying to another — has its prepended
-entries reached and believed. A preset therefore also carries the provider's
-client-IP header (`CF-Connecting-IP` for Cloudflare), which the edge sets itself
-and overwrites if the visitor supplied one. Reaching a Cloudflare hop in the chain
-ends the walk and takes the answer from that header instead — the one value a
-visitor behind the edge cannot choose. The header is read only for requests that
-actually arrived through a trusted edge range; anywhere else it is just another
-client-written header and is ignored. If the header is missing or arrives twice,
-resolution falls back to the plain chain walk and the denial log says so, so a
-proxy that strips it degrades rather than taking the deployment down.
-
-For a provider without a preset, list its ranges in `TRUSTED_PROXY_IP` by hand and
-be aware of the caveat above.
+For a provider with no preset, list its ranges in `TRUSTED_PROXY_IP` by hand, with
+the same caveat.
 
 **The residual trade-off:** anything connecting from a trusted range can still
 assert a client address. Trusting a CDN's ranges is only safe while the CDN is the
