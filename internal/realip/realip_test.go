@@ -488,8 +488,9 @@ func TestClientIPBehindACDN(t *testing.T) {
 	)
 	chain := client + ", " + edge
 
-	// Only the local proxy trusted: the walk stops at the edge. This is the
-	// reported bug, pinned so the behaviour cannot be changed by accident.
+	// No edge header on this request, so there is nothing to resolve the edge
+	// hop with and the walk stops there — the #40 symptom, which now only occurs
+	// when CF-Connecting-IP cannot reach the service (#42).
 	localOnly, err := New([]string{"127.0.0.1", "::1"})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -705,5 +706,157 @@ func TestEdgeHeaderIsReadOncePerRequest(t *testing.T) {
 	// The walk itself still lands on the untrusted tail entry.
 	if got := resolver.ClientIP(ctx); got != "203.0.113.9" {
 		t.Errorf("ClientIP() = %q, want 203.0.113.9", got)
+	}
+}
+
+// Reproduces the production chain from #42: a whitelisted client reaching a
+// Cloudflare-fronted deployment through a local reverse proxy on the docker
+// bridge. Nothing is configured beyond the proxy itself, which is the state
+// every existing deployment upgrades into — the #40 fix must not need an env
+// var to take effect.
+func TestClientIPBehindACDNWithoutAnyProviderConfigured(t *testing.T) {
+	const (
+		client = "31.201.224.107"
+		edge   = "172.71.99.34" // Cloudflare 172.64.0.0/13
+		proxy  = "172.27.0.1"   // docker bridge gateway, the local reverse proxy
+	)
+
+	resolver, err := New([]string{"127.0.0.1", "::1", proxy})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, ctx := acquireRawCtx(t, proxy, request(client+", "+edge, client))
+	got := resolver.Resolve(ctx)
+
+	if got.Client != client {
+		t.Errorf("Client = %q, want %q", got.Client, client)
+	}
+	if got.Via != "cloudflare" {
+		t.Errorf("Via = %q, want cloudflare", got.Via)
+	}
+}
+
+// Every edge address seen in the #42 production logs, each rotating per request
+// and none of them ever whitelistable.
+func TestClientIPBehindEveryObservedCloudflareEdge(t *testing.T) {
+	const client = "31.201.224.107"
+	const proxy = "172.27.0.1"
+
+	resolver, err := New([]string{proxy})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for _, edge := range []string{
+		"172.71.99.34", "172.70.46.193", "104.23.170.80", "172.71.103.208",
+		"104.23.166.178", "162.159.113.158", "141.101.76.54", "172.71.182.64",
+		"172.71.95.78", "104.23.172.6", "141.101.76.55", "104.23.168.62",
+	} {
+		t.Run(edge, func(t *testing.T) {
+			_, ctx := acquireRawCtx(t, proxy, request(client+", "+edge, client))
+			if got := resolver.ClientIP(ctx); got != client {
+				t.Errorf("ClientIP() = %q, want %q", got, client)
+			}
+		})
+	}
+}
+
+// Recognition must not become trust: the header is read only when a CDN address
+// is genuinely in the position the walk landed on, and that position is written
+// by a trusted hop. A client-prepended CDN address is never reached.
+func TestAutodetectDoesNotLetAClientAssertAnAddress(t *testing.T) {
+	const proxy = "172.27.0.1"
+	resolver, err := New([]string{proxy})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	tests := []struct {
+		name         string
+		forwardedFor string
+		connectingIP string
+		want         string
+	}{
+		{
+			// The attacker prepends a Cloudflare address and the header it wants
+			// believed. The proxy appends what it really saw, and the walk stops
+			// there without ever reaching the prepended entry.
+			name:         "prepended edge address with a forged header",
+			forwardedFor: "172.71.99.34, 203.0.113.9",
+			connectingIP: "31.201.224.107",
+			want:         "203.0.113.9",
+		},
+		{
+			name:         "forged header with no CDN hop at all",
+			forwardedFor: "203.0.113.9",
+			connectingIP: "31.201.224.107",
+			want:         "203.0.113.9",
+		},
+		{
+			name:         "forged header and a prepended whitelisted address",
+			forwardedFor: "31.201.224.107, 203.0.113.9",
+			connectingIP: "31.201.224.107",
+			want:         "203.0.113.9",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ctx := acquireRawCtx(t, proxy, request(tt.forwardedFor, tt.connectingIP))
+			if got := resolver.ClientIP(ctx); got != tt.want {
+				t.Errorf("ClientIP() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// If the header cannot reach this service the walk still stops at the edge, but
+// the resolution says so — that is the signal to set TRUSTED_PROXY_PRESET.
+func TestAutodetectReportsARecognisedEdgeWithNoHeader(t *testing.T) {
+	const proxy = "172.27.0.1"
+	resolver, err := New([]string{proxy})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, ctx := acquireCtx(t, proxy, "31.201.224.107, 172.71.99.34")
+	got := resolver.Resolve(ctx)
+
+	if got.Client != "172.71.99.34" {
+		t.Errorf("Client = %q, want the edge address without a usable header", got.Client)
+	}
+	if got.EdgeHeaderMissing != "cloudflare" {
+		t.Errorf("EdgeHeaderMissing = %q, want cloudflare", got.EdgeHeaderMissing)
+	}
+}
+
+// Cloudflare reaching the service with no reverse proxy in front of it: the
+// peer is the edge, and its address came off the socket.
+func TestAutodetectWhenTheUntrustedPeerIsTheEdge(t *testing.T) {
+	resolver, err := New(nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, ctx := acquireRawCtx(t, "172.71.99.34", request("", "31.201.224.107"))
+	got := resolver.Resolve(ctx)
+	if got.Client != "31.201.224.107" {
+		t.Errorf("Client = %q, want 31.201.224.107", got.Client)
+	}
+	if got.Via != "cloudflare" {
+		t.Errorf("Via = %q, want cloudflare", got.Via)
+	}
+}
+
+// Recognition alone must not make a CDN range a trusted proxy: without the
+// operator naming the provider, a request from inside those ranges is still
+// just a client.
+func TestAutodetectDoesNotTrustProviderRanges(t *testing.T) {
+	resolver, err := New([]string{"127.0.0.1"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if resolver.IsTrustedProxy(net.ParseIP("172.71.99.34")) {
+		t.Error("a Cloudflare range is trusted as a proxy without being configured")
 	}
 }
