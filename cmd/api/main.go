@@ -68,8 +68,11 @@ func main() {
 	}
 
 	// Client IP resolution shares the trusted proxy set with fiber.
-	trustedProxies := getTrustedProxies()
-	ipResolver, err := realip.New(trustedProxies)
+	trustedProxies, providers, err := getTrustedProxies()
+	if err != nil {
+		logger.Error.Fatalf("Failed to resolve trusted proxies: %v", err)
+	}
+	ipResolver, err := realip.New(trustedProxies, providers...)
 	if err != nil {
 		logger.Error.Fatalf("Failed to initialize client IP resolver: %v", err)
 	}
@@ -194,33 +197,63 @@ func parseDurationEnv(key, fallback string) time.Duration {
 	return d
 }
 
-// getTrustedProxies returns the list of trusted proxy IPs.
-func getTrustedProxies() []string {
+// getTrustedProxies returns the list of trusted proxy IPs: loopback, whatever
+// TRUSTED_PROXY_IP names, and the ranges of any TRUSTED_PROXY_PRESET.
+//
+// Every hop between the client and this service has to appear here — a CDN edge
+// included — because the client IP walk stops at the first untrusted hop and
+// returns it. An unnamed CDN edge is therefore what the IP whitelist ends up
+// judging, and edge addresses rotate per request (#40).
+func getTrustedProxies() ([]string, []realip.Provider, error) {
 	seen := make(map[string]bool)
 	result := []string{}
 
-	for _, ip := range []string{"127.0.0.1", "::1"} {
-		result = append(result, ip)
-		seen[ip] = true
-	}
-
-	if proxyIP := os.Getenv("TRUSTED_PROXY_IP"); proxyIP != "" {
-		proxies := strings.Split(proxyIP, ",")
-		for _, proxy := range proxies {
-			trimmed := strings.TrimSpace(proxy)
-			if trimmed == "" || seen[trimmed] {
-				continue
-			}
-			if err := validateIPOrCIDR(trimmed); err != nil {
-				logger.Warn.Printf("Ignoring invalid IP/CIDR in TRUSTED_PROXY_IP: %s (%v)", trimmed, err)
-				continue
-			}
-			result = append(result, trimmed)
-			seen[trimmed] = true
+	add := func(entry string) {
+		if entry == "" || seen[entry] {
+			return
 		}
+		result = append(result, entry)
+		seen[entry] = true
 	}
 
-	return result
+	for _, ip := range []string{"127.0.0.1", "::1"} {
+		add(ip)
+	}
+
+	for _, proxy := range strings.Split(os.Getenv("TRUSTED_PROXY_IP"), ",") {
+		trimmed := strings.TrimSpace(proxy)
+		if trimmed == "" {
+			continue
+		}
+		if err := validateIPOrCIDR(trimmed); err != nil {
+			logger.Warn.Printf("Ignoring invalid IP/CIDR in TRUSTED_PROXY_IP: %s (%v)", trimmed, err)
+			continue
+		}
+		add(trimmed)
+	}
+
+	// A misspelled preset is fatal rather than skipped: it is reached for when
+	// requests are already being denied, so ignoring it would leave that failure
+	// in place and add no signal about why.
+	var providers []realip.Provider
+	for _, name := range strings.Split(os.Getenv("TRUSTED_PROXY_PRESET"), ",") {
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
+		}
+		provider, err := realip.Preset(trimmed)
+		if err != nil {
+			return nil, nil, fmt.Errorf("TRUSTED_PROXY_PRESET: %w", err)
+		}
+		logger.Info.Printf("Trusting %d %s edge ranges; client address taken from %s",
+			len(provider.Ranges), provider.Name, provider.ClientIPHeader)
+		for _, entry := range provider.Ranges {
+			add(entry)
+		}
+		providers = append(providers, provider)
+	}
+
+	return result, providers, nil
 }
 
 // validateIPOrCIDR validates an IP or CIDR string.

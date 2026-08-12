@@ -98,21 +98,26 @@ func (wl *IPWhitelist) Middleware() fiber.Handler {
 			// fetch that failed, most likely. Serving every caller here would turn
 			// an outage into a silently open door, so fail closed.
 			logger.Error.Printf(
-				"IP whitelist is configured but holds no ranges (GitHub fetch failed?); denying %s on %s %s",
-				realip.FromCtx(c), c.Method(), c.Path())
+				"IP whitelist is configured but holds no ranges (GitHub fetch failed?); denying %s %s: %s",
+				c.Method(), c.Path(), realip.ResolutionFromCtx(c))
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 				"error": "access denied: IP not whitelisted",
 			})
 		}
 
-		clientIP := realip.FromCtx(c)
+		resolved := realip.ResolutionFromCtx(c)
 
-		if wl.IsAllowed(clientIP) {
-			logger.Debug.Printf("IP allowed: %s", clientIP)
+		if wl.IsAllowed(resolved.Client) {
+			logger.Debug.Printf("IP allowed: %s", resolved.Client)
 			return c.Next()
 		}
 
-		logger.Warn.Printf("IP blocked (not whitelisted): %s on %s %s", clientIP, c.Method(), c.Path())
+		// The resolution, not just the address: behind a CDN or any hop that is
+		// not in TRUSTED_PROXY_IP the walk stops early, and the address logged is
+		// an intermediary rather than the visitor. Reporting the socket peer and
+		// the forwarded chain alongside it makes that case read as a proxy
+		// misconfiguration instead of a whitelist typo (#40).
+		logger.Warn.Printf("IP blocked (not whitelisted) on %s %s: %s", c.Method(), c.Path(), resolved)
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
 			"error": "access denied: IP not whitelisted",
 		})

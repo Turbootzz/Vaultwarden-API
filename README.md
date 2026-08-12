@@ -126,6 +126,7 @@ You can also use **custom fields** or **notes** — the API returns the most rel
 | `WRITE_TIMEOUT` | No | `10s` | HTTP server write timeout |
 | `CORS_ALLOWED_ORIGINS` | No | `http://localhost:3000` | Comma-separated origins allowed by CORS |
 | `TRUSTED_PROXY_IP` | No | `127.0.0.1,::1` | Extra trusted reverse proxy IPs/CIDRs (comma-separated); loopback is always trusted. See [Client IP behind a proxy](#client-ip-behind-a-proxy) |
+| `TRUSTED_PROXY_PRESET` | No | — | Comma-separated provider presets whose ranges are added to the trusted set. Only `cloudflare` today. **Required if you front this service with Cloudflare** — see [Behind a CDN](#behind-a-cdn-cloudflare). An unknown name aborts startup |
 | `ENVIRONMENT` | No | `development` | Set to `production` to hide errors |
 | `DEBUG` | No | `false` | Enable debug logging |
 
@@ -332,16 +333,97 @@ right-to-left walk trusts. Without that, a client behind a proxy that forwards
 trailers (HAProxy and Envoy do; nginx does not) could smuggle its chosen address
 past the whitelist in the trailer section of a chunked request.
 
-Two consequences worth knowing:
+Three consequences worth knowing:
 
-- **Set `TRUSTED_PROXY_IP` to your proxy, and only your proxy.** Anything that can
-  connect from a trusted address *is* the proxy as far as this service can tell,
+- **Every hop between the client and this service must be trusted.** The walk stops
+  at the first untrusted entry and *returns* it, so one unlisted hop — a CDN edge,
+  a second reverse proxy, a sidecar — becomes the address `ALLOWED_IPS` is judged
+  against, and no whitelist entry will ever match it. See
+  [Behind a CDN](#behind-a-cdn-cloudflare).
+- **Set `TRUSTED_PROXY_IP` to your proxies, and only your proxies.** Anything that can
+  connect from a trusted address *is* a proxy as far as this service can tell,
   and can therefore claim any client address. A broad range like `172.16.0.0/12`
   hands that power to every container on the bridge network.
 - **Loopback is always trusted**, so any process on the same host can assert a
   client address. This is what makes the documented `127.0.0.1:8080` compose
   binding work with a same-host proxy; if you expose the service some other way,
   scope the port accordingly.
+
+#### Behind a CDN (Cloudflare)
+
+With Cloudflare in front (orange-cloud DNS → your reverse proxy → this service),
+the chain arriving here is:
+
+```text
+X-Forwarded-For: <real client>, <cloudflare edge>
+```
+
+Cloudflare sets the header to the visitor address, and your own proxy appends the
+address *it* saw — the edge. Edge addresses are not trusted by default, so the
+walk stops there and the whitelist is evaluated against a Cloudflare address that
+rotates per request: **every request is denied**, whatever `ALLOWED_IPS` says.
+That is the failure reported in [#40](https://github.com/Turbootzz/vaultwarden-api/issues/40).
+
+Fix it by trusting the edge ranges:
+
+```env
+TRUSTED_PROXY_PRESET=cloudflare
+TRUSTED_PROXY_IP=172.18.0.5        # your reverse proxy, as before
+```
+
+The preset expands to Cloudflare's [published ranges](https://www.cloudflare.com/ips/),
+embedded in the binary so startup never depends on fetching them. A weekly CI job
+flags drift; refresh with `make update-cloudflare-ips`.
+
+**Why a preset rather than pasting the ranges into `TRUSTED_PROXY_IP`.** Trusting
+a whole CDN's ranges by hand quietly re-opens the spoofing hole the right-to-left
+walk closes. The walk *skips* trusted entries, so a visitor whose own address is
+inside those ranges — one Cloudflare zone proxying to another — has its prepended
+entries reached and believed. A preset therefore also carries the provider's
+client-IP header (`CF-Connecting-IP` for Cloudflare), which the edge sets itself
+and overwrites if the visitor supplied one. Reaching a Cloudflare hop in the chain
+ends the walk and takes the answer from that header instead — the one value a
+visitor behind the edge cannot choose. The header is read only for requests that
+actually arrived through a trusted edge range; anywhere else it is just another
+client-written header and is ignored. If the header is missing or arrives twice,
+resolution falls back to the plain chain walk and the denial log says so, so a
+proxy that strips it degrades rather than taking the deployment down.
+
+For a provider without a preset, list its ranges in `TRUSTED_PROXY_IP` by hand and
+be aware of the caveat above.
+
+**The residual trade-off:** anything connecting from a trusted range can still
+assert a client address. Trusting a CDN's ranges is only safe while the CDN is the
+sole way to reach the origin — an attacker who can reach your origin directly
+bypasses the edge and its header entirely. Bound it with
+[authenticated origin pulls](https://developers.cloudflare.com/ssl/origin-configuration/authenticated-origin-pull/)
+or a [tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/),
+plus a firewall that drops everything else.
+
+Alternatives, if you would rather not trust the edge ranges: grey-cloud the
+hostname so Cloudflare stops proxying it, or give LAN clients a split-horizon DNS
+record that reaches the reverse proxy directly (that proxy must still be trusted).
+
+#### Diagnosing a denied request
+
+A blocked request logs the whole resolution, not just the verdict:
+
+```text
+WARN: IP blocked (not whitelisted) on GET /secret/db: resolved 172.70.1.1, peer 172.18.0.5, xff=[192.168.1.81 172.70.1.1]
+```
+
+`resolved` is the address judged against `ALLOWED_IPS`, `peer` is the socket
+address, and `xff` is the forwarded chain. If `resolved` is an address you never
+configured and it appears in `xff`, an untrusted hop terminated the walk — add
+that hop to `TRUSTED_PROXY_IP` (or the matching preset). Only the last eight chain
+entries are shown, since the client controls how many it prepends.
+
+Two more markers appear when a preset is in play. `resolved 192.168.1.81 via
+cloudflare` means the answer came from the provider's client-IP header rather than
+the chain. `(cloudflare edge in the chain but no usable client-IP header)` means
+the request came through the edge but `CF-Connecting-IP` was absent or duplicated,
+so the weaker chain walk was used — check that nothing between the edge and this
+service strips the header.
 
 ## Project Structure
 
@@ -353,6 +435,7 @@ Two consequences worth knowing:
 │   ├── handlers/handlers.go          # HTTP handlers
 │   ├── ipwhitelist/ipwhitelist.go    # IP access control
 │   ├── realip/realip.go              # Proxy-aware client IP resolution
+│   ├── realip/presets.go             # Provider trusted-proxy range presets
 │   ├── validators/validators.go      # Input validation
 │   └── vaultwarden/
 │       ├── api_client.go             # Native HTTP client for Vaultwarden

@@ -2,13 +2,16 @@ package ipwhitelist
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Turbootzz/vaultwarden-api/internal/realip"
+	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
 	"github.com/gofiber/fiber/v2"
 	"github.com/valyala/fasthttp"
 )
@@ -219,6 +222,52 @@ func TestMiddlewareFailsClosedWhenConfiguredButEmpty(t *testing.T) {
 	}
 }
 
+// Issue #40: a deployment behind a CDN denies every request because the walk
+// stops at an untrusted edge hop. "IP blocked: 172.70.1.1" alone reads like a
+// whitelist typo, so the warning has to carry the peer and the chain that
+// produced the address.
+func TestMiddlewareBlockLogExplainsTheProxyChain(t *testing.T) {
+	// The warning is written on the server goroutine and read on this one, with
+	// nothing between them to order the two accesses — a bare bytes.Buffer would
+	// be a data race whether or not the detector happens to catch it.
+	var buf syncBuffer
+	restore := logger.Warn.Writer()
+	logger.Warn.SetOutput(&buf)
+	t.Cleanup(func() { logger.Warn.SetOutput(restore) })
+
+	wl, err := New([]string{"192.168.1.0/24"}, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	resolver, err := realip.New([]string{"127.0.0.1", "::1"})
+	if err != nil {
+		t.Fatalf("realip.New: %v", err)
+	}
+
+	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app.Use(realip.Middleware(resolver))
+	app.Use(wl.Middleware())
+	app.Get("/secret/:name", func(c *fiber.Ctx) error { return c.SendString("ok") })
+	addr := serve(t, app)
+
+	if got := get(t, addr, "192.168.1.81, 172.70.1.1"); got != fiber.StatusForbidden {
+		t.Fatalf("status = %d, want %d", got, fiber.StatusForbidden)
+	}
+
+	line := buf.String()
+	for _, want := range []string{
+		"172.70.1.1",   // the address the whitelist actually judged
+		"127.0.0.1",    // the socket peer
+		"192.168.1.81", // the entry the operator expected to be used
+		"GET",
+		"/secret/db",
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("blocked warning %q does not mention %q", line, want)
+		}
+	}
+}
+
 func TestNewRecordsWhetherAccessControlWasConfigured(t *testing.T) {
 	t.Parallel()
 
@@ -325,4 +374,23 @@ func TestMiddlewareRejectsTrailerSmuggledForwardedFor(t *testing.T) {
 			}
 		})
 	}
+}
+
+// syncBuffer is a bytes.Buffer that survives being written from a handler
+// goroutine while the test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
