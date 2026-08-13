@@ -716,7 +716,7 @@ func TestEdgeHeaderIsReadOncePerRequest(t *testing.T) {
 // var to take effect.
 func TestClientIPBehindACDNWithoutAnyProviderConfigured(t *testing.T) {
 	const (
-		client = "31.201.224.107"
+		client = "198.51.100.7"
 		edge   = "172.71.99.34" // Cloudflare 172.64.0.0/13
 		proxy  = "172.27.0.1"   // docker bridge gateway, the local reverse proxy
 	)
@@ -740,7 +740,7 @@ func TestClientIPBehindACDNWithoutAnyProviderConfigured(t *testing.T) {
 // Every edge address seen in the #42 production logs, each rotating per request
 // and none of them ever whitelistable.
 func TestClientIPBehindEveryObservedCloudflareEdge(t *testing.T) {
-	const client = "31.201.224.107"
+	const client = "198.51.100.7"
 	const proxy = "172.27.0.1"
 
 	resolver, err := New([]string{proxy})
@@ -784,19 +784,19 @@ func TestAutodetectDoesNotLetAClientAssertAnAddress(t *testing.T) {
 			// there without ever reaching the prepended entry.
 			name:         "prepended edge address with a forged header",
 			forwardedFor: "172.71.99.34, 203.0.113.9",
-			connectingIP: "31.201.224.107",
+			connectingIP: "198.51.100.7",
 			want:         "203.0.113.9",
 		},
 		{
 			name:         "forged header with no CDN hop at all",
 			forwardedFor: "203.0.113.9",
-			connectingIP: "31.201.224.107",
+			connectingIP: "198.51.100.7",
 			want:         "203.0.113.9",
 		},
 		{
 			name:         "forged header and a prepended whitelisted address",
-			forwardedFor: "31.201.224.107, 203.0.113.9",
-			connectingIP: "31.201.224.107",
+			forwardedFor: "198.51.100.7, 203.0.113.9",
+			connectingIP: "198.51.100.7",
 			want:         "203.0.113.9",
 		},
 	}
@@ -819,7 +819,7 @@ func TestAutodetectReportsARecognisedEdgeWithNoHeader(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	_, ctx := acquireCtx(t, proxy, "31.201.224.107, 172.71.99.34")
+	_, ctx := acquireCtx(t, proxy, "198.51.100.7, 172.71.99.34")
 	got := resolver.Resolve(ctx)
 
 	if got.Client != "172.71.99.34" {
@@ -838,10 +838,10 @@ func TestAutodetectWhenTheUntrustedPeerIsTheEdge(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	_, ctx := acquireRawCtx(t, "172.71.99.34", request("", "31.201.224.107"))
+	_, ctx := acquireRawCtx(t, "172.71.99.34", request("", "198.51.100.7"))
 	got := resolver.Resolve(ctx)
-	if got.Client != "31.201.224.107" {
-		t.Errorf("Client = %q, want 31.201.224.107", got.Client)
+	if got.Client != "198.51.100.7" {
+		t.Errorf("Client = %q, want 198.51.100.7", got.Client)
 	}
 	if got.Via != "cloudflare" {
 		t.Errorf("Via = %q, want cloudflare", got.Via)
