@@ -55,15 +55,37 @@ func (s *Store) Match(provided string) (APIKey, bool) {
 	return matched, found
 }
 
-// ctxKey is the unexported type for the scope stored in the request context.
-type ctxKey struct{}
+// ctxKey is the unexported type for values stored in the request context.
+type ctxKey struct{ name string }
 
-var scopeKey ctxKey
+var (
+	scopeKey   = ctxKey{"scope"}
+	keyNameKey = ctxKey{"keyName"}
+)
 
 // ScopeFromCtx returns the authenticated key's scope from the request context.
 func ScopeFromCtx(c *fiber.Ctx) (Scope, bool) {
 	scope, ok := c.Locals(scopeKey).(Scope)
 	return scope, ok
+}
+
+// KeyNameFromCtx returns the configured name of the authenticated key, for logs
+// that need to say which caller made a request. Only the name is ever stored —
+// never the key material, which must not reach a log at any level.
+//
+// ok is false when the auth middleware did not run, which is a different and far
+// more serious condition than a key that was configured without a name: the
+// first means an unauthenticated request reached a secret route. Callers must
+// keep the two apart rather than printing one string for both.
+func KeyNameFromCtx(c *fiber.Ctx) (string, bool) {
+	name, ok := c.Locals(keyNameKey).(string)
+	if !ok {
+		return "", false
+	}
+	if name == "" {
+		return "<unnamed>", true
+	}
+	return name, true
 }
 
 // Middleware creates an authentication middleware that validates the bearer
@@ -100,6 +122,7 @@ func Middleware(store *Store) fiber.Handler {
 		}
 
 		c.Locals(scopeKey, key.Scope)
+		c.Locals(keyNameKey, key.Name)
 
 		// Authentication successful
 		return c.Next()

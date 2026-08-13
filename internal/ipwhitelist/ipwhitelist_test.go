@@ -2,14 +2,13 @@ package ipwhitelist
 
 import (
 	"bufio"
-	"bytes"
 	"io"
 	"net"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
+	"github.com/Turbootzz/vaultwarden-api/internal/logtest"
 	"github.com/Turbootzz/vaultwarden-api/internal/realip"
 	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
 	"github.com/gofiber/fiber/v2"
@@ -230,10 +229,7 @@ func TestMiddlewareBlockLogExplainsTheProxyChain(t *testing.T) {
 	// The warning is written on the server goroutine and read on this one, with
 	// nothing between them to order the two accesses — a bare bytes.Buffer would
 	// be a data race whether or not the detector happens to catch it.
-	var buf syncBuffer
-	restore := logger.Warn.Writer()
-	logger.Warn.SetOutput(&buf)
-	t.Cleanup(func() { logger.Warn.SetOutput(restore) })
+	buf := logtest.Capture(t, logger.Warn)[0]
 
 	wl, err := New([]string{"192.168.1.0/24"}, false)
 	if err != nil {
@@ -374,23 +370,4 @@ func TestMiddlewareRejectsTrailerSmuggledForwardedFor(t *testing.T) {
 			}
 		})
 	}
-}
-
-// syncBuffer is a bytes.Buffer that survives being written from a handler
-// goroutine while the test reads it.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
 }

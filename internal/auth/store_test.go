@@ -143,3 +143,118 @@ func TestScopeFromCtxAbsent(t *testing.T) {
 		t.Error("ScopeFromCtx should report false when no scope set")
 	}
 }
+
+// The key name lets a log say which caller made a request. The key material
+// backing it must never become reachable the same way — a log line built from
+// the context has to be safe to write at any level.
+func TestKeyNameFromCtx(t *testing.T) {
+	store := NewStore([]APIKey{
+		{Name: "hearth", Key: keyFull},
+		{Name: "", Key: keyScoped},
+	})
+
+	app := fiber.New()
+	app.Use(Middleware(store))
+	app.Get("/", func(c *fiber.Ctx) error {
+		name, ok := KeyNameFromCtx(c)
+		if !ok {
+			return c.SendString("NOT-AUTHENTICATED")
+		}
+		return c.SendString(name)
+	})
+
+	tests := []struct {
+		name string
+		key  string
+		want string
+	}{
+		{"named key", keyFull, "hearth"},
+		{"key with no configured name", keyScoped, "<unnamed>"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+			req.Header.Set("Authorization", "Bearer "+tt.key)
+
+			resp, err := app.Test(req, -1)
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			defer resp.Body.Close()
+
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			if string(body) != tt.want {
+				t.Errorf("KeyNameFromCtx() = %q, want %q", body, tt.want)
+			}
+			if strings.Contains(string(body), tt.key) {
+				t.Errorf("KeyNameFromCtx() returned key material: %q", body)
+			}
+		})
+	}
+}
+
+// Without the middleware there is no name to report, and the fallback must not
+// be mistaken for a real key name.
+func TestKeyNameFromCtxAbsent(t *testing.T) {
+	app := fiber.New()
+	var got string
+	var ok bool
+	app.Get("/", func(c *fiber.Ctx) error {
+		got, ok = KeyNameFromCtx(c)
+		return c.SendString("ok")
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// An absent auth context must be distinguishable from a key configured
+	// without a name, not collapsed into the same string.
+	if ok {
+		t.Errorf("KeyNameFromCtx() reported ok=true without the middleware, got %q", got)
+	}
+	if got == "<unnamed>" {
+		t.Error("an unauthenticated request is indistinguishable from an unnamed key")
+	}
+}
+
+// The scope and the name are stored under distinct keys; a reader of one must
+// never receive the other.
+func TestCtxKeysDoNotCollide(t *testing.T) {
+	store := NewStore([]APIKey{
+		{Name: "dev", Key: keyScoped, Scope: Scope{Collections: []string{"Shared"}}},
+	})
+
+	app := fiber.New()
+	var scope Scope
+	var ok bool
+	var name string
+	app.Use(Middleware(store))
+	app.Get("/", func(c *fiber.Ctx) error {
+		scope, ok = ScopeFromCtx(c)
+		name, _ = KeyNameFromCtx(c)
+		return c.SendString("ok")
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+keyScoped)
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if !ok || len(scope.Collections) != 1 || scope.Collections[0] != "Shared" {
+		t.Errorf("ScopeFromCtx() = %+v, ok=%v, want the configured collection scope", scope, ok)
+	}
+	if name != "dev" {
+		t.Errorf("KeyNameFromCtx() = %q, want dev", name)
+	}
+}

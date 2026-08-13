@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,7 +11,9 @@ import (
 	"testing"
 
 	"github.com/Turbootzz/vaultwarden-api/internal/auth"
+	"github.com/Turbootzz/vaultwarden-api/internal/logtest"
 	"github.com/Turbootzz/vaultwarden-api/internal/vaultwarden"
+	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
 	"github.com/gofiber/fiber/v2"
 	"github.com/valyala/fasthttp"
 )
@@ -488,5 +491,272 @@ func TestGetSecretSetsNoStoreHeaders(t *testing.T) {
 				t.Errorf("Pragma = %q, want no-cache", got)
 			}
 		})
+	}
+}
+
+// The whole point of the opaque 404: a scoped key must not be able to tell a
+// secret it may not see apart from one that does not exist. If these two
+// responses ever differ by a byte, the vault can be enumerated a name at a time.
+func TestGetSecretResponseIsIdenticalForMissingAndHiddenSecrets(t *testing.T) {
+	h := NewHandler(vaultwarden.NewClient(nil, 0, vaultwarden.WithState(testVaultItems(), testNameMaps())))
+
+	const scopedKey = "collection-scoped-11111111111111111111111"
+	store := auth.NewStore([]auth.APIKey{
+		{Name: "dev", Key: scopedKey, Scope: auth.Scope{Collections: []string{"Shared"}}},
+	})
+
+	app := fiber.New()
+	app.Use(auth.Middleware(store))
+	app.Get("/secret/:name", h.GetSecret)
+
+	// "other-password" exists but sits outside the key's collection scope;
+	// "does-not-exist-anywhere" is absent from the vault entirely.
+	get := func(name string) (int, string, http.Header) {
+		t.Helper()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/secret/"+name, nil)
+		req.Header.Set("Authorization", "Bearer "+scopedKey)
+		resp, err := app.Test(req, -1)
+		if err != nil {
+			t.Fatalf("app.Test: %v", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		return resp.StatusCode, string(body), resp.Header
+	}
+
+	hiddenStatus, hiddenBody, hiddenHeader := get("other-password")
+	missingStatus, missingBody, missingHeader := get("does-not-exist-anywhere")
+
+	if hiddenStatus != http.StatusNotFound || missingStatus != http.StatusNotFound {
+		t.Fatalf("status: hidden=%d missing=%d, want 404 for both", hiddenStatus, missingStatus)
+	}
+	if hiddenBody != missingBody {
+		t.Errorf("response body discloses existence:\n  hidden  = %q\n  missing = %q", hiddenBody, missingBody)
+	}
+	for _, header := range []string{"Content-Length", "Content-Type", "Cache-Control"} {
+		if hiddenHeader.Get(header) != missingHeader.Get(header) {
+			t.Errorf("%s differs: hidden=%q missing=%q",
+				header, hiddenHeader.Get(header), missingHeader.Get(header))
+		}
+	}
+}
+
+// The log is the other half of that trade: opaque to the client, specific to the
+// operator. It must name the secret, the key and the reason — and never a value.
+func TestGetSecretLogsWhyTheLookupFailed(t *testing.T) {
+	items := testVaultItems()
+	h := NewHandler(vaultwarden.NewClient(nil, 0, vaultwarden.WithState(items, testNameMaps())))
+
+	const scopedKey = "collection-scoped-11111111111111111111111"
+	store := auth.NewStore([]auth.APIKey{
+		{Name: "hearth", Key: scopedKey, Scope: auth.Scope{Collections: []string{"Shared"}}},
+	})
+
+	app := fiber.New()
+	app.Use(auth.Middleware(store))
+	app.Get("/secret/:name", h.GetSecret)
+
+	tests := []struct {
+		name     string
+		secret   string
+		wantLog  []string
+		wantMiss []string
+	}{
+		{
+			name:    "hidden by scope",
+			secret:  "other-password",
+			wantLog: []string{`"other-password"`, `"hearth"`, "outside this key's scope"},
+			// The value of the secret it could not see must not appear.
+			wantMiss: []string{"other-org", scopedKey},
+		},
+		{
+			name:     "absent from the vault",
+			secret:   "does-not-exist-anywhere",
+			wantLog:  []string{`"does-not-exist-anywhere"`, `"hearth"`, "no item by that name anywhere"},
+			wantMiss: []string{scopedKey},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Both levels: a regression that moved the line to Error would
+			// otherwise leak to the real stderr where the assertions below
+			// cannot see it, and the test would still pass.
+			bufs := logtest.Capture(t, logger.Warn, logger.Error)
+			warnBuf, errBuf := bufs[0], bufs[1]
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/secret/"+tt.secret, nil)
+			req.Header.Set("Authorization", "Bearer "+scopedKey)
+			resp, err := app.Test(req, -1)
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", resp.StatusCode)
+			}
+			if errBuf.String() != "" {
+				t.Errorf("an ordinary lookup miss logged at Error: %q", errBuf.String())
+			}
+
+			line := warnBuf.String()
+			for _, want := range tt.wantLog {
+				if !strings.Contains(line, want) {
+					t.Errorf("log %q does not mention %q", line, want)
+				}
+			}
+			for _, unwanted := range tt.wantMiss {
+				if strings.Contains(line, unwanted) {
+					t.Errorf("log %q leaks %q", line, unwanted)
+				}
+			}
+		})
+	}
+}
+
+// An error type other than *SecretLookupError is a genuine server fault, not a
+// caller asking for something absent: it keeps Error level, and must not be fed
+// to Diagnosis() on a nil pointer.
+func TestLogSecretLookupFailureLevels(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		wantWarn  string
+		wantError string
+	}{
+		{
+			name:     "lookup miss is a warning",
+			err:      realLookupError(t),
+			wantWarn: "no item by that name anywhere",
+		},
+		{
+			name:      "any other error stays an error",
+			err:       errors.New("vault client exploded"),
+			wantError: "vault client exploded",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bufs := logtest.Capture(t, logger.Warn, logger.Error)
+			warnBuf, errBuf := bufs[0], bufs[1]
+
+			_, ctx := acquireTestCtx(t, "")
+			logSecretLookupFailure(ctx, "JWT_SECRET", tt.err)
+
+			if tt.wantWarn != "" {
+				if !strings.Contains(warnBuf.String(), tt.wantWarn) {
+					t.Errorf("warn log = %q, want it to contain %q", warnBuf.String(), tt.wantWarn)
+				}
+				if errBuf.String() != "" {
+					t.Errorf("a lookup miss also logged at Error: %q", errBuf.String())
+				}
+			}
+			if tt.wantError != "" {
+				if !strings.Contains(errBuf.String(), tt.wantError) {
+					t.Errorf("error log = %q, want it to contain %q", errBuf.String(), tt.wantError)
+				}
+				if warnBuf.String() != "" {
+					t.Errorf("a server fault also logged at Warn: %q", warnBuf.String())
+				}
+			}
+		})
+	}
+}
+
+// realLookupError produces a genuine *vaultwarden.SecretLookupError by asking a
+// real client for a secret it does not hold. Building one by hand would need the
+// diagnostic fields exported, which is exactly what keeps them out of a JSON
+// response.
+func realLookupError(t *testing.T) error {
+	t.Helper()
+	client := vaultwarden.NewClient(nil, 0, vaultwarden.WithState(testVaultItems(), testNameMaps()))
+	_, err := client.GetSecret("no-such-secret-anywhere", vaultwarden.SecretFilter{})
+	if err == nil {
+		t.Fatal("GetSecret returned no error for an absent secret")
+	}
+	return err
+}
+
+// The denial wording is what an operator acts on, so pin each branch — including
+// the unauthenticated one, which must read as a routing fault rather than a
+// mis-scoped key.
+func TestScopeDenialString(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		denial scopeDenial
+		want   string
+	}{
+		{
+			name:   "no auth context",
+			denial: scopeDenial{kind: scopeNoAuthContext},
+			want:   "the auth middleware did not run",
+		},
+		{
+			name:   "organizations unresolved",
+			denial: scopeDenial{kind: scopeOrgsUnresolved, configured: 2, known: 3},
+			want:   "none of this key's 2 scoped organization(s) resolve against the 3 known",
+		},
+		{
+			name:   "collections unresolved",
+			denial: scopeDenial{kind: scopeCollectionsUnresolved, configured: 1, known: 11},
+			want:   "none of this key's 1 scoped collection(s) resolve against the 11 known",
+		},
+		{
+			name:   "zero value is not a denial",
+			denial: scopeDenial{},
+			want:   "allowed",
+		},
+		{
+			// Defensive: a kind added without a String case must not render as
+			// "allowed" and read like a permitted request in the log.
+			name:   "unknown kind is not reported as allowed",
+			denial: scopeDenial{kind: scopeDenialKind(99)},
+			want:   "denied",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.denial.String(); !strings.Contains(got, tt.want) {
+				t.Errorf("String() = %q, want it to contain %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// A secret route reachable without the auth middleware must fail closed and say
+// so distinctly — the operator is looking at a routing bug, not a scope typo.
+func TestGetSecretWithoutAuthMiddlewareIsCalledOut(t *testing.T) {
+	h := NewHandler(vaultwarden.NewClient(nil, 0, vaultwarden.WithState(testVaultItems(), testNameMaps())))
+
+	bufs := logtest.Capture(t, logger.Warn, logger.Error)
+	warnBuf := bufs[0]
+
+	app := fiber.New() // deliberately no auth.Middleware
+	app.Get("/secret/:name", h.GetSecret)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/secret/db-password", nil)
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (fail closed)", resp.StatusCode)
+	}
+	line := warnBuf.String()
+	if !strings.Contains(line, "UNAUTHENTICATED REQUEST") {
+		t.Errorf("log %q does not flag the missing auth middleware", line)
+	}
+	if strings.Contains(line, "<unnamed>") {
+		t.Errorf("log %q reads as a key without a name, hiding a routing fault", line)
 	}
 }
