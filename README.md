@@ -318,9 +318,15 @@ resp, _ := http.DefaultClient.Do(req)
 same headers — whether the secret does not exist, sits outside the calling key's
 [scope](#scoped-api-keys), or is excluded by the request's own filters. That
 uniformity is the point: telling "no such secret" apart from "exists but not
-yours" is how a scoped key would enumerate the vault a name at a time. The
-lookup also does the same amount of work in each case, so the response time does
-not disclose what the body withholds.
+yours" is how a scoped key would enumerate the vault a name at a time.
+
+The lookup scans every cached item on the failure path regardless of outcome —
+no early exit on a hit — so the dominant work does not vary with the answer.
+That is a deliberate property, not a constant-time guarantee: the log write that
+follows is synchronous and its length varies by cause, so a caller able to
+measure the origin precisely enough, past network jitter and a blocking log
+sink, is not provably unable to distinguish them. Treat the API key, not the
+opaque 404, as the boundary that matters.
 
 The server's log is under no such constraint, and is where the reason goes:
 
@@ -335,7 +341,7 @@ The tail names the cause:
 |---|---|---|
 | `no item by that name anywhere` | the secret really is absent | add it to the vault, or correct the name |
 | `N item(s) by that name exist but are outside this key's scope` | it exists, this key may not see it | widen the key's `organizations` / `collections`, or use a different key |
-| `left none of the N cached items visible` | the scope resolved, but nothing in the vault falls inside it | check the key is scoped to the collection the secrets actually live in |
+| `left none of the N cached items visible` | the key's scope *or* the request's own `organization_*` / `collection_*` / `folder_*` query filters match nothing in the vault | check both: the key's scope, and any filter the caller sent |
 | `STRICT_SECRET_MATCH rejects partial matches` | only a partial name match exists | use the exact name, or unset `STRICT_SECRET_MATCH` |
 | `the vault cache is empty` | the first sync has not completed | check the Vaultwarden connection |
 
@@ -554,11 +560,11 @@ However, for each dimension (organization | collection | folder) you can only fi
 | `MAC verification failed` | Wrong password or org-owned items | Normal for individual items shared via organizations — they use a different key. If *every* item fails, see the row below |
 | `sync decrypted 0 of N ciphers (M failures), refusing to replace cache` | No usable decryption key for any item — wrong master password, or every item is org-owned and the org key can't be decrypted | Check `VAULTWARDEN_PASSWORD` and that at least one item is decryptable. Rather than serve an empty vault, the service keeps the last good cache — and refuses to start if this happens on the first sync |
 | `missing authorization header` | No Bearer token in request | Add `-H "Authorization: Bearer YOUR_API_KEY"` to your request |
-| `secret not found` | Item name doesn't match, the item is in the trash, or it's out of the key's scope | Check the exact name in your Vaultwarden vault (matching is case-insensitive) and that the item isn't soft-deleted; for a scoped key, confirm the secret is within its allowed orgs/collections |
+| `secret not found` | Item name doesn't match, the item is in the trash, or it's out of the key's scope | **The server log says which** — see [Diagnosing a failed secret lookup](#diagnosing-a-failed-secret-lookup). The response is identical for every cause by design |
 | Container exits immediately | Missing required env vars | Ensure `VAULTWARDEN_URL`, `VAULTWARDEN_EMAIL`, `VAULTWARDEN_PASSWORD`, and one of `API_KEY` / `API_KEYS` / `API_KEYS_FILE` are set |
 | `Background sync failed N times in a row, cache is stale` | Vaultwarden unreachable, or the account credentials are no longer valid | Individual sync failures log a warning; after 3 consecutive failures they escalate to an error. Secrets keep being served from the last successful sync — check `VAULTWARDEN_URL` connectivity and your credentials |
 
-**Debug mode:** Set `DEBUG=true` to see detailed logs (sync results, token refreshes, per-item decrypt failures by UUID). Debug logging itself adds no secret names or values — it references vault items by UUID — but it is verbose, so don't use it in production. Secret values are never logged at any level; secret *names* can appear in blocked-request warnings and routing-error logs, which include the requested path (see [Security](#security)).
+**Debug mode:** Set `DEBUG=true` to see detailed logs (sync results, token refreshes, per-item decrypt failures by UUID). Debug logging itself adds no secret names or values — it references vault items by UUID — but it is verbose, so don't use it in production. Secret values are never logged at any level; secret *names* can appear at default level in blocked-request warnings, routing-error logs, and the failed-lookup warning (see [Diagnosing a failed secret lookup](#diagnosing-a-failed-secret-lookup) and [Security](#security)).
 
 ## Contributing
 

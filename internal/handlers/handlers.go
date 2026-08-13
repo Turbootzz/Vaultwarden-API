@@ -104,9 +104,9 @@ func (h *Handler) GetSecret(c *fiber.Ctx) error {
 	}
 
 	// Enforce the authenticated key's scope server-side, regardless of query filters.
-	if reason, ok := h.applyKeyScope(c, &filter); !ok {
-		logger.Warn.Printf("Secret lookup denied for %q (key %q, IP %s): %s",
-			secretName, auth.KeyNameFromCtx(c), realip.FromCtx(c), reason)
+	if denial, ok := h.applyKeyScope(c, &filter); !ok {
+		logger.Warn.Printf("Secret lookup denied for %q (%s, IP %s): %s",
+			secretName, describeKey(c), realip.FromCtx(c), denial)
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "secret not found",
 		})
@@ -134,6 +134,10 @@ func (h *Handler) GetSecret(c *fiber.Ctx) error {
 // constraint and is where the answer belongs. Secret *names* appear here, as
 // they already do in request-path logs; values never do, at any level.
 //
+// Note this write is synchronous and precedes the response, and its length
+// varies by cause. See SecretLookupError: the uniform body is a defence against
+// enumeration, not a constant-time guarantee.
+//
 // Warn, not Error: a caller asking for a secret that is not there is ordinary
 // 404 traffic, and logging it at Error buries real faults under one
 // misconfigured client's retry loop. An error of any other type is a genuine
@@ -142,12 +146,24 @@ func (h *Handler) GetSecret(c *fiber.Ctx) error {
 func logSecretLookupFailure(c *fiber.Ctx, secretName string, err error) {
 	var lookupErr *vaultwarden.SecretLookupError
 	if errors.As(err, &lookupErr) {
-		logger.Warn.Printf("Secret lookup failed for %q (key %q, IP %s): %s",
-			secretName, auth.KeyNameFromCtx(c), realip.FromCtx(c), lookupErr.Diagnosis())
+		logger.Warn.Printf("Secret lookup failed for %q (%s, IP %s): %s",
+			secretName, describeKey(c), realip.FromCtx(c), lookupErr.Diagnosis())
 		return
 	}
-	logger.Error.Printf("Secret lookup failed for %q (key %q, IP %s): %v",
-		secretName, auth.KeyNameFromCtx(c), realip.FromCtx(c), err)
+	logger.Error.Printf("Secret lookup failed for %q (%s, IP %s): %v",
+		secretName, describeKey(c), realip.FromCtx(c), err)
+}
+
+// describeKey names the calling key for a log line. An unauthenticated request
+// is called out rather than blended in with a key that has no configured name:
+// the first means a secret route is reachable without auth, which is a routing
+// fault, not a config one.
+func describeKey(c *fiber.Ctx) string {
+	name, ok := auth.KeyNameFromCtx(c)
+	if !ok {
+		return "UNAUTHENTICATED REQUEST — no auth middleware on this route"
+	}
+	return fmt.Sprintf("key %q", name)
 }
 
 func parseUUIDQuery(field, raw string) (string, error) {
@@ -205,22 +221,60 @@ func resolveScopeRefs(refs []string, nameMap map[string]string) []string {
 	return out
 }
 
+// scopeDenialKind classifies why a request was refused before any lookup ran.
+type scopeDenialKind int
+
+const (
+	scopeAllowed scopeDenialKind = iota
+	// scopeNoAuthContext means the auth middleware did not run for this route.
+	scopeNoAuthContext
+	// scopeOrgsUnresolved / scopeCollectionsUnresolved mean every ref the key
+	// names failed to match the last sync.
+	scopeOrgsUnresolved
+	scopeCollectionsUnresolved
+)
+
+// scopeDenial is the reason a request was refused, kept as data rather than
+// prose so the log site owns the wording and a future caller — a metric, a
+// structured-log field, a test — does not have to substring-match English.
+type scopeDenial struct {
+	kind       scopeDenialKind
+	configured int // refs the key names
+	known      int // refs the vault knows after the last sync
+}
+
+func (d scopeDenial) String() string {
+	switch d.kind {
+	case scopeNoAuthContext:
+		return "no scope on the request; the auth middleware did not run for this route, failing closed"
+	case scopeOrgsUnresolved:
+		return fmt.Sprintf(
+			"none of this key's %d scoped organization(s) resolve against the %d known to the vault; check the key config for a typo or a rename",
+			d.configured, d.known)
+	case scopeCollectionsUnresolved:
+		return fmt.Sprintf(
+			"none of this key's %d scoped collection(s) resolve against the %d known to the vault; check the key config for a typo or a rename",
+			d.configured, d.known)
+	default:
+		return "allowed"
+	}
+}
+
 // applyKeyScope sets the server-side scope fields on the filter from the
-// authenticated key's scope. It returns false to deny the request (404) when a
-// constrained dimension resolves to nothing — including unknown names and the
-// pre-first-sync window — so a scoped key can never read outside its scope.
-// applyKeyScope narrows filter to the authenticated key's scope. It returns
-// false with an operator-facing reason when the request cannot proceed; the
-// reason is for the log only and never reaches the response.
-func (h *Handler) applyKeyScope(c *fiber.Ctx, filter *vaultwarden.SecretFilter) (string, bool) {
+// authenticated key's scope, so a scoped key can never read outside its scope.
+//
+// It denies the request (404) when a constrained dimension resolves to nothing —
+// including unknown names and the pre-first-sync window. The returned denial
+// explains which, for the log only; it never reaches the response.
+func (h *Handler) applyKeyScope(c *fiber.Ctx, filter *vaultwarden.SecretFilter) (scopeDenial, bool) {
 	scope, ok := auth.ScopeFromCtx(c)
 	if !ok {
 		// No scope in context means the auth middleware did not run for this
 		// request. Fail closed rather than silently granting full access.
-		return "no scope on the request; the auth middleware did not run, failing closed", false
+		return scopeDenial{kind: scopeNoAuthContext}, false
 	}
 	if scope.IsEmpty() {
-		return "", true // unscoped key: full access
+		return scopeDenial{}, true // unscoped key: full access
 	}
 
 	nm := h.vaultClient.NameMaps()
@@ -230,23 +284,27 @@ func (h *Handler) applyKeyScope(c *fiber.Ctx, filter *vaultwarden.SecretFilter) 
 		if len(ids) == 0 {
 			// Names are matched against the last sync, so this is either a typo
 			// in the key config or an org that has been renamed since.
-			return fmt.Sprintf(
-				"none of this key's %d scoped organization(s) resolve against the %d known to the vault; check the key config for a typo or a rename",
-				len(scope.Organizations), len(nm.Organizations)), false
+			return scopeDenial{
+				kind:       scopeOrgsUnresolved,
+				configured: len(scope.Organizations),
+				known:      len(nm.Organizations),
+			}, false
 		}
 		filter.OrganizationIDs = ids
 	}
 	if len(scope.Collections) > 0 {
 		ids := resolveScopeRefs(scope.Collections, nm.Collections)
 		if len(ids) == 0 {
-			return fmt.Sprintf(
-				"none of this key's %d scoped collection(s) resolve against the %d known to the vault; check the key config for a typo or a rename",
-				len(scope.Collections), len(nm.Collections)), false
+			return scopeDenial{
+				kind:       scopeCollectionsUnresolved,
+				configured: len(scope.Collections),
+				known:      len(nm.Collections),
+			}, false
 		}
 		filter.CollectionIDs = ids
 	}
 
-	return "", true
+	return scopeDenial{}, true
 }
 
 // parseSecretFilters reads placement query params: at most one of id or name per dimension.

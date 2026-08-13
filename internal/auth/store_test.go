@@ -156,7 +156,11 @@ func TestKeyNameFromCtx(t *testing.T) {
 	app := fiber.New()
 	app.Use(Middleware(store))
 	app.Get("/", func(c *fiber.Ctx) error {
-		return c.SendString(KeyNameFromCtx(c))
+		name, ok := KeyNameFromCtx(c)
+		if !ok {
+			return c.SendString("NOT-AUTHENTICATED")
+		}
+		return c.SendString(name)
 	})
 
 	tests := []struct {
@@ -165,7 +169,7 @@ func TestKeyNameFromCtx(t *testing.T) {
 		want string
 	}{
 		{"named key", keyFull, "hearth"},
-		{"key with no configured name", keyScoped, "unnamed"},
+		{"key with no configured name", keyScoped, "<unnamed>"},
 	}
 
 	for _, tt := range tests {
@@ -198,8 +202,9 @@ func TestKeyNameFromCtx(t *testing.T) {
 func TestKeyNameFromCtxAbsent(t *testing.T) {
 	app := fiber.New()
 	var got string
+	var ok bool
 	app.Get("/", func(c *fiber.Ctx) error {
-		got = KeyNameFromCtx(c)
+		got, ok = KeyNameFromCtx(c)
 		return c.SendString("ok")
 	})
 
@@ -210,8 +215,13 @@ func TestKeyNameFromCtxAbsent(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if got != "unnamed" {
-		t.Errorf("KeyNameFromCtx() without middleware = %q, want unnamed", got)
+	// An absent auth context must be distinguishable from a key configured
+	// without a name, not collapsed into the same string.
+	if ok {
+		t.Errorf("KeyNameFromCtx() reported ok=true without the middleware, got %q", got)
+	}
+	if got == "<unnamed>" {
+		t.Error("an unauthenticated request is indistinguishable from an unnamed key")
 	}
 }
 
@@ -229,7 +239,7 @@ func TestCtxKeysDoNotCollide(t *testing.T) {
 	app.Use(Middleware(store))
 	app.Get("/", func(c *fiber.Ctx) error {
 		scope, ok = ScopeFromCtx(c)
-		name = KeyNameFromCtx(c)
+		name, _ = KeyNameFromCtx(c)
 		return c.SendString("ok")
 	})
 

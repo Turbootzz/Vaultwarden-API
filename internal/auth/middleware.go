@@ -72,12 +72,20 @@ func ScopeFromCtx(c *fiber.Ctx) (Scope, bool) {
 // KeyNameFromCtx returns the configured name of the authenticated key, for logs
 // that need to say which caller made a request. Only the name is ever stored —
 // never the key material, which must not reach a log at any level.
-func KeyNameFromCtx(c *fiber.Ctx) string {
-	name, _ := c.Locals(keyNameKey).(string)
-	if name == "" {
-		return "unnamed"
+//
+// ok is false when the auth middleware did not run, which is a different and far
+// more serious condition than a key that was configured without a name: the
+// first means an unauthenticated request reached a secret route. Callers must
+// keep the two apart rather than printing one string for both.
+func KeyNameFromCtx(c *fiber.Ctx) (string, bool) {
+	name, ok := c.Locals(keyNameKey).(string)
+	if !ok {
+		return "", false
 	}
-	return name
+	if name == "" {
+		return "<unnamed>", true
+	}
+	return name, true
 }
 
 // Middleware creates an authentication middleware that validates the bearer

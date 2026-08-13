@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -9,10 +8,10 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/Turbootzz/vaultwarden-api/internal/auth"
+	"github.com/Turbootzz/vaultwarden-api/internal/logtest"
 	"github.com/Turbootzz/vaultwarden-api/internal/vaultwarden"
 	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
 	"github.com/gofiber/fiber/v2"
@@ -583,10 +582,11 @@ func TestGetSecretLogsWhyTheLookupFailed(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var buf syncBuffer
-			restore := logger.Warn.Writer()
-			logger.Warn.SetOutput(&buf)
-			t.Cleanup(func() { logger.Warn.SetOutput(restore) })
+			// Both levels: a regression that moved the line to Error would
+			// otherwise leak to the real stderr where the assertions below
+			// cannot see it, and the test would still pass.
+			bufs := logtest.Capture(t, logger.Warn, logger.Error)
+			warnBuf, errBuf := bufs[0], bufs[1]
 
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/secret/"+tt.secret, nil)
 			req.Header.Set("Authorization", "Bearer "+scopedKey)
@@ -596,7 +596,14 @@ func TestGetSecretLogsWhyTheLookupFailed(t *testing.T) {
 			}
 			defer resp.Body.Close()
 
-			line := buf.String()
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", resp.StatusCode)
+			}
+			if errBuf.String() != "" {
+				t.Errorf("an ordinary lookup miss logged at Error: %q", errBuf.String())
+			}
+
+			line := warnBuf.String()
 			for _, want := range tt.wantLog {
 				if !strings.Contains(line, want) {
 					t.Errorf("log %q does not mention %q", line, want)
@@ -611,24 +618,6 @@ func TestGetSecretLogsWhyTheLookupFailed(t *testing.T) {
 	}
 }
 
-// syncBuffer is a bytes.Buffer safe to read while a handler goroutine writes it.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
 // An error type other than *SecretLookupError is a genuine server fault, not a
 // caller asking for something absent: it keeps Error level, and must not be fed
 // to Diagnosis() on a nil pointer.
@@ -641,7 +630,7 @@ func TestLogSecretLookupFailureLevels(t *testing.T) {
 	}{
 		{
 			name:     "lookup miss is a warning",
-			err:      &vaultwarden.SecretLookupError{Name: "JWT_SECRET", Cached: 259, Visible: 259},
+			err:      &vaultwarden.SecretLookupError{Cached: 259, Visible: 259},
 			wantWarn: "no item by that name anywhere",
 		},
 		{
@@ -653,14 +642,8 @@ func TestLogSecretLookupFailureLevels(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var warnBuf, errBuf syncBuffer
-			warnRestore, errRestore := logger.Warn.Writer(), logger.Error.Writer()
-			logger.Warn.SetOutput(&warnBuf)
-			logger.Error.SetOutput(&errBuf)
-			t.Cleanup(func() {
-				logger.Warn.SetOutput(warnRestore)
-				logger.Error.SetOutput(errRestore)
-			})
+			bufs := logtest.Capture(t, logger.Warn, logger.Error)
+			warnBuf, errBuf := bufs[0], bufs[1]
 
 			_, ctx := acquireTestCtx(t, "")
 			logSecretLookupFailure(ctx, "JWT_SECRET", tt.err)
@@ -682,5 +665,77 @@ func TestLogSecretLookupFailureLevels(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The denial wording is what an operator acts on, so pin each branch — including
+// the unauthenticated one, which must read as a routing fault rather than a
+// mis-scoped key.
+func TestScopeDenialString(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		denial scopeDenial
+		want   string
+	}{
+		{
+			name:   "no auth context",
+			denial: scopeDenial{kind: scopeNoAuthContext},
+			want:   "the auth middleware did not run",
+		},
+		{
+			name:   "organizations unresolved",
+			denial: scopeDenial{kind: scopeOrgsUnresolved, configured: 2, known: 3},
+			want:   "none of this key's 2 scoped organization(s) resolve against the 3 known",
+		},
+		{
+			name:   "collections unresolved",
+			denial: scopeDenial{kind: scopeCollectionsUnresolved, configured: 1, known: 11},
+			want:   "none of this key's 1 scoped collection(s) resolve against the 11 known",
+		},
+		{
+			name:   "zero value is not a denial",
+			denial: scopeDenial{},
+			want:   "allowed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.denial.String(); !strings.Contains(got, tt.want) {
+				t.Errorf("String() = %q, want it to contain %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// A secret route reachable without the auth middleware must fail closed and say
+// so distinctly — the operator is looking at a routing bug, not a scope typo.
+func TestGetSecretWithoutAuthMiddlewareIsCalledOut(t *testing.T) {
+	h := NewHandler(vaultwarden.NewClient(nil, 0, vaultwarden.WithState(testVaultItems(), testNameMaps())))
+
+	bufs := logtest.Capture(t, logger.Warn, logger.Error)
+	warnBuf := bufs[0]
+
+	app := fiber.New() // deliberately no auth.Middleware
+	app.Get("/secret/:name", h.GetSecret)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/secret/db-password", nil)
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (fail closed)", resp.StatusCode)
+	}
+	line := warnBuf.String()
+	if !strings.Contains(line, "UNAUTHENTICATED REQUEST") {
+		t.Errorf("log %q does not flag the missing auth middleware", line)
+	}
+	if strings.Contains(line, "<unnamed>") {
+		t.Errorf("log %q reads as a key without a name, hiding a routing fault", line)
 	}
 }

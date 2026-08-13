@@ -189,19 +189,22 @@ func selectMatch(candidates []DecryptedItem, kind string, pred func(DecryptedIte
 // exists, since telling a scoped key "exists but not yours" apart from "does not
 // exist" lets it enumerate the vault a name at a time. Error() is therefore safe
 // to leak, and Diagnosis() carries the detail for the server's own log.
+// The requested name is deliberately not a field: the caller already has it, and
+// storing it would put the one thing Error() withholds inside a value whose
+// premise is that it is safe to hand to a client — a %#v or a JSON encoding of
+// the error would print it.
 type SecretLookupError struct {
-	// Name is the secret that was requested. Names, unlike values, already
-	// appear in request-path logs.
-	Name string
 	// Cached is how many items the vault cache holds.
 	Cached int
 	// Visible is how many of them the caller's scope and filters left.
 	Visible int
-	// HiddenNameMatches counts items matching Name that the scope or filters
-	// excluded — the difference between "does not exist" and "not yours".
+	// HiddenNameMatches counts items the scope or filters excluded that would
+	// have matched under the rule the lookup used — the difference between
+	// "does not exist" and "not yours".
 	HiddenNameMatches int
-	// PartialInVisible counts visible items Name is a substring of. These would
-	// have matched had STRICT_SECRET_MATCH been off.
+	// PartialInVisible counts visible items the name is a substring of without
+	// matching exactly. Only reachable under StrictMatch; without it such an
+	// item is served and no lookup failure arises.
 	PartialInVisible int
 	// StrictMatch records whether strict matching was in force.
 	StrictMatch bool
@@ -279,36 +282,51 @@ func (c *Client) GetSecret(name string, filter SecretFilter) (string, error) {
 		}
 	}
 
-	return "", c.lookupFailure(name, candidates)
+	return "", c.lookupFailure(key, len(candidates), filter)
 }
 
-// lookupFailure describes a miss for the log. Callers hold c.mu.
+// lookupFailure describes a miss for the log. Callers hold c.mu, and key is the
+// requested name already lowercased.
 //
-// Both loops run to completion rather than stopping at the first hit: the work
-// done must not depend on whether the secret exists, or the response time would
-// disclose what the response body deliberately does not.
-func (c *Client) lookupFailure(name string, candidates []DecryptedItem) *SecretLookupError {
+// The scan runs to completion rather than stopping at the first hit, so the
+// dominant work does not vary with the answer — the distinction the response
+// body deliberately withholds. That is a deliberate property rather than a
+// constant-time guarantee: the caller's log write is synchronous and its length
+// varies by cause. The API key, not the opaque 404, is the boundary that
+// matters; this only avoids handing out a cheap oracle.
+func (c *Client) lookupFailure(key string, visible int, filter SecretFilter) *SecretLookupError {
 	e := &SecretLookupError{
-		Name:        name,
 		Cached:      len(c.items),
-		Visible:     len(candidates),
+		Visible:     visible,
 		StrictMatch: c.strictMatch,
 	}
 
-	visible := make(map[string]struct{}, len(candidates))
-	key := strings.ToLower(name)
-	for _, item := range candidates {
-		visible[item.ID] = struct{}{}
-		if strings.Contains(strings.ToLower(item.Name), key) {
-			e.PartialInVisible++
-		}
-	}
+	for _, item := range c.items {
+		name := strings.ToLower(item.Name)
+		exact := name == key
+		partial := strings.Contains(name, key)
 
-	for id, item := range c.items {
-		if _, shown := visible[id]; shown {
+		// Re-testing the filter beats carrying a set of visible ids: it is the
+		// same predicate that built the candidate list, with no allocation.
+		if matchesSecretFilter(item, filter) {
+			// A visible substring match that is not exact is precisely what
+			// strict matching refused; without strict it would have been served
+			// and this function would never have run.
+			if partial && !exact {
+				e.PartialInVisible++
+			}
 			continue
 		}
-		if strings.EqualFold(item.Name, name) {
+
+		// Hidden: count it only if it would have matched had the caller been
+		// able to see it, under whichever rule the lookup actually used. Testing
+		// exact-only here would report an out-of-scope substring match — one an
+		// unscoped key is served — as "no item by that name anywhere".
+		servable := exact
+		if !c.strictMatch {
+			servable = partial
+		}
+		if servable {
 			e.HiddenNameMatches++
 		}
 	}

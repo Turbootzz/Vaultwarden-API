@@ -897,9 +897,6 @@ func TestSecretLookupErrorCounts(t *testing.T) {
 	if lookupErr.HiddenNameMatches != 2 {
 		t.Errorf("HiddenNameMatches = %d, want 2", lookupErr.HiddenNameMatches)
 	}
-	if lookupErr.Name != "shared-token" {
-		t.Errorf("Name = %q, want shared-token", lookupErr.Name)
-	}
 }
 
 // A hit must stay a hit: the diagnosis is built on the failure path only, and
@@ -926,5 +923,69 @@ func TestSecretLookupDiagnosisDoesNotAffectSuccessfulLookups(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("GetSecret(%q) = %q, want %q", tt.lookup, got, tt.want)
 		}
+	}
+}
+
+// Regression: the hidden-item scan must use the same matching rule the lookup
+// used. With partial matching on (the default), an out-of-scope item that an
+// unscoped key is served on a substring was reported as "no item by that name
+// anywhere in the vault" — telling the operator to create a secret that already
+// exists, when the real fix is the key's scope. That is precisely the
+// distinction this diagnosis exists to draw.
+func TestSecretLookupErrorCountsSubstringMatchesHiddenByScope(t *testing.T) {
+	t.Parallel()
+
+	items := map[string]DecryptedItem{
+		"c1": {ID: "c1", Name: "prod-api-token", Password: "hidden", OrganizationID: testOrgID},
+		"c2": {ID: "c2", Name: "db-password", Password: "visible", OrganizationID: testOrgID2},
+	}
+	client := NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps()))
+
+	// An unscoped caller is served prod-api-token for this name, by substring.
+	if got, err := client.GetSecret("api-token", SecretFilter{}); err != nil || got != "hidden" {
+		t.Fatalf("unscoped GetSecret(api-token) = (%q, %v), want (hidden, nil)", got, err)
+	}
+
+	// The same request scoped away from it must say so, not deny its existence.
+	_, err := client.GetSecret("api-token", SecretFilter{OrganizationIDs: []string{testOrgID2}})
+	var lookupErr *SecretLookupError
+	if !errors.As(err, &lookupErr) {
+		t.Fatalf("error is %T, want *SecretLookupError", err)
+	}
+	if lookupErr.HiddenNameMatches != 1 {
+		t.Errorf("HiddenNameMatches = %d, want 1 for a substring match hidden by scope", lookupErr.HiddenNameMatches)
+	}
+	if got := lookupErr.Diagnosis(); !strings.Contains(got, "outside this key's scope") {
+		t.Errorf("Diagnosis() = %q, want it to report the item as hidden, not absent", got)
+	}
+}
+
+// Under strict matching the rules diverge: a hidden substring match is not
+// servable to anyone, so it must not be counted as hidden, while a *visible*
+// substring match is exactly what strict refused and must be reported as such.
+func TestSecretLookupErrorCountsUnderStrictMatching(t *testing.T) {
+	t.Parallel()
+
+	items := map[string]DecryptedItem{
+		"c1": {ID: "c1", Name: "prod-api-token", Password: "hidden", OrganizationID: testOrgID},
+		"c2": {ID: "c2", Name: "visible-api-token", Password: "seen", OrganizationID: testOrgID2},
+	}
+	client := NewClient(nil, time.Minute,
+		WithState(items, emptySyncNameMaps()), WithStrictMatch(true))
+
+	_, err := client.GetSecret("api-token", SecretFilter{OrganizationIDs: []string{testOrgID2}})
+	var lookupErr *SecretLookupError
+	if !errors.As(err, &lookupErr) {
+		t.Fatalf("error is %T, want *SecretLookupError", err)
+	}
+	if lookupErr.HiddenNameMatches != 0 {
+		t.Errorf("HiddenNameMatches = %d, want 0: strict matching would not serve a substring anyway",
+			lookupErr.HiddenNameMatches)
+	}
+	if lookupErr.PartialInVisible != 1 {
+		t.Errorf("PartialInVisible = %d, want 1", lookupErr.PartialInVisible)
+	}
+	if got := lookupErr.Diagnosis(); !strings.Contains(got, "STRICT_SECRET_MATCH") {
+		t.Errorf("Diagnosis() = %q, want the strict-match explanation", got)
 	}
 }
