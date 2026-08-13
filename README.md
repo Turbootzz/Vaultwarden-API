@@ -331,7 +331,7 @@ opaque 404, as the boundary that matters.
 The server's log is under no such constraint, and is where the reason goes:
 
 ```text
-WARN: Secret lookup failed for "JWT_SECRET" (key "hearth", IP 31.201.224.107):
+WARN: Secret lookup failed for "JWT_SECRET" (key "hearth", IP 198.51.100.7):
       no item by that name anywhere in the vault; 259 of 259 items were visible to this key
 ```
 
@@ -349,7 +349,7 @@ A scope that does not resolve at all is refused one step earlier, before any
 lookup happens, and says so:
 
 ```text
-WARN: Secret lookup denied for "JWT_SECRET" (key "hearth", IP 31.201.224.107):
+WARN: Secret lookup denied for "JWT_SECRET" (key "hearth", IP 198.51.100.7):
       none of this key's 1 scoped collection(s) resolve against the 11 known to the vault;
       check the key config for a typo or a rename
 ```
@@ -437,7 +437,7 @@ Only when `CF-Connecting-IP` cannot reach this service — a proxy in between st
 it, or sends it twice. The denial log says so explicitly:
 
 ```text
-resolved 172.71.99.34, peer 172.27.0.1, xff=[31.201.224.107 172.71.99.34] (cloudflare edge in the chain but no usable client-IP header)
+resolved 172.71.99.34, peer 172.27.0.1, xff=[198.51.100.7 172.71.99.34] (cloudflare edge in the chain but no usable client-IP header)
 ```
 
 ```env
