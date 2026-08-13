@@ -760,3 +760,171 @@ func TestSyncVault_UsernameFailureIsNotFatal(t *testing.T) {
 		t.Errorf("GetSecret = %q, %v; want %q, nil", got, err, "readable")
 	}
 }
+
+// The diagnosis exists so the server log can say which of the several ways a
+// lookup can miss actually happened — the distinction the response withholds.
+func TestSecretLookupErrorDiagnosis(t *testing.T) {
+	t.Parallel()
+
+	items := map[string]DecryptedItem{
+		"c1": {ID: "c1", Name: "db-password", Password: "pw", OrganizationID: testOrgID},
+		"c2": {ID: "c2", Name: "api-token", Password: "tok", OrganizationID: testOrgID2},
+	}
+
+	tests := []struct {
+		name    string
+		client  *Client
+		lookup  string
+		filter  SecretFilter
+		want    string
+		wantErr string
+	}{
+		{
+			name:   "cache not populated yet",
+			client: NewClient(nil, time.Minute, WithState(nil, emptySyncNameMaps())),
+			lookup: "db-password",
+			want:   "the vault cache is empty",
+		},
+		{
+			name:   "name exists but the filter hides it",
+			client: NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps())),
+			lookup: "api-token",
+			filter: SecretFilter{OrganizationIDs: []string{testOrgID}},
+			want:   "outside this key's scope or the request filters",
+		},
+		{
+			name:   "strict matching rejects a partial hit",
+			client: NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps()), WithStrictMatch(true)),
+			lookup: "password",
+			want:   "STRICT_SECRET_MATCH rejects partial matches",
+		},
+		{
+			// A name that is absent anyway, so the hidden-match branch cannot
+			// fire and the empty visible set is the whole story.
+			name:   "filter leaves nothing visible",
+			client: NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps())),
+			lookup: "nothing-like-this",
+			filter: SecretFilter{OrganizationIDs: []string{"99999999-9999-4999-8999-999999999999"}},
+			want:   "left none of the 2 cached items visible",
+		},
+		{
+			// The hidden-match branch outranks the empty-visible one: naming the
+			// secret the caller actually asked for is the more actionable half.
+			name:   "a hidden name beats an empty visible set",
+			client: NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps())),
+			lookup: "db-password",
+			filter: SecretFilter{OrganizationIDs: []string{"99999999-9999-4999-8999-999999999999"}},
+			want:   "outside this key's scope or the request filters",
+		},
+		{
+			name:   "no such name anywhere",
+			client: NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps())),
+			lookup: "nothing-like-this",
+			want:   "no item by that name anywhere",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := tt.client.GetSecret(tt.lookup, tt.filter)
+			if err == nil {
+				t.Fatal("GetSecret returned no error, want a lookup failure")
+			}
+
+			var lookupErr *SecretLookupError
+			if !errors.As(err, &lookupErr) {
+				t.Fatalf("error is %T, want *SecretLookupError", err)
+			}
+			if got := lookupErr.Diagnosis(); !strings.Contains(got, tt.want) {
+				t.Errorf("Diagnosis() = %q, want it to contain %q", got, tt.want)
+			}
+
+			// Whatever the cause, what a client could see never varies.
+			if got := lookupErr.Error(); got != "secret not found" {
+				t.Errorf("Error() = %q, want the constant %q", got, "secret not found")
+			}
+		})
+	}
+}
+
+// Error() is what a caller might accidentally hand to an HTTP client, so it must
+// carry none of the detail Diagnosis() does — no name, no counts.
+func TestSecretLookupErrorTextLeaksNothing(t *testing.T) {
+	t.Parallel()
+
+	items := map[string]DecryptedItem{
+		"c1": {ID: "c1", Name: "db-password", Password: "pw", OrganizationID: testOrgID},
+	}
+	client := NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps()))
+
+	_, err := client.GetSecret("db-password", SecretFilter{OrganizationIDs: []string{testOrgID2}})
+	if err == nil {
+		t.Fatal("GetSecret returned no error")
+	}
+	for _, leak := range []string{"db-password", "scope", "1", "cached"} {
+		if strings.Contains(err.Error(), leak) {
+			t.Errorf("Error() = %q, leaks %q", err.Error(), leak)
+		}
+	}
+}
+
+// The counts drive the diagnosis, so pin them rather than only the prose.
+func TestSecretLookupErrorCounts(t *testing.T) {
+	t.Parallel()
+
+	items := map[string]DecryptedItem{
+		"c1": {ID: "c1", Name: "shared-token", Password: "a", OrganizationID: testOrgID},
+		"c2": {ID: "c2", Name: "shared-token", Password: "b", OrganizationID: testOrgID2},
+		"c3": {ID: "c3", Name: "unrelated", Password: "c", OrganizationID: testOrgID},
+	}
+	client := NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps()))
+
+	_, err := client.GetSecret("shared-token", SecretFilter{
+		OrganizationIDs: []string{"99999999-9999-4999-8999-999999999999"},
+	})
+
+	var lookupErr *SecretLookupError
+	if !errors.As(err, &lookupErr) {
+		t.Fatalf("error is %T, want *SecretLookupError", err)
+	}
+	if lookupErr.Cached != 3 {
+		t.Errorf("Cached = %d, want 3", lookupErr.Cached)
+	}
+	if lookupErr.Visible != 0 {
+		t.Errorf("Visible = %d, want 0", lookupErr.Visible)
+	}
+	// Both copies are hidden, and the count must not stop at the first.
+	if lookupErr.HiddenNameMatches != 2 {
+		t.Errorf("HiddenNameMatches = %d, want 2", lookupErr.HiddenNameMatches)
+	}
+	if lookupErr.Name != "shared-token" {
+		t.Errorf("Name = %q, want shared-token", lookupErr.Name)
+	}
+}
+
+// A hit must stay a hit: the diagnosis is built on the failure path only, and
+// must not disturb exact, partial or filtered lookups that already worked.
+func TestSecretLookupDiagnosisDoesNotAffectSuccessfulLookups(t *testing.T) {
+	t.Parallel()
+
+	items := map[string]DecryptedItem{
+		"c1": {ID: "c1", Name: "db-password", Password: "exact", OrganizationID: testOrgID},
+		"c2": {ID: "c2", Name: "my secret value", Password: "partial"},
+	}
+	client := NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps()))
+
+	for _, tt := range []struct{ lookup, want string }{
+		{"db-password", "exact"},
+		{"DB-PASSWORD", "exact"},
+		{"secret", "partial"},
+	} {
+		got, err := client.GetSecret(tt.lookup, SecretFilter{})
+		if err != nil {
+			t.Errorf("GetSecret(%q): %v", tt.lookup, err)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("GetSecret(%q) = %q, want %q", tt.lookup, got, tt.want)
+		}
+	}
+}

@@ -182,6 +182,58 @@ func selectMatch(candidates []DecryptedItem, kind string, pred func(DecryptedIte
 	return chosen, true
 }
 
+// SecretLookupError reports a lookup that found nothing, together with why.
+//
+// The reason is deliberately kept out of Error(): a caller that returns the
+// error text to an HTTP client must not thereby disclose whether a secret
+// exists, since telling a scoped key "exists but not yours" apart from "does not
+// exist" lets it enumerate the vault a name at a time. Error() is therefore safe
+// to leak, and Diagnosis() carries the detail for the server's own log.
+type SecretLookupError struct {
+	// Name is the secret that was requested. Names, unlike values, already
+	// appear in request-path logs.
+	Name string
+	// Cached is how many items the vault cache holds.
+	Cached int
+	// Visible is how many of them the caller's scope and filters left.
+	Visible int
+	// HiddenNameMatches counts items matching Name that the scope or filters
+	// excluded — the difference between "does not exist" and "not yours".
+	HiddenNameMatches int
+	// PartialInVisible counts visible items Name is a substring of. These would
+	// have matched had STRICT_SECRET_MATCH been off.
+	PartialInVisible int
+	// StrictMatch records whether strict matching was in force.
+	StrictMatch bool
+}
+
+// Error is intentionally identical for every cause. See the type comment.
+func (e *SecretLookupError) Error() string { return "secret not found" }
+
+// Diagnosis explains the lookup for the operator reading the server log. It is
+// never sent to a client.
+func (e *SecretLookupError) Diagnosis() string {
+	switch {
+	case e.Cached == 0:
+		return "the vault cache is empty; the first sync may not have completed"
+	case e.HiddenNameMatches > 0:
+		return fmt.Sprintf(
+			"%d item(s) by that name exist but are outside this key's scope or the request filters; %d of %d items were visible",
+			e.HiddenNameMatches, e.Visible, e.Cached)
+	case e.StrictMatch && e.PartialInVisible > 0:
+		return fmt.Sprintf(
+			"no exact match, and %d visible item(s) contain the name but STRICT_SECRET_MATCH rejects partial matches; %d of %d items were visible",
+			e.PartialInVisible, e.Visible, e.Cached)
+	case e.Visible == 0:
+		return fmt.Sprintf(
+			"this key's scope or the request filters left none of the %d cached items visible", e.Cached)
+	default:
+		return fmt.Sprintf(
+			"no item by that name anywhere in the vault; %d of %d items were visible to this key",
+			e.Visible, e.Cached)
+	}
+}
+
 // GetSecret retrieves a decrypted secret by name.
 // It searches by exact name (case-insensitive), then falls back to partial match
 // unless strict matching is enabled.
@@ -189,6 +241,9 @@ func selectMatch(candidates []DecryptedItem, kind string, pred func(DecryptedIte
 // Candidates are sorted by cipher id so that repeating a request returns the
 // same secret: ranging over the item map directly made the winner depend on Go's
 // randomized map iteration order (#30).
+//
+// A miss returns *SecretLookupError, which carries why for the log without
+// putting it anywhere a client can read.
 func (c *Client) GetSecret(name string, filter SecretFilter) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("secret name cannot be empty")
@@ -215,17 +270,50 @@ func (c *Client) GetSecret(name string, filter SecretFilter) (string, error) {
 	}
 
 	// Case 2: Partial match, opt-out via strict matching.
-	if c.strictMatch {
-		return "", fmt.Errorf("secret not found")
-	}
-	if item, ok := selectMatch(candidates, "partially", func(item DecryptedItem) bool {
-		return strings.Contains(strings.ToLower(item.Name), key)
-	}); ok {
-		logger.Debug.Printf("Partial match found for secret lookup")
-		return extractSecret(item), nil
+	if !c.strictMatch {
+		if item, ok := selectMatch(candidates, "partially", func(item DecryptedItem) bool {
+			return strings.Contains(strings.ToLower(item.Name), key)
+		}); ok {
+			logger.Debug.Printf("Partial match found for secret lookup")
+			return extractSecret(item), nil
+		}
 	}
 
-	return "", fmt.Errorf("secret not found")
+	return "", c.lookupFailure(name, candidates)
+}
+
+// lookupFailure describes a miss for the log. Callers hold c.mu.
+//
+// Both loops run to completion rather than stopping at the first hit: the work
+// done must not depend on whether the secret exists, or the response time would
+// disclose what the response body deliberately does not.
+func (c *Client) lookupFailure(name string, candidates []DecryptedItem) *SecretLookupError {
+	e := &SecretLookupError{
+		Name:        name,
+		Cached:      len(c.items),
+		Visible:     len(candidates),
+		StrictMatch: c.strictMatch,
+	}
+
+	visible := make(map[string]struct{}, len(candidates))
+	key := strings.ToLower(name)
+	for _, item := range candidates {
+		visible[item.ID] = struct{}{}
+		if strings.Contains(strings.ToLower(item.Name), key) {
+			e.PartialInVisible++
+		}
+	}
+
+	for id, item := range c.items {
+		if _, shown := visible[id]; shown {
+			continue
+		}
+		if strings.EqualFold(item.Name, name) {
+			e.HiddenNameMatches++
+		}
+	}
+
+	return e
 }
 
 // ClearCache triggers a fresh vault sync.

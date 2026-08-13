@@ -308,8 +308,53 @@ resp, _ := http.DefaultClient.Do(req)
 - **Spoof-resistant client IP** — see [Client IP behind a proxy](#client-ip-behind-a-proxy)
 - **No caching or compression of secret responses** — `GET /secret/:name` answers carry `Cache-Control: no-store` and are excluded from response compression, so a secret is neither storable by an intermediary nor measurable through compressed length
 - **No secret values in logs** — secret values are never written to logs at any level; vault items are referenced by UUID
-- **Secret names can appear in request-path logs** — two default-level paths log the requested URL, which embeds the secret name for `GET /api/secret/:name`: the blocked-IP warning from the IP whitelist, and the error handler's log for unmatched routes. Values are still never logged
+- **Secret names can appear in request-path logs** — several default-level paths log the requested URL or name for `GET /api/secret/:name`: the blocked-IP warning from the IP whitelist, the error handler's log for unmatched routes, and the failed-lookup warning below. Values are still never logged
+- **A 404 tells the caller nothing; the log tells you everything** — see [Diagnosing a failed secret lookup](#diagnosing-a-failed-secret-lookup)
 - Secrets are **decrypted in-memory only** — never written to disk
+
+### Diagnosing a failed secret lookup
+
+`GET /secret/:name` answers **exactly the same 404 for every failure** — same body,
+same headers — whether the secret does not exist, sits outside the calling key's
+[scope](#scoped-api-keys), or is excluded by the request's own filters. That
+uniformity is the point: telling "no such secret" apart from "exists but not
+yours" is how a scoped key would enumerate the vault a name at a time. The
+lookup also does the same amount of work in each case, so the response time does
+not disclose what the body withholds.
+
+The server's log is under no such constraint, and is where the reason goes:
+
+```text
+WARN: Secret lookup failed for "JWT_SECRET" (key "hearth", IP 31.201.224.107):
+      no item by that name anywhere in the vault; 259 of 259 items were visible to this key
+```
+
+The tail names the cause:
+
+| Log says | Meaning | Fix |
+|---|---|---|
+| `no item by that name anywhere` | the secret really is absent | add it to the vault, or correct the name |
+| `N item(s) by that name exist but are outside this key's scope` | it exists, this key may not see it | widen the key's `organizations` / `collections`, or use a different key |
+| `left none of the N cached items visible` | the scope resolved, but nothing in the vault falls inside it | check the key is scoped to the collection the secrets actually live in |
+| `STRICT_SECRET_MATCH rejects partial matches` | only a partial name match exists | use the exact name, or unset `STRICT_SECRET_MATCH` |
+| `the vault cache is empty` | the first sync has not completed | check the Vaultwarden connection |
+
+A scope that does not resolve at all is refused one step earlier, before any
+lookup happens, and says so:
+
+```text
+WARN: Secret lookup denied for "JWT_SECRET" (key "hearth", IP 31.201.224.107):
+      none of this key's 1 scoped collection(s) resolve against the 11 known to the vault;
+      check the key config for a typo or a rename
+```
+
+Scope refs are matched against the last sync, so this is a typo in the key's
+`organizations` / `collections`, or an org or collection renamed in the vault
+since. Using UUIDs rather than names avoids the rename half of that.
+
+A failed lookup is logged at **warning**, not error: a caller asking for a secret
+that is not there is ordinary 404 traffic, and one misconfigured client retrying
+would otherwise bury real faults. Errors of any other kind stay at error level.
 
 ### Client IP behind a proxy
 

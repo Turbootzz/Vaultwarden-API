@@ -1,16 +1,20 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Turbootzz/vaultwarden-api/internal/auth"
 	"github.com/Turbootzz/vaultwarden-api/internal/vaultwarden"
+	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
 	"github.com/gofiber/fiber/v2"
 	"github.com/valyala/fasthttp"
 )
@@ -486,6 +490,196 @@ func TestGetSecretSetsNoStoreHeaders(t *testing.T) {
 			}
 			if got := resp.Header.Get("Pragma"); got != "no-cache" {
 				t.Errorf("Pragma = %q, want no-cache", got)
+			}
+		})
+	}
+}
+
+// The whole point of the opaque 404: a scoped key must not be able to tell a
+// secret it may not see apart from one that does not exist. If these two
+// responses ever differ by a byte, the vault can be enumerated a name at a time.
+func TestGetSecretResponseIsIdenticalForMissingAndHiddenSecrets(t *testing.T) {
+	h := NewHandler(vaultwarden.NewClient(nil, 0, vaultwarden.WithState(testVaultItems(), testNameMaps())))
+
+	const scopedKey = "collection-scoped-11111111111111111111111"
+	store := auth.NewStore([]auth.APIKey{
+		{Name: "dev", Key: scopedKey, Scope: auth.Scope{Collections: []string{"Shared"}}},
+	})
+
+	app := fiber.New()
+	app.Use(auth.Middleware(store))
+	app.Get("/secret/:name", h.GetSecret)
+
+	// "other-password" exists but sits outside the key's collection scope;
+	// "does-not-exist-anywhere" is absent from the vault entirely.
+	get := func(name string) (int, string, http.Header) {
+		t.Helper()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/secret/"+name, nil)
+		req.Header.Set("Authorization", "Bearer "+scopedKey)
+		resp, err := app.Test(req, -1)
+		if err != nil {
+			t.Fatalf("app.Test: %v", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		return resp.StatusCode, string(body), resp.Header
+	}
+
+	hiddenStatus, hiddenBody, hiddenHeader := get("other-password")
+	missingStatus, missingBody, missingHeader := get("does-not-exist-anywhere")
+
+	if hiddenStatus != http.StatusNotFound || missingStatus != http.StatusNotFound {
+		t.Fatalf("status: hidden=%d missing=%d, want 404 for both", hiddenStatus, missingStatus)
+	}
+	if hiddenBody != missingBody {
+		t.Errorf("response body discloses existence:\n  hidden  = %q\n  missing = %q", hiddenBody, missingBody)
+	}
+	for _, header := range []string{"Content-Length", "Content-Type", "Cache-Control"} {
+		if hiddenHeader.Get(header) != missingHeader.Get(header) {
+			t.Errorf("%s differs: hidden=%q missing=%q",
+				header, hiddenHeader.Get(header), missingHeader.Get(header))
+		}
+	}
+}
+
+// The log is the other half of that trade: opaque to the client, specific to the
+// operator. It must name the secret, the key and the reason — and never a value.
+func TestGetSecretLogsWhyTheLookupFailed(t *testing.T) {
+	items := testVaultItems()
+	h := NewHandler(vaultwarden.NewClient(nil, 0, vaultwarden.WithState(items, testNameMaps())))
+
+	const scopedKey = "collection-scoped-11111111111111111111111"
+	store := auth.NewStore([]auth.APIKey{
+		{Name: "hearth", Key: scopedKey, Scope: auth.Scope{Collections: []string{"Shared"}}},
+	})
+
+	app := fiber.New()
+	app.Use(auth.Middleware(store))
+	app.Get("/secret/:name", h.GetSecret)
+
+	tests := []struct {
+		name     string
+		secret   string
+		wantLog  []string
+		wantMiss []string
+	}{
+		{
+			name:    "hidden by scope",
+			secret:  "other-password",
+			wantLog: []string{`"other-password"`, `"hearth"`, "outside this key's scope"},
+			// The value of the secret it could not see must not appear.
+			wantMiss: []string{"other-org", scopedKey},
+		},
+		{
+			name:     "absent from the vault",
+			secret:   "does-not-exist-anywhere",
+			wantLog:  []string{`"does-not-exist-anywhere"`, `"hearth"`, "no item by that name anywhere"},
+			wantMiss: []string{scopedKey},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf syncBuffer
+			restore := logger.Warn.Writer()
+			logger.Warn.SetOutput(&buf)
+			t.Cleanup(func() { logger.Warn.SetOutput(restore) })
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/secret/"+tt.secret, nil)
+			req.Header.Set("Authorization", "Bearer "+scopedKey)
+			resp, err := app.Test(req, -1)
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			defer resp.Body.Close()
+
+			line := buf.String()
+			for _, want := range tt.wantLog {
+				if !strings.Contains(line, want) {
+					t.Errorf("log %q does not mention %q", line, want)
+				}
+			}
+			for _, unwanted := range tt.wantMiss {
+				if strings.Contains(line, unwanted) {
+					t.Errorf("log %q leaks %q", line, unwanted)
+				}
+			}
+		})
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe to read while a handler goroutine writes it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// An error type other than *SecretLookupError is a genuine server fault, not a
+// caller asking for something absent: it keeps Error level, and must not be fed
+// to Diagnosis() on a nil pointer.
+func TestLogSecretLookupFailureLevels(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		wantWarn  string
+		wantError string
+	}{
+		{
+			name:     "lookup miss is a warning",
+			err:      &vaultwarden.SecretLookupError{Name: "JWT_SECRET", Cached: 259, Visible: 259},
+			wantWarn: "no item by that name anywhere",
+		},
+		{
+			name:      "any other error stays an error",
+			err:       errors.New("vault client exploded"),
+			wantError: "vault client exploded",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var warnBuf, errBuf syncBuffer
+			warnRestore, errRestore := logger.Warn.Writer(), logger.Error.Writer()
+			logger.Warn.SetOutput(&warnBuf)
+			logger.Error.SetOutput(&errBuf)
+			t.Cleanup(func() {
+				logger.Warn.SetOutput(warnRestore)
+				logger.Error.SetOutput(errRestore)
+			})
+
+			_, ctx := acquireTestCtx(t, "")
+			logSecretLookupFailure(ctx, "JWT_SECRET", tt.err)
+
+			if tt.wantWarn != "" {
+				if !strings.Contains(warnBuf.String(), tt.wantWarn) {
+					t.Errorf("warn log = %q, want it to contain %q", warnBuf.String(), tt.wantWarn)
+				}
+				if errBuf.String() != "" {
+					t.Errorf("a lookup miss also logged at Error: %q", errBuf.String())
+				}
+			}
+			if tt.wantError != "" {
+				if !strings.Contains(errBuf.String(), tt.wantError) {
+					t.Errorf("error log = %q, want it to contain %q", errBuf.String(), tt.wantError)
+				}
+				if warnBuf.String() != "" {
+					t.Errorf("a server fault also logged at Warn: %q", warnBuf.String())
+				}
 			}
 		})
 	}

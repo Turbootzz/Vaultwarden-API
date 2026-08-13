@@ -104,8 +104,9 @@ func (h *Handler) GetSecret(c *fiber.Ctx) error {
 	}
 
 	// Enforce the authenticated key's scope server-side, regardless of query filters.
-	if !h.applyKeyScope(c, &filter) {
-		logger.Warn.Printf("Request denied by key scope from IP: %s", realip.FromCtx(c))
+	if reason, ok := h.applyKeyScope(c, &filter); !ok {
+		logger.Warn.Printf("Secret lookup denied for %q (key %q, IP %s): %s",
+			secretName, auth.KeyNameFromCtx(c), realip.FromCtx(c), reason)
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "secret not found",
 		})
@@ -113,7 +114,7 @@ func (h *Handler) GetSecret(c *fiber.Ctx) error {
 
 	value, err := h.vaultClient.GetSecret(secretName, filter)
 	if err != nil {
-		logger.Error.Printf("Failed to fetch secret (requested by IP: %s)", realip.FromCtx(c))
+		logSecretLookupFailure(c, secretName, err)
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "secret not found",
 		})
@@ -123,6 +124,30 @@ func (h *Handler) GetSecret(c *fiber.Ctx) error {
 		"name":  secretName,
 		"value": value,
 	})
+}
+
+// logSecretLookupFailure records why a lookup missed, for the operator only.
+//
+// The response tells a caller nothing beyond "not found": letting a scoped key
+// tell "no such secret" apart from "exists but not yours" is precisely how it
+// would enumerate the vault a name at a time. The server's own log has no such
+// constraint and is where the answer belongs. Secret *names* appear here, as
+// they already do in request-path logs; values never do, at any level.
+//
+// Warn, not Error: a caller asking for a secret that is not there is ordinary
+// 404 traffic, and logging it at Error buries real faults under one
+// misconfigured client's retry loop. An error of any other type is a genuine
+// fault and keeps Error — that branch is also what stops a future non-lookup
+// error from reaching Diagnosis() on a nil pointer.
+func logSecretLookupFailure(c *fiber.Ctx, secretName string, err error) {
+	var lookupErr *vaultwarden.SecretLookupError
+	if errors.As(err, &lookupErr) {
+		logger.Warn.Printf("Secret lookup failed for %q (key %q, IP %s): %s",
+			secretName, auth.KeyNameFromCtx(c), realip.FromCtx(c), lookupErr.Diagnosis())
+		return
+	}
+	logger.Error.Printf("Secret lookup failed for %q (key %q, IP %s): %v",
+		secretName, auth.KeyNameFromCtx(c), realip.FromCtx(c), err)
 }
 
 func parseUUIDQuery(field, raw string) (string, error) {
@@ -184,15 +209,18 @@ func resolveScopeRefs(refs []string, nameMap map[string]string) []string {
 // authenticated key's scope. It returns false to deny the request (404) when a
 // constrained dimension resolves to nothing — including unknown names and the
 // pre-first-sync window — so a scoped key can never read outside its scope.
-func (h *Handler) applyKeyScope(c *fiber.Ctx, filter *vaultwarden.SecretFilter) bool {
+// applyKeyScope narrows filter to the authenticated key's scope. It returns
+// false with an operator-facing reason when the request cannot proceed; the
+// reason is for the log only and never reaches the response.
+func (h *Handler) applyKeyScope(c *fiber.Ctx, filter *vaultwarden.SecretFilter) (string, bool) {
 	scope, ok := auth.ScopeFromCtx(c)
 	if !ok {
 		// No scope in context means the auth middleware did not run for this
 		// request. Fail closed rather than silently granting full access.
-		return false
+		return "no scope on the request; the auth middleware did not run, failing closed", false
 	}
 	if scope.IsEmpty() {
-		return true // unscoped key: full access
+		return "", true // unscoped key: full access
 	}
 
 	nm := h.vaultClient.NameMaps()
@@ -200,19 +228,25 @@ func (h *Handler) applyKeyScope(c *fiber.Ctx, filter *vaultwarden.SecretFilter) 
 	if len(scope.Organizations) > 0 {
 		ids := resolveScopeRefs(scope.Organizations, nm.Organizations)
 		if len(ids) == 0 {
-			return false
+			// Names are matched against the last sync, so this is either a typo
+			// in the key config or an org that has been renamed since.
+			return fmt.Sprintf(
+				"none of this key's %d scoped organization(s) resolve against the %d known to the vault; check the key config for a typo or a rename",
+				len(scope.Organizations), len(nm.Organizations)), false
 		}
 		filter.OrganizationIDs = ids
 	}
 	if len(scope.Collections) > 0 {
 		ids := resolveScopeRefs(scope.Collections, nm.Collections)
 		if len(ids) == 0 {
-			return false
+			return fmt.Sprintf(
+				"none of this key's %d scoped collection(s) resolve against the %d known to the vault; check the key config for a typo or a rename",
+				len(scope.Collections), len(nm.Collections)), false
 		}
 		filter.CollectionIDs = ids
 	}
 
-	return true
+	return "", true
 }
 
 // parseSecretFilters reads placement query params: at most one of id or name per dimension.
