@@ -189,25 +189,31 @@ func selectMatch(candidates []DecryptedItem, kind string, pred func(DecryptedIte
 // exists, since telling a scoped key "exists but not yours" apart from "does not
 // exist" lets it enumerate the vault a name at a time. Error() is therefore safe
 // to leak, and Diagnosis() carries the detail for the server's own log.
-// The requested name is deliberately not a field: the caller already has it, and
-// storing it would put the one thing Error() withholds inside a value whose
-// premise is that it is safe to hand to a client — a %#v or a JSON encoding of
-// the error would print it.
+//
+// The requested name is deliberately not a field, and the counts are unexported:
+// exported fields are what encoding/json emits, so an error marshalled into a
+// response — by a future handler, or a middleware that serialises errors —
+// would ship "HiddenNameMatches" and hand back the very distinction Error()
+// withholds. Unexported fields marshal to {}.
+//
+// This narrows the exposure rather than closing it: fmt's %#v prints unexported
+// fields too. That is acceptable because %#v of an error is a server-side log
+// concern, where the detail is permitted anyway; a JSON response is not.
 type SecretLookupError struct {
-	// Cached is how many items the vault cache holds.
-	Cached int
-	// Visible is how many of them the caller's scope and filters left.
-	Visible int
-	// HiddenNameMatches counts items the scope or filters excluded that would
+	// cached is how many items the vault cache holds.
+	cached int
+	// visible is how many of them the caller's scope and filters left.
+	visible int
+	// hiddenNameMatches counts items the scope or filters excluded that would
 	// have matched under the rule the lookup used — the difference between
 	// "does not exist" and "not yours".
-	HiddenNameMatches int
-	// PartialInVisible counts visible items the name is a substring of without
-	// matching exactly. Only reachable under StrictMatch; without it such an
+	hiddenNameMatches int
+	// partialInVisible counts visible items the name is a substring of without
+	// matching exactly. Only reachable under strictMatch; without it such an
 	// item is served and no lookup failure arises.
-	PartialInVisible int
-	// StrictMatch records whether strict matching was in force.
-	StrictMatch bool
+	partialInVisible int
+	// strictMatch records whether strict matching was in force.
+	strictMatch bool
 }
 
 // Error is intentionally identical for every cause. See the type comment.
@@ -217,23 +223,23 @@ func (e *SecretLookupError) Error() string { return "secret not found" }
 // never sent to a client.
 func (e *SecretLookupError) Diagnosis() string {
 	switch {
-	case e.Cached == 0:
+	case e.cached == 0:
 		return "the vault cache is empty; the first sync may not have completed"
-	case e.HiddenNameMatches > 0:
+	case e.hiddenNameMatches > 0:
 		return fmt.Sprintf(
 			"%d item(s) by that name exist but are outside this key's scope or the request filters; %d of %d items were visible",
-			e.HiddenNameMatches, e.Visible, e.Cached)
-	case e.StrictMatch && e.PartialInVisible > 0:
+			e.hiddenNameMatches, e.visible, e.cached)
+	case e.strictMatch && e.partialInVisible > 0:
 		return fmt.Sprintf(
 			"no exact match, and %d visible item(s) contain the name but STRICT_SECRET_MATCH rejects partial matches; %d of %d items were visible",
-			e.PartialInVisible, e.Visible, e.Cached)
-	case e.Visible == 0:
+			e.partialInVisible, e.visible, e.cached)
+	case e.visible == 0:
 		return fmt.Sprintf(
-			"this key's scope or the request filters left none of the %d cached items visible", e.Cached)
+			"this key's scope or the request filters left none of the %d cached items visible", e.cached)
 	default:
 		return fmt.Sprintf(
 			"no item by that name anywhere in the vault; %d of %d items were visible to this key",
-			e.Visible, e.Cached)
+			e.visible, e.cached)
 	}
 }
 
@@ -282,7 +288,7 @@ func (c *Client) GetSecret(name string, filter SecretFilter) (string, error) {
 		}
 	}
 
-	return "", c.lookupFailure(key, len(candidates), filter)
+	return "", c.lookupFailure(name, key, len(candidates), filter)
 }
 
 // lookupFailure describes a miss for the log. Callers hold c.mu, and key is the
@@ -294,17 +300,19 @@ func (c *Client) GetSecret(name string, filter SecretFilter) (string, error) {
 // constant-time guarantee: the caller's log write is synchronous and its length
 // varies by cause. The API key, not the opaque 404, is the boundary that
 // matters; this only avoids handing out a cheap oracle.
-func (c *Client) lookupFailure(key string, visible int, filter SecretFilter) *SecretLookupError {
+func (c *Client) lookupFailure(name, key string, visible int, filter SecretFilter) *SecretLookupError {
 	e := &SecretLookupError{
-		Cached:      len(c.items),
-		Visible:     visible,
-		StrictMatch: c.strictMatch,
+		cached:      len(c.items),
+		visible:     visible,
+		strictMatch: c.strictMatch,
 	}
 
 	for _, item := range c.items {
-		name := strings.ToLower(item.Name)
-		exact := name == key
-		partial := strings.Contains(name, key)
+		// EqualFold, not lowercase equality: it is the predicate the lookup
+		// itself used, and the two disagree on characters that case-fold to a
+		// common form without sharing a lowercase one — "\u03c2" and "\u03a3", say.
+		exact := strings.EqualFold(item.Name, name)
+		partial := strings.Contains(strings.ToLower(item.Name), key)
 
 		// Re-testing the filter beats carrying a set of visible ids: it is the
 		// same predicate that built the candidate list, with no allocation.
@@ -313,7 +321,7 @@ func (c *Client) lookupFailure(key string, visible int, filter SecretFilter) *Se
 			// strict matching refused; without strict it would have been served
 			// and this function would never have run.
 			if partial && !exact {
-				e.PartialInVisible++
+				e.partialInVisible++
 			}
 			continue
 		}
@@ -327,7 +335,7 @@ func (c *Client) lookupFailure(key string, visible int, filter SecretFilter) *Se
 			servable = partial
 		}
 		if servable {
-			e.HiddenNameMatches++
+			e.hiddenNameMatches++
 		}
 	}
 

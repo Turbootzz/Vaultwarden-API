@@ -630,7 +630,7 @@ func TestLogSecretLookupFailureLevels(t *testing.T) {
 	}{
 		{
 			name:     "lookup miss is a warning",
-			err:      &vaultwarden.SecretLookupError{Cached: 259, Visible: 259},
+			err:      realLookupError(t),
 			wantWarn: "no item by that name anywhere",
 		},
 		{
@@ -668,6 +668,20 @@ func TestLogSecretLookupFailureLevels(t *testing.T) {
 	}
 }
 
+// realLookupError produces a genuine *vaultwarden.SecretLookupError by asking a
+// real client for a secret it does not hold. Building one by hand would need the
+// diagnostic fields exported, which is exactly what keeps them out of a JSON
+// response.
+func realLookupError(t *testing.T) error {
+	t.Helper()
+	client := vaultwarden.NewClient(nil, 0, vaultwarden.WithState(testVaultItems(), testNameMaps()))
+	_, err := client.GetSecret("no-such-secret-anywhere", vaultwarden.SecretFilter{})
+	if err == nil {
+		t.Fatal("GetSecret returned no error for an absent secret")
+	}
+	return err
+}
+
 // The denial wording is what an operator acts on, so pin each branch — including
 // the unauthenticated one, which must read as a routing fault rather than a
 // mis-scoped key.
@@ -698,6 +712,13 @@ func TestScopeDenialString(t *testing.T) {
 			name:   "zero value is not a denial",
 			denial: scopeDenial{},
 			want:   "allowed",
+		},
+		{
+			// Defensive: a kind added without a String case must not render as
+			// "allowed" and read like a permitted request in the log.
+			name:   "unknown kind is not reported as allowed",
+			denial: scopeDenial{kind: scopeDenialKind(99)},
+			want:   "denied",
 		},
 	}
 

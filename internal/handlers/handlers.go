@@ -255,8 +255,10 @@ func (d scopeDenial) String() string {
 		return fmt.Sprintf(
 			"none of this key's %d scoped collection(s) resolve against the %d known to the vault; check the key config for a typo or a rename",
 			d.configured, d.known)
-	default:
+	case scopeAllowed:
 		return "allowed"
+	default:
+		return "denied"
 	}
 }
 
@@ -274,7 +276,7 @@ func (h *Handler) applyKeyScope(c *fiber.Ctx, filter *vaultwarden.SecretFilter) 
 		return scopeDenial{kind: scopeNoAuthContext}, false
 	}
 	if scope.IsEmpty() {
-		return scopeDenial{}, true // unscoped key: full access
+		return scopeDenial{kind: scopeAllowed}, true // unscoped key: full access
 	}
 
 	nm := h.vaultClient.NameMaps()
@@ -304,7 +306,7 @@ func (h *Handler) applyKeyScope(c *fiber.Ctx, filter *vaultwarden.SecretFilter) 
 		filter.CollectionIDs = ids
 	}
 
-	return scopeDenial{}, true
+	return scopeDenial{kind: scopeAllowed}, true
 }
 
 // parseSecretFilters reads placement query params: at most one of id or name per dimension.

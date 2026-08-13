@@ -887,15 +887,15 @@ func TestSecretLookupErrorCounts(t *testing.T) {
 	if !errors.As(err, &lookupErr) {
 		t.Fatalf("error is %T, want *SecretLookupError", err)
 	}
-	if lookupErr.Cached != 3 {
-		t.Errorf("Cached = %d, want 3", lookupErr.Cached)
+	if lookupErr.cached != 3 {
+		t.Errorf("Cached = %d, want 3", lookupErr.cached)
 	}
-	if lookupErr.Visible != 0 {
-		t.Errorf("Visible = %d, want 0", lookupErr.Visible)
+	if lookupErr.visible != 0 {
+		t.Errorf("Visible = %d, want 0", lookupErr.visible)
 	}
 	// Both copies are hidden, and the count must not stop at the first.
-	if lookupErr.HiddenNameMatches != 2 {
-		t.Errorf("HiddenNameMatches = %d, want 2", lookupErr.HiddenNameMatches)
+	if lookupErr.hiddenNameMatches != 2 {
+		t.Errorf("HiddenNameMatches = %d, want 2", lookupErr.hiddenNameMatches)
 	}
 }
 
@@ -952,8 +952,8 @@ func TestSecretLookupErrorCountsSubstringMatchesHiddenByScope(t *testing.T) {
 	if !errors.As(err, &lookupErr) {
 		t.Fatalf("error is %T, want *SecretLookupError", err)
 	}
-	if lookupErr.HiddenNameMatches != 1 {
-		t.Errorf("HiddenNameMatches = %d, want 1 for a substring match hidden by scope", lookupErr.HiddenNameMatches)
+	if lookupErr.hiddenNameMatches != 1 {
+		t.Errorf("HiddenNameMatches = %d, want 1 for a substring match hidden by scope", lookupErr.hiddenNameMatches)
 	}
 	if got := lookupErr.Diagnosis(); !strings.Contains(got, "outside this key's scope") {
 		t.Errorf("Diagnosis() = %q, want it to report the item as hidden, not absent", got)
@@ -978,14 +978,95 @@ func TestSecretLookupErrorCountsUnderStrictMatching(t *testing.T) {
 	if !errors.As(err, &lookupErr) {
 		t.Fatalf("error is %T, want *SecretLookupError", err)
 	}
-	if lookupErr.HiddenNameMatches != 0 {
+	if lookupErr.hiddenNameMatches != 0 {
 		t.Errorf("HiddenNameMatches = %d, want 0: strict matching would not serve a substring anyway",
-			lookupErr.HiddenNameMatches)
+			lookupErr.hiddenNameMatches)
 	}
-	if lookupErr.PartialInVisible != 1 {
-		t.Errorf("PartialInVisible = %d, want 1", lookupErr.PartialInVisible)
+	if lookupErr.partialInVisible != 1 {
+		t.Errorf("PartialInVisible = %d, want 1", lookupErr.partialInVisible)
 	}
 	if got := lookupErr.Diagnosis(); !strings.Contains(got, "STRICT_SECRET_MATCH") {
 		t.Errorf("Diagnosis() = %q, want the strict-match explanation", got)
+	}
+}
+
+// The counts must not survive a JSON encoding. Exported fields are what
+// encoding/json emits, so a handler or middleware that ever marshalled an error
+// into a response would ship HiddenNameMatches and hand back the distinction
+// Error() exists to withhold.
+func TestSecretLookupErrorDoesNotSerialiseItsCounts(t *testing.T) {
+	t.Parallel()
+
+	items := map[string]DecryptedItem{
+		"c1": {ID: "c1", Name: "db-password", Password: "pw", OrganizationID: testOrgID},
+	}
+	client := NewClient(nil, time.Minute, WithState(items, emptySyncNameMaps()))
+
+	_, err := client.GetSecret("db-password", SecretFilter{OrganizationIDs: []string{testOrgID2}})
+	var lookupErr *SecretLookupError
+	if !errors.As(err, &lookupErr) {
+		t.Fatalf("error is %T, want *SecretLookupError", err)
+	}
+	// Precondition: this is the case whose counts would be most revealing.
+	if lookupErr.hiddenNameMatches == 0 {
+		t.Fatal("expected a hidden name match to be recorded")
+	}
+
+	encoded, marshalErr := json.Marshal(lookupErr)
+	if marshalErr != nil {
+		t.Fatalf("json.Marshal: %v", marshalErr)
+	}
+	if string(encoded) != "{}" {
+		t.Errorf("json.Marshal = %s, want {} — the counts must not be serialisable", encoded)
+	}
+
+	// Marshalling through the error interface, as a generic handler would.
+	wrapped, marshalErr := json.Marshal(map[string]error{"error": err})
+	if marshalErr != nil {
+		t.Fatalf("json.Marshal(map): %v", marshalErr)
+	}
+	for _, leak := range []string{"hidden", "Hidden", "cached", "Cached", "visible", "Visible"} {
+		if strings.Contains(string(wrapped), leak) {
+			t.Errorf("marshalled error %s leaks %q", wrapped, leak)
+		}
+	}
+}
+
+// Regression: the diagnosis must use the lookup's own exact predicate. Greek
+// final sigma folds to the same letter as capital sigma under EqualFold, which
+// is what the lookup uses, but lowercasing them gives different strings — so a
+// hidden item the lookup would have matched went uncounted and was reported as
+// absent.
+func TestSecretLookupErrorCountsUnicodeFoldedNames(t *testing.T) {
+	t.Parallel()
+
+	const (
+		stored    = "ςecret" // ςecret, final sigma
+		requested = "Σecret" // Σecret, capital sigma
+	)
+
+	items := map[string]DecryptedItem{
+		"c1": {ID: "c1", Name: stored, Password: "hidden", OrganizationID: testOrgID},
+	}
+	client := NewClient(nil, time.Minute,
+		WithState(items, emptySyncNameMaps()), WithStrictMatch(true))
+
+	// The two names fold together, so an unscoped caller is served the item.
+	if got, err := client.GetSecret(requested, SecretFilter{}); err != nil || got != "hidden" {
+		t.Fatalf("unscoped GetSecret = (%q, %v), want (hidden, nil)", got, err)
+	}
+
+	// Scoped away from it, the diagnosis must still recognise it as hidden.
+	_, err := client.GetSecret(requested, SecretFilter{OrganizationIDs: []string{testOrgID2}})
+	var lookupErr *SecretLookupError
+	if !errors.As(err, &lookupErr) {
+		t.Fatalf("error is %T, want *SecretLookupError", err)
+	}
+	if lookupErr.hiddenNameMatches != 1 {
+		t.Errorf("hiddenNameMatches = %d, want 1: the item folds to the requested name",
+			lookupErr.hiddenNameMatches)
+	}
+	if got := lookupErr.Diagnosis(); !strings.Contains(got, "outside this key's scope") {
+		t.Errorf("Diagnosis() = %q, want it to report the item as hidden, not absent", got)
 	}
 }
