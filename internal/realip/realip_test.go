@@ -43,15 +43,25 @@ func acquireCtx(t *testing.T, peer string, forwardedFor ...string) (*fiber.App, 
 // shapes such as chunked bodies with trailers.
 func acquireRawCtx(t *testing.T, peer, raw string) (*fiber.App, *fiber.Ctx) {
 	t.Helper()
-	app := fiber.New()
+	app, ctx, err := parseRawCtx(t, peer, raw)
+	if err != nil {
+		t.Fatalf("parse request: %v", err)
+	}
+	return app, ctx
+}
+
+// parseRawCtx is acquireRawCtx for requests some fasthttp versions refuse to parse.
+func parseRawCtx(t *testing.T, peer, raw string) (*fiber.App, *fiber.Ctx, error) {
+	t.Helper()
 	fctx := &fasthttp.RequestCtx{}
 	fctx.SetRemoteAddr(&net.TCPAddr{IP: net.ParseIP(peer), Port: 54321})
 	if err := fctx.Request.Read(bufio.NewReader(strings.NewReader(raw))); err != nil {
-		t.Fatalf("parse request: %v", err)
+		return nil, nil, err
 	}
+	app := fiber.New()
 	ctx := app.AcquireCtx(fctx)
 	t.Cleanup(func() { app.ReleaseCtx(ctx) })
-	return app, ctx
+	return app, ctx, nil
 }
 
 func TestClientIP(t *testing.T) {
@@ -328,7 +338,14 @@ func TestClientIPIgnoresSmuggledTrailers(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, ctx := acquireRawCtx(t, "127.0.0.1", tt.raw)
+			_, ctx, err := parseRawCtx(t, "127.0.0.1", tt.raw)
+			if err != nil {
+				// fasthttp v1.7x refuses an X-Forwarded-* trailer before any handler runs.
+				if !strings.Contains(err.Error(), "forbidden trailer") {
+					t.Fatalf("parse request: %v", err)
+				}
+				return
+			}
 			if got := resolver.ClientIP(ctx); got != tt.want {
 				t.Errorf("ClientIP() = %q, want %q (smuggled trailer must not win)", got, tt.want)
 			}
@@ -371,19 +388,41 @@ func TestClientIPHonoursLineFolding(t *testing.T) {
 	}
 }
 
-// A continuation line that itself looks like a header is rejected by fasthttp
-// before any handler runs, so smuggling one under an unrelated header never
-// reaches the resolver. Pinned because the raw-header parse would otherwise have
-// to decide what such a line means.
-func TestFoldedHeaderMasqueradingAsForwardedForIsRejected(t *testing.T) {
-	raw := "GET /secret/db HTTP/1.1\r\nHost: target\r\n" +
-		"User-Agent: curl\r\n X-Forwarded-For: 10.0.0.5\r\n" +
-		"X-Forwarded-For: 203.0.113.9\r\n\r\n"
+// A continuation line that itself looks like a header must never join the chain.
+// fasthttp v1.51 refuses such a request; v1.7x unfolds the line into the header
+// above it, and the raw-header parse has to agree.
+func TestFoldedHeaderMasqueradingAsForwardedForNeverJoinsChain(t *testing.T) {
+	resolver := testResolver(t)
 
-	var fctx fasthttp.RequestCtx
-	fctx.SetRemoteAddr(&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 54321})
-	if err := fctx.Request.Read(bufio.NewReader(strings.NewReader(raw))); err == nil {
-		t.Fatal("expected fasthttp to reject the folded header-shaped continuation line")
+	const smuggled = "User-Agent: curl\r\n X-Forwarded-For: 10.0.0.5\r\n"
+
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "before the genuine header",
+			raw: "GET /secret/db HTTP/1.1\r\nHost: target\r\n" + smuggled +
+				"X-Forwarded-For: 203.0.113.9\r\n\r\n",
+		},
+		{
+			// Read as its own line, 10.0.0.5 would be the rightmost entry and win.
+			name: "after the genuine header",
+			raw: "GET /secret/db HTTP/1.1\r\nHost: target\r\nX-Forwarded-For: 203.0.113.9\r\n" +
+				smuggled + "\r\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ctx, err := parseRawCtx(t, "127.0.0.1", tt.raw)
+			if err != nil {
+				return
+			}
+			if got := resolver.ClientIP(ctx); got != "203.0.113.9" {
+				t.Errorf("ClientIP() = %q, want 203.0.113.9 (folded line belongs to User-Agent)", got)
+			}
+		})
 	}
 }
 

@@ -365,8 +365,9 @@ func TestMiddlewareRejectsTrailerSmuggledForwardedFor(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := rawGet(t, addr, tt.raw)
-			if !strings.Contains(got, "403") {
-				t.Errorf("status = %q, want 403 — a smuggled trailer must not pass the whitelist", got)
+			// 400: fasthttp v1.7x refuses an X-Forwarded-* trailer before the whitelist runs.
+			if !strings.Contains(got, "403") && !strings.Contains(got, "400") {
+				t.Errorf("status = %q, want 403 or 400 — a smuggled trailer must not pass the whitelist", got)
 			}
 		})
 	}
