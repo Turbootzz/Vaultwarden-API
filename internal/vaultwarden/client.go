@@ -503,7 +503,7 @@ func (c *Client) backgroundSync() {
 }
 
 // extractSecret extracts the most relevant secret value from a decrypted item.
-// Priority: password > field named "value"/"secret"/"api_key" > notes > first field.
+// Priority: password > SSH private key > field named "value"/"secret"/"api_key" > notes > first field.
 func extractSecret(item DecryptedItem) string {
 	if item.Password != "" {
 		return item.Password

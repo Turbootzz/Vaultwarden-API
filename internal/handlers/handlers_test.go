@@ -325,7 +325,7 @@ func TestGetSecret(t *testing.T) {
 			wantBody:   "bracketed",
 		},
 		{
-			// The decode loop unescapes until stable, so a literal % never survives.
+			// The decode loop unescapes until stable, so a name with a literal % is unreachable.
 			name:       "percent in name",
 			path:       "/secret/100%25",
 			wantStatus: http.StatusBadRequest,

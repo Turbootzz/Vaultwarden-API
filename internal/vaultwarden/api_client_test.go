@@ -909,8 +909,40 @@ func TestLookupIDByName(t *testing.T) {
 	})
 }
 
-// The sync response is written as raw JSON in Vaultwarden's shape, so the
-// struct tags are exercised rather than round-tripped through SyncCipher.
+// serveRawSync serves body, raw JSON in Vaultwarden's shape, as /api/sync. Like
+// Vaultwarden it drops SSH key ciphers unless Bitwarden-Client-Version >= 2024.12.0.
+func serveRawSync(t *testing.T, body string) *APIClient {
+	t.Helper()
+	var payload struct {
+		Ciphers []json.RawMessage `json:"ciphers"`
+	}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("sync body: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		var year, month, patch int
+		_, err := fmt.Sscanf(r.Header.Get("Bitwarden-Client-Version"), "%d.%d.%d", &year, &month, &patch)
+		showSSH := err == nil && (year > 2024 || (year == 2024 && month >= 12))
+
+		ciphers := make([]json.RawMessage, 0, len(payload.Ciphers))
+		for _, c := range payload.Ciphers {
+			var head struct {
+				Type int `json:"type"`
+			}
+			_ = json.Unmarshal(c, &head)
+			if head.Type == CipherTypeSSHKey && !showSSH {
+				continue
+			}
+			ciphers = append(ciphers, c)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ciphers": ciphers})
+	})
+	return newSyncTestClient(t, mux)
+}
+
 func TestSync_DecryptsSSHKeyItems(t *testing.T) {
 	userKey := testUserKey()
 	const privateKey = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaA==\n-----END OPENSSH PRIVATE KEY-----\n"
@@ -927,28 +959,19 @@ func TestSync_DecryptsSSHKeyItems(t *testing.T) {
 		{"id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","type":5,"name":%q,"sshKey":null}
 	]}`, name, priv, pub, fp, nullName)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, body)
-	})
-
-	items, _, failed, err := newSyncTestClient(t, mux).Sync(t.Context())
+	items, _, failed, err := serveRawSync(t, body).Sync(t.Context())
 	if err != nil {
 		t.Fatalf("Sync() error: %v", err)
 	}
-	if len(failed) != 0 || len(items) != 2 {
-		t.Fatalf("got %d items, %d failed; want 2 items, 0 failed", len(items), len(failed))
+	// "sshKey": null has no key to serve; caching it would answer 200 with an empty value.
+	if len(failed) != 0 || len(items) != 1 {
+		t.Fatalf("got %d items, %d failed; want 1 item, 0 failed", len(items), len(failed))
 	}
-	byName := map[string]DecryptedItem{}
-	for _, it := range items {
-		byName[it.Name] = it
+	if items[0].Name != "deploy-key" {
+		t.Fatalf("surviving item = %q, want deploy-key", items[0].Name)
 	}
-	if got := byName["deploy-key"].SSHPrivateKey; got != privateKey {
+	if got := items[0].SSHPrivateKey; got != privateKey {
 		t.Errorf("SSHPrivateKey = %q, want %q (trailing newline must survive)", got, privateKey)
-	}
-	if got := byName["broken-key"].SSHPrivateKey; got != "" {
-		t.Errorf("null sshKey gave SSHPrivateKey %q, want empty", got)
 	}
 }
 
@@ -966,13 +989,7 @@ func TestSync_SSHPrivateKeyDecryptFailureFailsTheCipher(t *testing.T) {
 		{"id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","type":5,"name":%q,"sshKey":{"privateKey":%q}}
 	]}`, okName, sshName, badPriv)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, body)
-	})
-
-	items, _, failed, err := newSyncTestClient(t, mux).Sync(t.Context())
+	items, _, failed, err := serveRawSync(t, body).Sync(t.Context())
 	if err != nil {
 		t.Fatalf("Sync() error: %v", err)
 	}

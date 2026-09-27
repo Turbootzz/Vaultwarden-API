@@ -483,6 +483,8 @@ func (ac *APIClient) Sync(ctx context.Context) ([]DecryptedItem, SyncNameMaps, [
 		return nil, emptySyncNameMaps(), nil, fmt.Errorf("create sync request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	// Vaultwarden leaves SSH key ciphers out of the sync for older or unversioned clients.
+	req.Header.Set("Bitwarden-Client-Version", "2024.12.0")
 
 	resp, err := ac.httpClient.Do(req)
 	if err != nil {
@@ -565,6 +567,12 @@ func (ac *APIClient) Sync(ctx context.Context) ([]DecryptedItem, SyncNameMaps, [
 		// Trashed ciphers stay in the sync payload; they must not resolve (#20).
 		if c.DeletedDate != nil && strings.TrimSpace(*c.DeletedDate) != "" {
 			logger.Debug.Printf("Skipping trashed cipher %s", c.ID)
+			continue
+		}
+
+		// Vaultwarden sends "sshKey": null for an SSH item it deems invalid; there is no key to serve.
+		if c.Type == CipherTypeSSHKey && (c.SSHKey == nil || c.SSHKey.PrivateKey == nil) {
+			logger.Debug.Printf("Skipping SSH key cipher %s without key data", c.ID)
 			continue
 		}
 
