@@ -14,13 +14,13 @@ import (
 	// ships no tzdata package.
 	_ "time/tzdata"
 
-	"github.com/Turbootzz/vaultwarden-api/internal/auth"
-	"github.com/Turbootzz/vaultwarden-api/internal/config"
-	"github.com/Turbootzz/vaultwarden-api/internal/handlers"
-	"github.com/Turbootzz/vaultwarden-api/internal/ipwhitelist"
-	"github.com/Turbootzz/vaultwarden-api/internal/realip"
-	"github.com/Turbootzz/vaultwarden-api/internal/vaultwarden"
-	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
+	"github.com/Turbootzz/vaultwarden-secrets-api/internal/auth"
+	"github.com/Turbootzz/vaultwarden-secrets-api/internal/config"
+	"github.com/Turbootzz/vaultwarden-secrets-api/internal/handlers"
+	"github.com/Turbootzz/vaultwarden-secrets-api/internal/ipwhitelist"
+	"github.com/Turbootzz/vaultwarden-secrets-api/internal/realip"
+	"github.com/Turbootzz/vaultwarden-secrets-api/internal/vaultwarden"
+	"github.com/Turbootzz/vaultwarden-secrets-api/pkg/logger"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/compress"
 	"github.com/gofiber/fiber/v2/middleware/cors"
@@ -36,7 +36,7 @@ func main() {
 		logger.Error.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	logger.Info.Printf("Starting Vaultwarden API on port %s (environment: %s)", cfg.Port, cfg.Environment)
+	logger.Info.Printf("Starting Vaultwarden Secrets API on port %s (environment: %s)", cfg.Port, cfg.Environment)
 
 	// Initialize Vaultwarden client.
 	email := os.Getenv("VAULTWARDEN_EMAIL")
@@ -90,7 +90,7 @@ func main() {
 
 	// Create Fiber app with security configurations.
 	app := fiber.New(fiber.Config{
-		AppName:                 "Vaultwarden API v2.0",
+		AppName:                 "Vaultwarden Secrets API v2.0",
 		DisableStartupMessage:   false,
 		ReadTimeout:             cfg.ReadTimeout,
 		WriteTimeout:            cfg.WriteTimeout,

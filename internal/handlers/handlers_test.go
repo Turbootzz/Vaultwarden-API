@@ -10,10 +10,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Turbootzz/vaultwarden-api/internal/auth"
-	"github.com/Turbootzz/vaultwarden-api/internal/logtest"
-	"github.com/Turbootzz/vaultwarden-api/internal/vaultwarden"
-	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
+	"github.com/Turbootzz/vaultwarden-secrets-api/internal/auth"
+	"github.com/Turbootzz/vaultwarden-secrets-api/internal/logtest"
+	"github.com/Turbootzz/vaultwarden-secrets-api/internal/vaultwarden"
+	"github.com/Turbootzz/vaultwarden-secrets-api/pkg/logger"
 	"github.com/gofiber/fiber/v2"
 	"github.com/valyala/fasthttp"
 )

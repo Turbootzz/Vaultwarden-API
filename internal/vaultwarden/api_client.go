@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
+	"github.com/Turbootzz/vaultwarden-secrets-api/pkg/logger"
 	"github.com/google/uuid"
 )
 

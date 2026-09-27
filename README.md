@@ -1,8 +1,10 @@
-# 🔐 Vaultwarden API
+# 🔐 Vaultwarden Secrets API
 
 > **Stop using `.env` files.** Fetch secrets directly from your self-hosted [Vaultwarden](https://github.com/dani-garcia/vaultwarden) instance at runtime.
 
 A lightweight, production-ready Go API that acts as a secrets bridge between your apps and Vaultwarden. No more scattered `.env` files, no more accidentally committed credentials.
+
+Formerly *Vaultwarden-API*. The Docker image keeps its name, `ghcr.io/turbootzz/vaultwarden-api`, so existing deployments need no changes. This project is not related to Bitwarden Secrets Manager: the `bws` CLI and its SDKs don't work with this API.
 
 ## ✨ Highlights
 
@@ -18,8 +20,8 @@ A lightweight, production-ready Go API that acts as a secrets bridge between you
 
 ```
 ┌─────────────┐    HTTPS + API Key    ┌──────────────────────┐    Native Go    ┌──────────────┐
-│  Your App   │ ────────────────────> │  Vaultwarden API     │ ──────────────> │  Vaultwarden │
-│  (any lang) │ <──────────────────── │  (Go, ~20MB image)   │ <────────────── │  Server      │
+│  Your App   │ ────────────────────> │  Vaultwarden Secrets │ ──────────────> │  Vaultwarden │
+│  (any lang) │ <──────────────────── │  API (Go, ~20MB)     │ <────────────── │  Server      │
 └─────────────┘    JSON response      │                      │  Encrypted API  └──────────────┘
                                       │  • Auto token refresh│
                                       │  • Background sync   │
@@ -418,7 +420,7 @@ Cloudflare sets the header to the visitor address, and your own proxy appends th
 address *it* saw — the edge. Edge addresses rotate per request and can never be
 whitelisted, so a walk that stops there denies every request whatever
 `ALLOWED_IPS` says. That was the failure reported in
-[#40](https://github.com/Turbootzz/vaultwarden-api/issues/40).
+[#40](https://github.com/Turbootzz/vaultwarden-secrets-api/issues/40).
 
 **This is handled automatically — no configuration needed.** Cloudflare's
 [published ranges](https://www.cloudflare.com/ips/) are embedded in the binary, and
