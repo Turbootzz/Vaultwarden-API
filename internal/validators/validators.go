@@ -2,20 +2,19 @@
 package validators
 
 import (
-	"regexp"
 	"strings"
 )
 
 const SecretNameMaxLength = 255
 
-var SecretNamePattern = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9 _\-\./]*[a-zA-Z0-9])?$`)
-
+// IsValidSecretName accepts printable ASCII: the name is only compared against
+// decrypted vault item names, so the rule exists to keep control bytes out of logs.
 func IsValidSecretName(name string) bool {
 	if len(name) == 0 || len(name) > SecretNameMaxLength {
 		return false
 	}
 
-	if strings.Contains(name, "..") || strings.Contains(name, "\x00") {
+	if strings.Contains(name, "..") || name[0] == ' ' || name[len(name)-1] == ' ' {
 		return false
 	}
 
@@ -25,7 +24,7 @@ func IsValidSecretName(name string) bool {
 		}
 	}
 
-	return SecretNamePattern.MatchString(name)
+	return true
 }
 
 func SanitizeSecretName(name string) (string, bool) {

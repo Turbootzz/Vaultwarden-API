@@ -55,6 +55,11 @@ func testVaultItems() map[string]vaultwarden.DecryptedItem {
 			Name:     "my secret",
 			Password: "partial",
 		},
+		"cipher-4": {
+			ID:       "cipher-4",
+			Name:     "Database (prod)",
+			Password: "bracketed",
+		},
 	}
 }
 
@@ -306,6 +311,25 @@ func TestGetSecret(t *testing.T) {
 			path:       "/secret/my%2520secret",
 			wantStatus: http.StatusOK,
 			wantBody:   "partial",
+		},
+		{
+			name:       "brackets in name",
+			path:       "/secret/Database%20(prod)",
+			wantStatus: http.StatusOK,
+			wantBody:   "bracketed",
+		},
+		{
+			name:       "encoded brackets in name",
+			path:       "/secret/Database%20%28prod%29",
+			wantStatus: http.StatusOK,
+			wantBody:   "bracketed",
+		},
+		{
+			// The decode loop unescapes until stable, so a literal % never survives.
+			name:       "percent in name",
+			path:       "/secret/100%25",
+			wantStatus: http.StatusBadRequest,
+			wantBody:   "invalid secret name format",
 		},
 		{
 			name:       "success with organization filter",

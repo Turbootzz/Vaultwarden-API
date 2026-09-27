@@ -95,6 +95,8 @@ You can also use **custom fields** or **notes** — the API returns the most rel
 
 > **Tip:** Name your items exactly like you'd name environment variables. It makes the mental mapping easy: `DATABASE_URL` in Vaultwarden = `DATABASE_URL` in your app.
 
+**Secret names** can use any printable ASCII character, up to 255 characters. They can't start or end with a space, and can't contain `..` or `%`. URL-encode spaces and reserved characters in the path: `Database (prod)` → `/secret/Database%20(prod)`.
+
 ## API Endpoints
 
 | Method | Path | Auth | Description |
