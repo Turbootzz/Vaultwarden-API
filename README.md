@@ -91,7 +91,9 @@ Create a login item in Vaultwarden for each secret:
 
 That's it. When you call `GET /secret/DATABASE_URL`, the API finds the item named "DATABASE_URL" and returns the password field.
 
-You can also use **custom fields** or **notes** — the API returns the most relevant value: password → custom fields → notes.
+You can also use **custom fields** or **notes** — the API returns the most relevant value: password → SSH private key → custom fields → notes.
+
+**SSH keys** work too: for an SSH key item the API returns the private key, including its trailing newline.
 
 > **Tip:** Name your items exactly like you'd name environment variables. It makes the mental mapping easy: `DATABASE_URL` in Vaultwarden = `DATABASE_URL` in your app.
 
@@ -532,7 +534,7 @@ When you request `/secret/DATABASE_URL`, the API:
 
 1. **Exact match** (case-insensitive) against vault item names
 2. **Partial match** if no exact match is found
-3. Returns the most relevant value: password → custom field → notes
+3. Returns the most relevant value: password → SSH private key → custom field → notes
 
 This means you can name your Vaultwarden items naturally (e.g., "Database URL") and fetch them with any casing.
 

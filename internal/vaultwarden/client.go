@@ -509,6 +509,10 @@ func extractSecret(item DecryptedItem) string {
 		return item.Password
 	}
 
+	if item.SSHPrivateKey != "" {
+		return item.SSHPrivateKey
+	}
+
 	// Check custom fields by priority.
 	for _, name := range []string{"value", "secret", "api_key", "apikey", "token"} {
 		if v, ok := item.Fields[name]; ok && v != "" {

@@ -908,3 +908,75 @@ func TestLookupIDByName(t *testing.T) {
 		}
 	})
 }
+
+// The sync response is written as raw JSON in Vaultwarden's shape, so the
+// struct tags are exercised rather than round-tripped through SyncCipher.
+func TestSync_DecryptsSSHKeyItems(t *testing.T) {
+	userKey := testUserKey()
+	const privateKey = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaA==\n-----END OPENSSH PRIVATE KEY-----\n"
+
+	name := mustEncryptType2Cipher(t, "deploy-key", userKey)
+	priv := mustEncryptType2Cipher(t, privateKey, userKey)
+	pub := mustEncryptType2Cipher(t, "ssh-ed25519 AAAA test", userKey)
+	fp := mustEncryptType2Cipher(t, "SHA256:abc", userKey)
+	nullName := mustEncryptType2Cipher(t, "broken-key", userKey)
+
+	body := fmt.Sprintf(`{"ciphers":[
+		{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","type":5,"name":%q,
+		 "sshKey":{"privateKey":%q,"publicKey":%q,"keyFingerprint":%q}},
+		{"id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","type":5,"name":%q,"sshKey":null}
+	]}`, name, priv, pub, fp, nullName)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, body)
+	})
+
+	items, _, failed, err := newSyncTestClient(t, mux).Sync(t.Context())
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if len(failed) != 0 || len(items) != 2 {
+		t.Fatalf("got %d items, %d failed; want 2 items, 0 failed", len(items), len(failed))
+	}
+	byName := map[string]DecryptedItem{}
+	for _, it := range items {
+		byName[it.Name] = it
+	}
+	if got := byName["deploy-key"].SSHPrivateKey; got != privateKey {
+		t.Errorf("SSHPrivateKey = %q, want %q (trailing newline must survive)", got, privateKey)
+	}
+	if got := byName["broken-key"].SSHPrivateKey; got != "" {
+		t.Errorf("null sshKey gave SSHPrivateKey %q, want empty", got)
+	}
+}
+
+func TestSync_SSHPrivateKeyDecryptFailureFailsTheCipher(t *testing.T) {
+	userKey := testUserKey()
+	wrongKey := testUserKey()
+	wrongKey.MacKey = bytes.Repeat([]byte{0xff}, 32)
+
+	okName := mustEncryptType2Cipher(t, "ok-item", userKey)
+	sshName := mustEncryptType2Cipher(t, "deploy-key", userKey)
+	badPriv := mustEncryptType2Cipher(t, "unreadable", wrongKey)
+
+	body := fmt.Sprintf(`{"ciphers":[
+		{"id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","type":1,"name":%q},
+		{"id":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","type":5,"name":%q,"sshKey":{"privateKey":%q}}
+	]}`, okName, sshName, badPriv)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/sync", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, body)
+	})
+
+	items, _, failed, err := newSyncTestClient(t, mux).Sync(t.Context())
+	if err != nil {
+		t.Fatalf("Sync() error: %v", err)
+	}
+	if len(items) != 1 || len(failed) != 1 || failed[0].ID != "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" {
+		t.Fatalf("items=%d failed=%v; want the SSH cipher marked failed", len(items), failed)
+	}
+}
