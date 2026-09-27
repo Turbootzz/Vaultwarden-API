@@ -1,4 +1,4 @@
-module github.com/Turbootzz/vaultwarden-api
+module github.com/Turbootzz/vaultwarden-secrets-api
 
 go 1.25.3
 

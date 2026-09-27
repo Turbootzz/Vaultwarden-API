@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Turbootzz/vaultwarden-api/internal/realip"
-	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
+	"github.com/Turbootzz/vaultwarden-secrets-api/internal/realip"
+	"github.com/Turbootzz/vaultwarden-secrets-api/pkg/logger"
 	"github.com/gofiber/fiber/v2"
 )
 

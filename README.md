@@ -1,8 +1,10 @@
-# 🔐 Vaultwarden API
+# 🔐 Vaultwarden Secrets API
 
 > **Stop using `.env` files.** Fetch secrets directly from your self-hosted [Vaultwarden](https://github.com/dani-garcia/vaultwarden) instance at runtime.
 
 A lightweight, production-ready Go API that acts as a secrets bridge between your apps and Vaultwarden. No more scattered `.env` files, no more accidentally committed credentials.
+
+Formerly *Vaultwarden-API*. The Docker image keeps its name, `ghcr.io/turbootzz/vaultwarden-api`, so existing deployments need no changes. This project is not related to Bitwarden Secrets Manager: the `bws` CLI and its SDKs don't work with this API.
 
 ## ✨ Highlights
 
@@ -18,8 +20,8 @@ A lightweight, production-ready Go API that acts as a secrets bridge between you
 
 ```
 ┌─────────────┐    HTTPS + API Key    ┌──────────────────────┐    Native Go    ┌──────────────┐
-│  Your App   │ ────────────────────> │  Vaultwarden API     │ ──────────────> │  Vaultwarden │
-│  (any lang) │ <──────────────────── │  (Go, ~20MB image)   │ <────────────── │  Server      │
+│  Your App   │ ────────────────────> │  Vaultwarden Secrets │ ──────────────> │  Vaultwarden │
+│  (any lang) │ <──────────────────── │  API (Go, ~20MB)     │ <────────────── │  Server      │
 └─────────────┘    JSON response      │                      │  Encrypted API  └──────────────┘
                                       │  • Auto token refresh│
                                       │  • Background sync   │
@@ -91,9 +93,13 @@ Create a login item in Vaultwarden for each secret:
 
 That's it. When you call `GET /secret/DATABASE_URL`, the API finds the item named "DATABASE_URL" and returns the password field.
 
-You can also use **custom fields** or **notes** — the API returns the most relevant value: password → custom fields → notes.
+You can also use **custom fields** or **notes** — the API returns the most relevant value: password → SSH private key → custom fields → notes.
+
+**SSH keys** work too: for an SSH key item the API returns the private key, including its trailing newline.
 
 > **Tip:** Name your items exactly like you'd name environment variables. It makes the mental mapping easy: `DATABASE_URL` in Vaultwarden = `DATABASE_URL` in your app.
+
+**Secret names** can use any printable ASCII character, up to 255 characters. They can't start or end with a space or contain `..`. URL-encode spaces and reserved characters in the path: `Database (prod)` → `/secret/Database%20(prod)`. Names containing `%` can't be fetched: the path is decoded until it stops changing, so double-encoded requests keep working, and a `%41` in a name would be read as `A`.
 
 ## API Endpoints
 
@@ -414,7 +420,7 @@ Cloudflare sets the header to the visitor address, and your own proxy appends th
 address *it* saw — the edge. Edge addresses rotate per request and can never be
 whitelisted, so a walk that stops there denies every request whatever
 `ALLOWED_IPS` says. That was the failure reported in
-[#40](https://github.com/Turbootzz/vaultwarden-api/issues/40).
+[#40](https://github.com/Turbootzz/vaultwarden-secrets-api/issues/40).
 
 **This is handled automatically — no configuration needed.** Cloudflare's
 [published ranges](https://www.cloudflare.com/ips/) are embedded in the binary, and
@@ -530,7 +536,7 @@ When you request `/secret/DATABASE_URL`, the API:
 
 1. **Exact match** (case-insensitive) against vault item names
 2. **Partial match** if no exact match is found
-3. Returns the most relevant value: password → custom field → notes
+3. Returns the most relevant value: password → SSH private key → custom field → notes
 
 This means you can name your Vaultwarden items naturally (e.g., "Database URL") and fetch them with any casing.
 

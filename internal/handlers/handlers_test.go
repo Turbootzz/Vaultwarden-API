@@ -10,10 +10,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Turbootzz/vaultwarden-api/internal/auth"
-	"github.com/Turbootzz/vaultwarden-api/internal/logtest"
-	"github.com/Turbootzz/vaultwarden-api/internal/vaultwarden"
-	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
+	"github.com/Turbootzz/vaultwarden-secrets-api/internal/auth"
+	"github.com/Turbootzz/vaultwarden-secrets-api/internal/logtest"
+	"github.com/Turbootzz/vaultwarden-secrets-api/internal/vaultwarden"
+	"github.com/Turbootzz/vaultwarden-secrets-api/pkg/logger"
 	"github.com/gofiber/fiber/v2"
 	"github.com/valyala/fasthttp"
 )
@@ -54,6 +54,11 @@ func testVaultItems() map[string]vaultwarden.DecryptedItem {
 			ID:       "cipher-3",
 			Name:     "my secret",
 			Password: "partial",
+		},
+		"cipher-4": {
+			ID:       "cipher-4",
+			Name:     "Database (prod)",
+			Password: "bracketed",
 		},
 	}
 }
@@ -306,6 +311,25 @@ func TestGetSecret(t *testing.T) {
 			path:       "/secret/my%2520secret",
 			wantStatus: http.StatusOK,
 			wantBody:   "partial",
+		},
+		{
+			name:       "brackets in name",
+			path:       "/secret/Database%20(prod)",
+			wantStatus: http.StatusOK,
+			wantBody:   "bracketed",
+		},
+		{
+			name:       "encoded brackets in name",
+			path:       "/secret/Database%20%28prod%29",
+			wantStatus: http.StatusOK,
+			wantBody:   "bracketed",
+		},
+		{
+			// The decode loop unescapes until stable, so a name with a literal % is unreachable.
+			name:       "percent in name",
+			path:       "/secret/100%25",
+			wantStatus: http.StatusBadRequest,
+			wantBody:   "invalid secret name format",
 		},
 		{
 			name:       "success with organization filter",

@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
+	"github.com/Turbootzz/vaultwarden-secrets-api/pkg/logger"
 	"github.com/google/uuid"
 )
 
@@ -84,6 +84,7 @@ type SyncCipher struct {
 	Notes          *string     `json:"notes"`
 	Login          *SyncLogin  `json:"login"`
 	Card           *SyncCard   `json:"card"`
+	SSHKey         *SyncSSHKey `json:"sshKey"`
 	Fields         []SyncField `json:"fields"`
 }
 
@@ -104,6 +105,13 @@ type SyncCard struct {
 	Code           *string `json:"code"`
 }
 
+// SyncSSHKey contains encrypted SSH key data.
+type SyncSSHKey struct {
+	PrivateKey     *string `json:"privateKey"`
+	PublicKey      *string `json:"publicKey"`
+	KeyFingerprint *string `json:"keyFingerprint"`
+}
+
 // SyncField contains encrypted custom field data.
 type SyncField struct {
 	Name  *string `json:"name"`
@@ -117,6 +125,7 @@ const (
 	CipherTypeSecureNote = 2
 	CipherTypeCard       = 3
 	CipherTypeIdentity   = 4
+	CipherTypeSSHKey     = 5
 )
 
 // FieldTypeLinked marks a custom field that points at another field rather than
@@ -474,6 +483,8 @@ func (ac *APIClient) Sync(ctx context.Context) ([]DecryptedItem, SyncNameMaps, [
 		return nil, emptySyncNameMaps(), nil, fmt.Errorf("create sync request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	// Vaultwarden leaves SSH key ciphers out of the sync for older or unversioned clients.
+	req.Header.Set("Bitwarden-Client-Version", "2024.12.0")
 
 	resp, err := ac.httpClient.Do(req)
 	if err != nil {
@@ -559,6 +570,12 @@ func (ac *APIClient) Sync(ctx context.Context) ([]DecryptedItem, SyncNameMaps, [
 			continue
 		}
 
+		// Vaultwarden sends "sshKey": null for an SSH item it deems invalid; there is no key to serve.
+		if c.Type == CipherTypeSSHKey && (c.SSHKey == nil || c.SSHKey.PrivateKey == nil) {
+			logger.Debug.Printf("Skipping SSH key cipher %s without key data", c.ID)
+			continue
+		}
+
 		// Select the correct decryption key.
 		decryptKey := key
 		if c.OrganizationID != nil && *c.OrganizationID != "" {
@@ -613,6 +630,7 @@ type DecryptedItem struct {
 	Name           string
 	Username       string
 	Password       string
+	SSHPrivateKey  string
 	Notes          string
 	URI            string
 	Fields         map[string]string
@@ -664,6 +682,13 @@ func decryptCipher(c SyncCipher, key SymmetricKey) (DecryptedItem, error) {
 		}
 		if item.URI == "" && len(c.Login.URIs) > 0 && c.Login.URIs[0].URI != nil {
 			item.URI, _ = DecryptStr(*c.Login.URIs[0].URI, key)
+		}
+	}
+
+	if c.SSHKey != nil && c.SSHKey.PrivateKey != nil {
+		item.SSHPrivateKey, err = DecryptStr(*c.SSHKey.PrivateKey, key)
+		if err != nil {
+			return item, fmt.Errorf("decrypt ssh private key: %w", err)
 		}
 	}
 

@@ -1070,3 +1070,19 @@ func TestSecretLookupErrorCountsUnicodeFoldedNames(t *testing.T) {
 		t.Errorf("Diagnosis() = %q, want it to report the item as hidden, not absent", got)
 	}
 }
+
+func TestExtractSecret_SSHPrivateKeyWinsOverFieldsAndNotes(t *testing.T) {
+	item := DecryptedItem{
+		Type:          CipherTypeSSHKey,
+		SSHPrivateKey: "PRIVATE",
+		Notes:         "notes",
+		Fields:        map[string]string{"value": "field"},
+	}
+	if got := extractSecret(item); got != "PRIVATE" {
+		t.Errorf("extractSecret() = %q, want PRIVATE", got)
+	}
+	item.Password = "password"
+	if got := extractSecret(item); got != "password" {
+		t.Errorf("extractSecret() = %q, want the login password to keep precedence", got)
+	}
+}

@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Turbootzz/vaultwarden-api/internal/auth"
+	"github.com/Turbootzz/vaultwarden-secrets-api/internal/auth"
 )
 
 // Config holds all application configuration

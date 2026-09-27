@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Turbootzz/vaultwarden-api/pkg/logger"
+	"github.com/Turbootzz/vaultwarden-secrets-api/pkg/logger"
 )
 
 // Client manages vault access, caching, and background sync.
@@ -503,10 +503,14 @@ func (c *Client) backgroundSync() {
 }
 
 // extractSecret extracts the most relevant secret value from a decrypted item.
-// Priority: password > field named "value"/"secret"/"api_key" > notes > first field.
+// Priority: password > SSH private key > field named "value"/"secret"/"api_key" > notes > first field.
 func extractSecret(item DecryptedItem) string {
 	if item.Password != "" {
 		return item.Password
+	}
+
+	if item.SSHPrivateKey != "" {
+		return item.SSHPrivateKey
 	}
 
 	// Check custom fields by priority.
