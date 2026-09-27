@@ -40,8 +40,10 @@ jobs:
       # A re-run of an older commit must not roll :latest back.
       - name: Check that this commit is still the tip of main
         id: tip
+        # shell: bash brings pipefail, so a failed lookup fails the job instead of skipping publish.
+        shell: bash
         run: |
-          tip=$(git ls-remote origin refs/heads/main | cut -f1)
+          tip=$(git ls-remote --exit-code origin refs/heads/main | cut -f1)
           if [ "$tip" = "$GITHUB_SHA" ]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
           else
