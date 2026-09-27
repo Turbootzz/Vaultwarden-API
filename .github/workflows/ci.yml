@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# Runs on main queue in push order, so an older commit cannot publish :latest after a newer one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -32,17 +37,35 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # A re-run of an older commit must not roll :latest back.
+      - name: Check that this commit is still the tip of main
+        id: tip
+        # shell: bash brings pipefail, so a failed lookup fails the job instead of skipping publish.
+        shell: bash
+        run: |
+          tip=$(git ls-remote --exit-code origin refs/heads/main | cut -f1)
+          if [ "$tip" = "$GITHUB_SHA" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::main is at $tip, not $GITHUB_SHA; skipping publish"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: docker/setup-qemu-action@v4
+        if: steps.tip.outputs.publish == 'true'
 
       - uses: docker/setup-buildx-action@v4
+        if: steps.tip.outputs.publish == 'true'
 
       - uses: docker/login-action@v4
+        if: steps.tip.outputs.publish == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/build-push-action@v7
+        if: steps.tip.outputs.publish == 'true'
         with:
           context: .
           push: true
