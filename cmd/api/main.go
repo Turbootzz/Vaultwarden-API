@@ -9,6 +9,11 @@ import (
 	"syscall"
 	"time"
 
+	// Embed the IANA timezone database in the binary so time.LoadLocation and
+	// the TZ environment variable work on the bare Alpine runtime image, which
+	// ships no tzdata package.
+	_ "time/tzdata"
+
 	"github.com/Turbootzz/vaultwarden-api/internal/auth"
 	"github.com/Turbootzz/vaultwarden-api/internal/config"
 	"github.com/Turbootzz/vaultwarden-api/internal/handlers"
